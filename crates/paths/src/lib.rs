@@ -6,9 +6,10 @@ use std::{
     ops,
     path::{Component, Path, PathBuf},
 };
+use serde;
 
 /// Wrapper around an absolute [`PathBuf`].
-#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct AbsPathBuf(PathBuf);
 
 impl From<AbsPathBuf> for PathBuf {

@@ -1057,6 +1057,9 @@ dependencies = [
 [[package]]
 name = "paths"
 version = "0.0.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "percent-encoding"

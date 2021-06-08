@@ -50,6 +50,18 @@ impl CreateJsonCmd {
         let deserialized_crate_graph: CrateGraph = serde_json::from_str(&json).expect("deserialization must work");
         assert_eq!(crate_graph, deserialized_crate_graph, "Deserialized `CrateGraph` is not equal!");
 
+        // TODO: create a new `Change` object
+        //
+        // `serde::Serialize` and `serde::Deserialize` are already supported by `Change`.
+        // So this should work out of the box after the object has been created:
+        //
+        // ```
+        // let json = serde_json::to_string(&change).expect("`Change` serialization must work");
+        // println!("change json:\n{}", json);
+        // let deserialized_change: Change = serde_json::from_str(&json).expect("`Change` deserialization must work");
+        // assert_eq!(change, deserialized_change, "Deserialized `Change` is not equal!");
+        // ```
+
         Ok(())
     }
 }

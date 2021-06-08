@@ -48,7 +48,7 @@ impl CreateJsonCmd {
             "Deserialized `CrateGraph` is not equal!"
         );
 
-        // TODO: create a new `Change` object
+        // Missing: Create a new `Change` object.
         //
         // `serde::Serialize` and `serde::Deserialize` are already supported by `Change`.
         // So this should work out of the box after the object has been created:

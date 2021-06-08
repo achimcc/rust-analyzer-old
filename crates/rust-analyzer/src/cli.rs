@@ -2,6 +2,7 @@
 
 pub(crate) mod load_cargo;
 mod analysis_stats;
+mod create_json;
 mod diagnostics;
 mod progress_report;
 mod ssr;
@@ -15,6 +16,7 @@ use vfs::Vfs;
 
 pub use self::{
     analysis_stats::AnalysisStatsCmd,
+    create_json::CreateJsonCmd,
     diagnostics::diagnostics,
     load_cargo::{load_workspace, load_workspace_at, LoadCargoConfig},
     ssr::{apply_ssr_rules, search_for_patterns},

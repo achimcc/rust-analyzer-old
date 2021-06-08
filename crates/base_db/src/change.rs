@@ -8,7 +8,6 @@ use salsa::Durability;
 use vfs::FileId;
 
 use crate::{CrateGraph, SourceDatabaseExt, SourceRoot, SourceRootId};
-use serde::ser::SerializeStruct;
 
 /// Encapsulate a bunch of raw `.set` calls on the database.
 #[derive(serde::Serialize, serde::Deserialize, Default)]

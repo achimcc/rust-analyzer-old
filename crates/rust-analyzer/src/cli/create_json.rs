@@ -15,8 +15,6 @@ use crate::cli::{
 
 use vfs::{loader::Handle, AbsPath, AbsPathBuf};
 
-use ide_db::base_db::{CrateId};
-
 pub struct CreateJsonCmd {
 }
 
@@ -67,7 +65,7 @@ impl CreateJsonCmd {
 }
 
 fn get_crate_graph(ws: ProjectWorkspace, config: &LoadCargoConfig, progress: &dyn Fn(String)) -> Result<CrateGraph> {
-    let (sender, receiver) = unbounded();
+    let (sender, _receiver) = unbounded();
     let mut vfs = vfs::Vfs::default();
     let mut loader = {
         let loader =

@@ -13,8 +13,6 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::SmolStr;
 use tt::{ExpansionError, Subtree};
 use vfs::{file_set::FileSet, FileId, VfsPath};
-use serde::ser::{SerializeStruct, SerializeSeq};
-use serde::de::Error;
 
 /// Files are grouped into source roots. A source root is a directory on the
 /// file systems which is watched for changes. Typically it corresponds to a
@@ -173,7 +171,7 @@ pub struct ProcMacro {
 }
 
 impl serde::Serialize for ProcMacro {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
@@ -182,7 +180,7 @@ impl serde::Serialize for ProcMacro {
 }
 
 impl<'de> serde::Deserialize<'de> for ProcMacro {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {

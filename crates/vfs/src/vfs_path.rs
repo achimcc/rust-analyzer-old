@@ -306,7 +306,9 @@ impl fmt::Debug for VfsPathRepr {
 /// `/`-separated virtual path.
 ///
 /// This is used to describe files that do not reside on the file system.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash,
+)]
 struct VirtualPath(String);
 
 impl VirtualPath {

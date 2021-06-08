@@ -1,29 +1,25 @@
 //! Fully type-check project and print various stats, like the number of type
 //! errors.
 
-use std::{path::Path};
+use crossbeam_channel::unbounded;
+use ide_db::base_db::CrateGraph;
 use project_model::{
     BuildDataCollector, CargoConfig, ProcMacroClient, ProjectManifest, ProjectWorkspace,
 };
-use ide_db::base_db::CrateGraph;
-use crossbeam_channel::{unbounded};
+use std::path::Path;
 
-use crate::cli::{
-    load_cargo::LoadCargoConfig,
-    Result
-};
+use crate::cli::{load_cargo::LoadCargoConfig, Result};
 
 use vfs::{loader::Handle, AbsPath, AbsPathBuf};
 
-pub struct CreateJsonCmd {
-}
+pub struct CreateJsonCmd {}
 
 impl CreateJsonCmd {
     /// Execute with e.g.
     /// ```no_compile
     /// cargo run --bin rust-analyzer create-json ../ink/examples/flipper/Cargo.toml
     /// ```
-    pub fn run(self, root: &Path,) -> Result<()>{
+    pub fn run(self, root: &Path) -> Result<()> {
         println!("Running! {:?}", root);
         let mut cargo_config = CargoConfig::default();
         cargo_config.no_sysroot = false;
@@ -45,8 +41,12 @@ impl CreateJsonCmd {
         // println!("json:\n{}", json);
 
         // deserialize from json string
-        let deserialized_crate_graph: CrateGraph = serde_json::from_str(&json).expect("deserialization must work");
-        assert_eq!(crate_graph, deserialized_crate_graph, "Deserialized `CrateGraph` is not equal!");
+        let deserialized_crate_graph: CrateGraph =
+            serde_json::from_str(&json).expect("deserialization must work");
+        assert_eq!(
+            crate_graph, deserialized_crate_graph,
+            "Deserialized `CrateGraph` is not equal!"
+        );
 
         // TODO: create a new `Change` object
         //
@@ -64,7 +64,11 @@ impl CreateJsonCmd {
     }
 }
 
-fn get_crate_graph(ws: ProjectWorkspace, config: &LoadCargoConfig, progress: &dyn Fn(String)) -> Result<CrateGraph> {
+fn get_crate_graph(
+    ws: ProjectWorkspace,
+    config: &LoadCargoConfig,
+    progress: &dyn Fn(String),
+) -> Result<CrateGraph> {
     let (sender, _receiver) = unbounded();
     let mut vfs = vfs::Vfs::default();
     let mut loader = {
@@ -100,5 +104,4 @@ fn get_crate_graph(ws: ProjectWorkspace, config: &LoadCargoConfig, progress: &dy
     );
 
     Ok(crate_graph)
-
 }

@@ -99,7 +99,7 @@ xflags::xflags! {
         }
 
         cmd proc-macro {}
-        
+
         cmd create-json
             /// Directory with Cargo.toml.
             required path: PathBuf
@@ -201,7 +201,7 @@ impl RustAnalyzer {
 }
 
 #[derive(Debug)]
-pub struct CreateJson{
+pub struct CreateJson {
     pub path: PathBuf,
 }
 

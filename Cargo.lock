@@ -158,6 +158,7 @@ dependencies = [
  "expect-test",
  "mbe",
  "rustc-hash",
+ "serde",
  "syntax",
  "tt",
 ]
@@ -534,6 +535,7 @@ dependencies = [
  "parser",
  "profile",
  "rustc-hash",
+ "serde",
  "syntax",
  "test_utils",
  "tt",
@@ -1863,6 +1865,7 @@ dependencies = [
  "indexmap",
  "paths",
  "rustc-hash",
+ "serde",
 ]
 
 [[package]]

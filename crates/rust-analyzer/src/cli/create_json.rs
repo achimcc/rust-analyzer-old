@@ -21,12 +21,18 @@ pub struct CreateJsonCmd {
 }
 
 impl CreateJsonCmd {
+    /// Execute with e.g.
+    /// ```no_compile
+    /// cargo run --bin rust-analyzer create-json ../ink/examples/flipper/Cargo.toml
+    /// ```
     pub fn run(self, root: &Path,) -> Result<()>{
         println!("Running! {:?}", root);
         let mut cargo_config = CargoConfig::default();
         cargo_config.no_sysroot = false;
         let root = AbsPathBuf::assert(std::env::current_dir()?.join(root));
-        let root = ProjectManifest::discover_single(&root)?;
+
+        let root = AbsPath::assert(&root);
+        let root = ProjectManifest::discover_single(root)?;
         let ws = ProjectWorkspace::load(root, &cargo_config, &|_| {})?;
 
         let load_cargo_config = LoadCargoConfig {
@@ -37,16 +43,13 @@ impl CreateJsonCmd {
 
         let crate_graph = get_crate_graph(ws, &load_cargo_config, &|_| {})?;
 
-        let crates = crate_graph.crates_in_topological_order();
+        let json = serde_json::to_string(&crate_graph).expect("serialization must work");
+        // println!("json:\n{}", json);
 
-        let crates_iter = crates.iter();
+        // deserialize from json string
+        let deserialized_crate_graph: CrateGraph = serde_json::from_str(&json).expect("deserialization must work");
+        assert_eq!(crate_graph, deserialized_crate_graph, "Deserialized `CrateGraph` is not equal!");
 
-        for crate_id in crates_iter {
-            let data = &crate_graph[*crate_id];
-          //  println!("Root FileId: {:?}", data.root_file_id);
-        }
-
-        
         Ok(())
     }
 }

@@ -2,8 +2,9 @@
 
 use crate::db::AstDatabase;
 use base_db::{CrateId, ProcMacroId};
+use serde;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct ProcMacroExpander {
     krate: CrateId,
     proc_macro_id: Option<ProcMacroId>,

@@ -44,6 +44,7 @@ mod path_interner;
 mod vfs_path;
 
 use std::{fmt, mem};
+use serde;
 
 use crate::path_interner::PathInterner;
 
@@ -56,7 +57,7 @@ pub use paths::{AbsPath, AbsPathBuf};
 /// Handle to a file in [`Vfs`]
 ///
 /// Most functions in rust-analyzer use this when they need to refer to a file.
-#[derive(Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize, Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct FileId(pub u32);
 
 /// Storage for all files read by rust-analyzer.

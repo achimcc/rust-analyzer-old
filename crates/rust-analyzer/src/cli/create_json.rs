@@ -12,7 +12,7 @@ use project_model::{
 
 use crate::cli::{load_cargo::LoadCargoConfig, Result};
 
-use crate::reload::{SourceRootConfig};
+use crate::reload::{ProjectFolders, SourceRootConfig};
 
 use vfs::{loader::Handle, AbsPath, AbsPathBuf};
 
@@ -39,7 +39,7 @@ impl CreateJsonCmd {
             with_proc_macro: false,
         };
 
-        let crate_graph = get_crate_graph(ws, &load_cargo_config, &|_| {})?;
+        let (crate_graph, change) = get_crate_data(ws, &load_cargo_config, &|_| {})?;
 
         let json = serde_json::to_string(&crate_graph).expect("serialization must work");
         // println!("json:\n{}", json);
@@ -68,12 +68,12 @@ impl CreateJsonCmd {
     }
 }
 
-fn get_crate_graph(
+fn get_crate_data(
     ws: ProjectWorkspace,
     config: &LoadCargoConfig,
     progress: &dyn Fn(String),
-) -> Result<CrateGraph> {
-    let (sender, _receiver) = unbounded();
+) -> Result<(CrateGraph, Change)> {
+    let (sender, receiver) = unbounded();
     let mut vfs = vfs::Vfs::default();
     let mut loader = {
         let loader =
@@ -107,7 +107,16 @@ fn get_crate_graph(
         },
     );
 
-    Ok(crate_graph)
+    let project_folders = ProjectFolders::new(&[ws], &[], build_data.as_ref());
+        loader.set_config(vfs::loader::Config {
+        load: project_folders.load,
+        watch: vec![],
+        version: 0,
+        });
+
+    let change = get_change(crate_graph.clone(), project_folders.source_root_config, &mut vfs, &receiver);
+
+    Ok((crate_graph, change))
 }
 
 fn get_change(
@@ -116,7 +125,6 @@ fn get_change(
     vfs: &mut vfs::Vfs,
     receiver: &Receiver<vfs::loader::Message>,
 ) -> Change {
-    let lru_cap = std::env::var("RA_LRU_CAP").ok().and_then(|it| it.parse::<usize>().ok());
     let mut analysis_change = Change::new();
 
     // wait until Vfs has loaded all roots

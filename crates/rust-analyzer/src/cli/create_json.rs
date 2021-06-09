@@ -1,13 +1,14 @@
 //! Fully type-check project and print various stats, like the number of type
 //! errors.
 
+use std::{path::Path, sync::Arc};
 use crossbeam_channel::{unbounded, Receiver};
 use ide_db::base_db::CrateGraph;
 use ide::{Change};
 use project_model::{
-    BuildDataCollector, CargoConfig, ProcMacroClient, ProjectManifest, ProjectWorkspace,
+    CargoConfig, ProcMacroClient, ProjectManifest, ProjectWorkspace,
 };
-use std::path::Path;
+
 
 use crate::cli::{load_cargo::LoadCargoConfig, Result};
 
@@ -87,7 +88,7 @@ fn get_crate_graph(
         None
     };
 
-    let build_data = if config.load_out_dirs_from_check {
+    let build_data = if config.load_use std::{path::Path, sync::Arc};out_dirs_from_check {
         let mut collector = BuildDataCollector::new(config.wrap_rustc);
         ws.collect_build_data_configs(&mut collector);
         Some(collector.collect(progress)?)

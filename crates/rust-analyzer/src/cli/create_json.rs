@@ -1,14 +1,17 @@
 //! Fully type-check project and print various stats, like the number of type
 //! errors.
 
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{unbounded, Receiver};
 use ide_db::base_db::CrateGraph;
+use ide::{Change};
 use project_model::{
     BuildDataCollector, CargoConfig, ProcMacroClient, ProjectManifest, ProjectWorkspace,
 };
 use std::path::Path;
 
 use crate::cli::{load_cargo::LoadCargoConfig, Result};
+
+use crate::reload::{SourceRootConfig};
 
 use vfs::{loader::Handle, AbsPath, AbsPathBuf};
 
@@ -104,4 +107,45 @@ fn get_crate_graph(
     );
 
     Ok(crate_graph)
+}
+
+fn get_change(
+    crate_graph: CrateGraph,
+    source_root_config: SourceRootConfig,
+    vfs: &mut vfs::Vfs,
+    receiver: &Receiver<vfs::loader::Message>,
+) -> Change {
+    let lru_cap = std::env::var("RA_LRU_CAP").ok().and_then(|it| it.parse::<usize>().ok());
+    let mut analysis_change = Change::new();
+
+    // wait until Vfs has loaded all roots
+    for task in receiver {
+        match task {
+            vfs::loader::Message::Progress { n_done, n_total, config_version: _ } => {
+                if n_done == n_total {
+                    break;
+                }
+            }
+            vfs::loader::Message::Loaded { files } => {
+                for (path, contents) in files {
+                    vfs.set_file_contents(path.into(), contents);
+                }
+            }
+        }
+    }
+    let changes = vfs.take_changes();
+    for file in changes {
+        if file.exists() {
+            let contents = vfs.file_contents(file.file_id).to_vec();
+            if let Ok(text) = String::from_utf8(contents) {
+                analysis_change.change_file(file.file_id, Some(Arc::new(text)))
+            }
+        }
+    }
+    let source_roots = source_root_config.partition(&vfs);
+    analysis_change.set_roots(source_roots);
+
+    analysis_change.set_crate_graph(crate_graph);
+
+    analysis_change
 }

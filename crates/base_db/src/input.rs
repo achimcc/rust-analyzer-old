@@ -86,12 +86,14 @@ impl serde::Serialize for CrateId {
 }
 
 impl<'de> serde::Deserialize<'de> for CrateId {
-    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
-    {
-        unimplemented!("deserialize for `CrateId` is missing");
-    }
+        {
+            let s: &str = serde::Deserialize::deserialize(deserializer)?;
+            let id = s.parse::<u32>().unwrap();
+            Ok(CrateId(id))
+        }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Hash)]

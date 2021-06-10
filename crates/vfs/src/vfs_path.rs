@@ -23,7 +23,7 @@ impl serde::Serialize for VfsPath {
 }
 
 impl<'de> serde::Deserialize<'de> for VfsPath {
-    fn deserialize<D>(deserializer: D) -> Result<VfsPath, D::Error>
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {

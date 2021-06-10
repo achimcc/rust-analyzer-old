@@ -9,8 +9,27 @@ use paths::{AbsPath, AbsPathBuf};
 /// so we treat `VfsPath`s as opaque identifiers.
 ///
 /// [`Vfs`]: crate::Vfs
-#[derive(serde::Serialize, serde::Deserialize, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+#[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct VfsPath(VfsPathRepr);
+
+impl serde::Serialize for VfsPath {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let s = self.to_string();
+        serializer.serialize_str(&s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for VfsPath {
+    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        unimplemented!("deserialize for `VfsPath` is missing");
+    }
+}
 
 impl VfsPath {
     /// Creates an "in-memory" path from `/`-separated string.

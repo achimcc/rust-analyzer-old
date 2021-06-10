@@ -1,14 +1,13 @@
 //! Fully type-check project and print various stats, like the number of type
 //! errors.
 
-use std::{path::Path, sync::Arc};
 use crossbeam_channel::{unbounded, Receiver};
+use ide::Change;
 use ide_db::base_db::CrateGraph;
-use ide::{Change};
 use project_model::{
     BuildDataCollector, CargoConfig, ProcMacroClient, ProjectManifest, ProjectWorkspace,
 };
-
+use std::{path::Path, sync::Arc};
 
 use crate::cli::{load_cargo::LoadCargoConfig, Result};
 
@@ -41,18 +40,25 @@ impl CreateJsonCmd {
 
         let (crate_graph, _) = get_crate_data(ws, &load_cargo_config, &|_| {})?;
 
-        let json = serde_json::to_string(&crate_graph).expect("serialization of crate_graph must work");
-        println!("json:\n{}", json);
 
-        // let change_json = serde_json::to_string(&change).expect("serialization of change must work");
-        // println!("change_json:\n{}", change_json);  
+        let _json =
+            serde_json::to_string(&crate_graph).expect("serialization of crate_graph must work");
+        // println!("json:\n{}", json);
+
+        let change_json =
+            serde_json::to_string(&change).expect("serialization of change must work");
+        println!("change_json:\n{}", change_json);
+
         // deserialize from json string
-        // let deserialized_crate_graph: CrateGraph =
-        //    serde_json::from_str(&json).expect("deserialization must work");
-        // assert_eq!(
-        //    crate_graph, deserialized_crate_graph,
-        //    "Deserialized `CrateGraph` is not equal!"
-        // );
+        /*
+        let deserialized_crate_graph: CrateGraph =
+            serde_json::from_str(&json).expect("deserialization must work");
+        assert_eq!(
+            crate_graph, deserialized_crate_graph,
+            "Deserialized `CrateGraph` is not equal!"
+        );
+        */
+
 
         // Missing: Create a new `Change` object.
         //
@@ -110,13 +116,14 @@ fn get_crate_data(
     );
 
     let project_folders = ProjectFolders::new(&[ws], &[], build_data.as_ref());
-        loader.set_config(vfs::loader::Config {
+    loader.set_config(vfs::loader::Config {
         load: project_folders.load,
         watch: vec![],
         version: 0,
-        });
+    });
 
-    let change = get_change(crate_graph.clone(), project_folders.source_root_config, &mut vfs, &receiver);
+    let change =
+        get_change(crate_graph.clone(), project_folders.source_root_config, &mut vfs, &receiver);
 
     Ok((crate_graph, change))
 }

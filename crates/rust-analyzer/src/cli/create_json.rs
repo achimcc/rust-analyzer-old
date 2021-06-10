@@ -48,7 +48,7 @@ impl CreateJsonCmd {
         // println!("change_json:\n{}", change_json);  
         // deserialize from json string
         // let deserialized_crate_graph: CrateGraph =
-            serde_json::from_str(&json).expect("deserialization must work");
+        //    serde_json::from_str(&json).expect("deserialization must work");
         // assert_eq!(
         //    crate_graph, deserialized_crate_graph,
         //    "Deserialized `CrateGraph` is not equal!"

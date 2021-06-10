@@ -39,7 +39,7 @@ impl CreateJsonCmd {
             with_proc_macro: false,
         };
 
-        let (crate_graph, change) = get_crate_data(ws, &load_cargo_config, &|_| {})?;
+        let (crate_graph, _) = get_crate_data(ws, &load_cargo_config, &|_| {})?;
 
         let json = serde_json::to_string(&crate_graph).expect("serialization of crate_graph must work");
         println!("json:\n{}", json);

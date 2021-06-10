@@ -1,12 +1,14 @@
 //! Fully type-check project and print various stats, like the number of type
 //! errors.
 
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{unbounded, Receiver};
+use ide::Change;
 use ide_db::base_db::CrateGraph;
 use project_model::{
     BuildDataCollector, CargoConfig, ProcMacroClient, ProjectManifest, ProjectWorkspace,
 };
 use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use crate::cli::{load_cargo::LoadCargoConfig, Result};
 
@@ -37,8 +39,13 @@ impl CreateJsonCmd {
 
         let crate_graph = get_crate_graph(ws, &load_cargo_config, &|_| {})?;
 
-        let json = serde_json::to_string(&crate_graph).expect("serialization must work");
+        let json =
+            serde_json::to_string(&crate_graph).expect("serialization of crate_graph must work");
         // println!("json:\n{}", json);
+
+        let change_json =
+            serde_json::to_string(&change).expect("serialization of change must work");
+        println!("change_json:\n{}", change_json);
 
         // deserialize from json string
         let deserialized_crate_graph: CrateGraph =

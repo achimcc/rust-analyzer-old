@@ -23,11 +23,13 @@ impl serde::Serialize for VfsPath {
 }
 
 impl<'de> serde::Deserialize<'de> for VfsPath {
-    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> Result<VfsPath, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        unimplemented!("deserialize for `VfsPath` is missing");
+        let path: &str = serde::Deserialize::deserialize(deserializer)?;
+        let path = VfsPath::new_virtual_path(String::from(path));
+        Ok(path)
     }
 }
 

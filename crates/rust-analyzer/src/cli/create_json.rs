@@ -44,9 +44,13 @@ impl CreateJsonCmd {
             serde_json::to_string(&crate_graph).expect("serialization of crate_graph must work");
         // println!("json:\n{}", json);
 
-        let change_json =
+        let json =
             serde_json::to_string(&change).expect("serialization of change must work");
-        println!("change_json:\n{}", change_json);
+
+        let _deserialized_change: Change = serde_json::from_str(&json).expect("`Change` deserialization must work");
+
+
+        // println!("change_json:\n{}", change_json);
 
         // deserialize from json string
         /*

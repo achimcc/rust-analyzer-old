@@ -42,17 +42,17 @@ impl CreateJsonCmd {
         let (crate_graph, change) = get_crate_data(ws, &load_cargo_config, &|_| {})?;
 
         let json = serde_json::to_string(&crate_graph).expect("serialization of crate_graph must work");
-        // println!("json:\n{}", json);
+        println!("json:\n{}", json);
 
-        let change_json = serde_json::to_string(&change).expect("serialization of change must work");
-        println!("change_json:\n{}", change_json);  
+        // let change_json = serde_json::to_string(&change).expect("serialization of change must work");
+        // println!("change_json:\n{}", change_json);  
         // deserialize from json string
-        let deserialized_crate_graph: CrateGraph =
+        // let deserialized_crate_graph: CrateGraph =
             serde_json::from_str(&json).expect("deserialization must work");
-        assert_eq!(
-            crate_graph, deserialized_crate_graph,
-            "Deserialized `CrateGraph` is not equal!"
-        );
+        // assert_eq!(
+        //    crate_graph, deserialized_crate_graph,
+        //    "Deserialized `CrateGraph` is not equal!"
+        // );
 
         // Missing: Create a new `Change` object.
         //

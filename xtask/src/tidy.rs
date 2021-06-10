@@ -27,17 +27,17 @@ fn generate_lint_completions() {
     codegen::generate_lint_completions().unwrap()
 }
 
-// #[test]
-// fn check_code_formatting() {
-//    let _dir = pushd(project_root()).unwrap();
-//    let _e = pushenv("RUSTUP_TOOLCHAIN", "stable");
-//    crate::ensure_rustfmt().unwrap();
-//    let res = cmd!("cargo fmt -- --check").run();
-//    if res.is_err() {
-//        let _ = cmd!("cargo fmt").run();
-//    }
-//    res.unwrap()
-// }
+ #[test]
+ fn check_code_formatting() {
+    let _dir = pushd(project_root()).unwrap();
+    let _e = pushenv("RUSTUP_TOOLCHAIN", "stable");
+    crate::ensure_rustfmt().unwrap();
+    let res = cmd!("cargo fmt -- --check").run();
+    if res.is_err() {
+        let _ = cmd!("cargo fmt").run();
+    }
+    res.unwrap()
+ }
 
 #[test]
 fn smoke_test_generate_documentation() {
@@ -141,14 +141,14 @@ fn cargo_files_are_tidy() {
     }
 }
 
-// #[test]
-// fn check_merge_commits() {
-//    let stdout = cmd!("git rev-list --merges --invert-grep --author 'bors\\[bot\\]' HEAD~19..")
-//        .read()
-//        .unwrap();
-//    if !stdout.is_empty() {
-//        panic!(
-/*            "
+#[test]
+ fn check_merge_commits() {
+    let stdout = cmd!("git rev-list --merges --invert-grep --author 'bors\\[bot\\]' HEAD~19..")
+        .read()
+        .unwrap();
+    if !stdout.is_empty() {
+        panic!(
+            "
 Merge commits are not allowed in the history.
 
 When updating a pull-request, please rebase your feature branch
@@ -190,7 +190,7 @@ https://github.blog/2015-06-08-how-to-undo-almost-anything-with-git/#redo-after-
     }
 }
 
-*/
+
 
 fn deny_clippy(path: &Path, text: &str) {
     let ignore = &[

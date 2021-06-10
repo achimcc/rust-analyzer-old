@@ -28,7 +28,7 @@ impl CreateJsonCmd {
 
         let (crate_graph, change) = get_crate_data(root, &|_| {})?;
 
-        let (_, change2) = get_crate_data(root, &|_| {})?;
+        // let (_, change2) = get_crate_data(root, &|_| {})?;
 
         let _json =
             serde_json::to_string(&crate_graph).expect("serialization of crate_graph must work");
@@ -37,7 +37,7 @@ impl CreateJsonCmd {
         let json =
             serde_json::to_string(&change).expect("serialization of change must work");
 
-        let _deserialized_change: Change = serde_json::from_str(&json).expect("`Change` deserialization must work");
+        let deserialized_change: Change = serde_json::from_str(&json).expect("`Change` deserialization must work");
 
 
         // println!("change_json:\n{}", change_json);
@@ -61,7 +61,8 @@ impl CreateJsonCmd {
         // let json = serde_json::to_string(&change).expect("`Change` serialization must work");
         // println!("change json:\n{}", json);
         // let deserialized_change: Change = serde_json::from_str(&json).expect("`Change` deserialization must work");
-        assert_eq!(change, change2, "Deserialized `Change` is not equal!");
+        assert_eq!(change.roots, deserialized_change.roots, "Deserialized `Change.roots` is not equal!");
+        assert_eq!(change.files_changed, deserialized_change.files_changed, "Deserialized `Change.roots` is not equal!");
         // ```
 
         Ok(())

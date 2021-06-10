@@ -1,5 +1,5 @@
 //! Abstract-ish representation of paths for VFS.
-use std::fmt;
+use std::{fmt, path::{Path, PathBuf}};
 
 use paths::{AbsPath, AbsPathBuf};
 
@@ -28,7 +28,10 @@ impl<'de> serde::Deserialize<'de> for VfsPath {
         D: serde::Deserializer<'de>,
     {
         let path: &str = serde::Deserialize::deserialize(deserializer)?;
-        let path = VfsPath::new_virtual_path(String::from(path));
+        let path = Path::new(path);
+        let path = PathBuf::from(path);
+        let path = AbsPathBuf::assert(path);
+        let path = VfsPath::from(path);
         Ok(path)
     }
 }

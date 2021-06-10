@@ -72,10 +72,27 @@ pub struct CrateGraph {
     arena: FxHashMap<CrateId, CrateData>,
 }
 
-#[derive(
-    serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CrateId(pub u32);
+
+impl serde::Serialize for CrateId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let s = self.0.to_string();
+        serializer.serialize_str(&s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CrateId {
+    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        unimplemented!("deserialize for `CrateId` is missing");
+    }
+}
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CrateName(SmolStr);

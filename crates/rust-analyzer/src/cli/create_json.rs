@@ -24,21 +24,9 @@ impl CreateJsonCmd {
     /// ```
     pub fn run(self, root: &Path) -> Result<()> {
         println!("Running! {:?}", root);
-        let mut cargo_config = CargoConfig::default();
-        cargo_config.no_sysroot = false;
-        let root = AbsPathBuf::assert(std::env::current_dir()?.join(root));
+        
 
-        let root = AbsPath::assert(&root);
-        let root = ProjectManifest::discover_single(root)?;
-        let ws = ProjectWorkspace::load(root, &cargo_config, &|_| {})?;
-
-        let load_cargo_config = LoadCargoConfig {
-            load_out_dirs_from_check: false,
-            wrap_rustc: false,
-            with_proc_macro: false,
-        };
-
-        let (crate_graph, change) = get_crate_data(ws, &load_cargo_config, &|_| {})?;
+        let (crate_graph, change) = get_crate_data(root, &|_| {})?;
 
         let _json =
             serde_json::to_string(&crate_graph).expect("serialization of crate_graph must work");
@@ -79,10 +67,22 @@ impl CreateJsonCmd {
 }
 
 fn get_crate_data(
-    ws: ProjectWorkspace,
-    config: &LoadCargoConfig,
+    root: &Path,
     progress: &dyn Fn(String),
 ) -> Result<(CrateGraph, Change)> {
+    let mut cargo_config = CargoConfig::default();
+    cargo_config.no_sysroot = false;
+    let root = AbsPathBuf::assert(std::env::current_dir()?.join(root));
+
+    let root = AbsPath::assert(&root);
+    let root = ProjectManifest::discover_single(root)?;
+    let ws = ProjectWorkspace::load(root, &cargo_config, &|_| {})?;
+
+    let config = LoadCargoConfig {
+        load_out_dirs_from_check: false,
+        wrap_rustc: false,
+        with_proc_macro: false,
+    };
     let (sender, receiver) = unbounded();
     let mut vfs = vfs::Vfs::default();
     let mut loader = {

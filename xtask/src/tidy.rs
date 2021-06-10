@@ -27,8 +27,8 @@ fn generate_lint_completions() {
     codegen::generate_lint_completions().unwrap()
 }
 
-#[test]
-fn check_code_formatting() {
+ #[test]
+ fn check_code_formatting() {
     let _dir = pushd(project_root()).unwrap();
     let _e = pushenv("RUSTUP_TOOLCHAIN", "stable");
     crate::ensure_rustfmt().unwrap();
@@ -37,7 +37,7 @@ fn check_code_formatting() {
         let _ = cmd!("cargo fmt").run();
     }
     res.unwrap()
-}
+ }
 
 #[test]
 fn smoke_test_generate_documentation() {
@@ -142,7 +142,7 @@ fn cargo_files_are_tidy() {
 }
 
 #[test]
-fn check_merge_commits() {
+ fn check_merge_commits() {
     let stdout = cmd!("git rev-list --merges --invert-grep --author 'bors\\[bot\\]' HEAD~19..")
         .read()
         .unwrap();
@@ -189,6 +189,8 @@ https://github.blog/2015-06-08-how-to-undo-almost-anything-with-git/#redo-after-
         );
     }
 }
+
+
 
 fn deny_clippy(path: &Path, text: &str) {
     let ignore = &[

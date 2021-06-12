@@ -23,7 +23,6 @@ impl CreateJsonCmd {
     /// cargo run --bin rust-analyzer create-json ../ink/examples/flipper/Cargo.toml
     /// ```
     pub fn run(self, root: &Path) -> Result<()> {
-        println!("Running! {:?}", root);
         
 
         let (crate_graph, change) = get_crate_data(root, &|_| {})?;
@@ -32,10 +31,12 @@ impl CreateJsonCmd {
 
         let _json =
             serde_json::to_string(&crate_graph).expect("serialization of crate_graph must work");
-        // println!("json:\n{}", json);
+        
 
         let json =
             serde_json::to_string(&change).expect("serialization of change must work");
+
+        println!("{}", json);
 
         let deserialized_change: Change = serde_json::from_str(&json).expect("`Change` deserialization must work");
 
@@ -83,7 +84,7 @@ fn get_crate_data(
 
     let config = LoadCargoConfig {
         load_out_dirs_from_check: false,
-        wrap_rustc: false,
+   //     wrap_rustc: false,
         with_proc_macro: false,
     };
     let (sender, receiver) = unbounded();
@@ -102,7 +103,7 @@ fn get_crate_data(
     };
 
     let build_data = if config.load_out_dirs_from_check {
-        let mut collector = BuildDataCollector::new(config.wrap_rustc);
+        let mut collector = BuildDataCollector::default();
         ws.collect_build_data_configs(&mut collector);
         Some(collector.collect(progress)?)
     } else {

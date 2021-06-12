@@ -92,6 +92,7 @@ dependencies = [
  "profile",
  "rustc-hash",
  "salsa",
+ "serde",
  "stdx",
  "syntax",
  "test_utils",
@@ -156,6 +157,7 @@ dependencies = [
  "expect-test",
  "mbe",
  "rustc-hash",
+ "serde",
  "syntax",
  "tt",
 ]
@@ -534,6 +536,7 @@ dependencies = [
  "parser",
  "profile",
  "rustc-hash",
+ "serde",
  "syntax",
  "test_utils",
  "tt",
@@ -1097,6 +1100,9 @@ dependencies = [
 [[package]]
 name = "paths"
 version = "0.0.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "percent-encoding"
@@ -1868,6 +1874,7 @@ dependencies = [
  "fst",
  "paths",
  "rustc-hash",
+ "serde",
 ]
 
 [[package]]

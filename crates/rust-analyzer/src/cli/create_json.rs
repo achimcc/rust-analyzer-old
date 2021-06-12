@@ -36,9 +36,11 @@ impl CreateJsonCmd {
         let json =
             serde_json::to_string(&change).expect("serialization of change must work");
 
+        // let json = str::replace(&json,  "'","@@@"); 
+        
         println!("{}", json);
 
-        let deserialized_change: Change = serde_json::from_str(&json).expect("`Change` deserialization must work");
+        // let deserialized_change: Change = serde_json::from_str(&json).expect("`Change` deserialization must work");
 
 
         // println!("change_json:\n{}", change_json);
@@ -62,8 +64,8 @@ impl CreateJsonCmd {
         // let json = serde_json::to_string(&change).expect("`Change` serialization must work");
         // println!("change json:\n{}", json);
         // let deserialized_change: Change = serde_json::from_str(&json).expect("`Change` deserialization must work");
-        assert_eq!(change.roots, deserialized_change.roots, "Deserialized `Change.roots` is not equal!");
-        assert_eq!(change.files_changed, deserialized_change.files_changed, "Deserialized `Change.roots` is not equal!");
+        // assert_eq!(change.roots, deserialized_change.roots, "Deserialized `Change.roots` is not equal!");
+        // assert_eq!(change.files_changed, deserialized_change.files_changed, "Deserialized `Change.roots` is not equal!");
         // ```
 
         Ok(())

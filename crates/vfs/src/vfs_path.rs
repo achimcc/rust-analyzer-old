@@ -1,5 +1,5 @@
 //! Abstract-ish representation of paths for VFS.
-use std::{fmt, path::{Path, PathBuf}};
+use std::{fmt};
 
 use paths::{AbsPath, AbsPathBuf};
 
@@ -22,6 +22,10 @@ impl serde::Serialize for VfsPath {
     }
 }
 
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
 impl<'de> serde::Deserialize<'de> for VfsPath {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -32,6 +36,18 @@ impl<'de> serde::Deserialize<'de> for VfsPath {
         let path = PathBuf::from(path);
         let path = AbsPathBuf::assert(path);
         let path = VfsPath::from(path);
+        Ok(path)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl<'de> serde::Deserialize<'de> for VfsPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let path: &str = serde::Deserialize::deserialize(deserializer)?;
+        let path = VfsPath::new_virtual_path(path.to_string());
         Ok(path)
     }
 }

@@ -1,5 +1,6 @@
 //! Thin wrappers around `std::path`, distinguishing between absolute and
 //! relative paths.
+use serde;
 use std::{
     convert::{TryFrom, TryInto},
     ops,
@@ -7,7 +8,9 @@ use std::{
 };
 
 /// Wrapper around an absolute [`PathBuf`].
-#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash,
+)]
 pub struct AbsPathBuf(PathBuf);
 
 impl From<AbsPathBuf> for PathBuf {

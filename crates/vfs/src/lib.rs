@@ -56,10 +56,27 @@ pub use paths::{AbsPath, AbsPathBuf};
 /// Handle to a file in [`Vfs`]
 ///
 /// Most functions in rust-analyzer use this when they need to refer to a file.
-#[derive(
-    serde::Serialize, serde::Deserialize, Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Hash,
-)]
+#[derive(Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct FileId(pub u32);
+
+impl serde::Serialize for FileId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let s = self.0.to_string();
+        serializer.serialize_str(&s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FileId {
+    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        unimplemented!("deserialize for `FileId` is missing");
+    }
+}
 
 /// Storage for all files read by rust-analyzer.
 ///

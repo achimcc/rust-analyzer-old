@@ -9,7 +9,7 @@ use std::{convert::TryFrom, env, fs, path::Path, process};
 use lsp_server::Connection;
 use project_model::ProjectManifest;
 use rust_analyzer::{
-    cli::{self, AnalysisStatsCmd, BenchCmd},
+    cli::{self, AnalysisStatsCmd, BenchCmd, CreateJsonCmd},
     config::Config,
     from_json,
     lsp_ext::supports_utf8,
@@ -97,6 +97,7 @@ fn try_main() -> Result<()> {
         }
         flags::RustAnalyzerCmd::Ssr(cmd) => cli::apply_ssr_rules(cmd.rule)?,
         flags::RustAnalyzerCmd::Search(cmd) => cli::search_for_patterns(cmd.pattern, cmd.debug)?,
+        flags::RustAnalyzerCmd::CreateJson(cmd) => CreateJsonCmd {}.run(&cmd.path)?,
     }
     Ok(())
 }

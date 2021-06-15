@@ -24,29 +24,23 @@ impl CreateJsonCmd {
     /// ```
     pub fn run(self, root: &Path) -> Result<()> {
         println!("Running! {:?}", root);
-        let mut cargo_config = CargoConfig::default();
-        cargo_config.no_sysroot = false;
-        let root = AbsPathBuf::assert(std::env::current_dir()?.join(root));
+        
 
-        let root = AbsPath::assert(&root);
-        let root = ProjectManifest::discover_single(root)?;
-        let ws = ProjectWorkspace::load(root, &cargo_config, &|_| {})?;
+        let (crate_graph, change) = get_crate_data(root, &|_| {})?;
 
-        let load_cargo_config = LoadCargoConfig {
-            load_out_dirs_from_check: false,
-            wrap_rustc: false,
-            with_proc_macro: false,
-        };
-
-        let (crate_graph, change) = get_crate_data(ws, &load_cargo_config, &|_| {})?;
+        // let (_, change2) = get_crate_data(root, &|_| {})?;
 
         let _json =
             serde_json::to_string(&crate_graph).expect("serialization of crate_graph must work");
         // println!("json:\n{}", json);
 
-        let change_json =
+        let json =
             serde_json::to_string(&change).expect("serialization of change must work");
-        println!("change_json:\n{}", change_json);
+
+        let deserialized_change: Change = serde_json::from_str(&json).expect("`Change` deserialization must work");
+
+
+        // println!("change_json:\n{}", change_json);
 
         // deserialize from json string
         /*
@@ -67,7 +61,8 @@ impl CreateJsonCmd {
         // let json = serde_json::to_string(&change).expect("`Change` serialization must work");
         // println!("change json:\n{}", json);
         // let deserialized_change: Change = serde_json::from_str(&json).expect("`Change` deserialization must work");
-        // assert_eq!(change, deserialized_change, "Deserialized `Change` is not equal!");
+        assert_eq!(change.roots, deserialized_change.roots, "Deserialized `Change.roots` is not equal!");
+        assert_eq!(change.files_changed, deserialized_change.files_changed, "Deserialized `Change.roots` is not equal!");
         // ```
 
         Ok(())
@@ -75,10 +70,22 @@ impl CreateJsonCmd {
 }
 
 fn get_crate_data(
-    ws: ProjectWorkspace,
-    config: &LoadCargoConfig,
+    root: &Path,
     progress: &dyn Fn(String),
 ) -> Result<(CrateGraph, Change)> {
+    let mut cargo_config = CargoConfig::default();
+    cargo_config.no_sysroot = false;
+    let root = AbsPathBuf::assert(std::env::current_dir()?.join(root));
+
+    let root = AbsPath::assert(&root);
+    let root = ProjectManifest::discover_single(root)?;
+    let ws = ProjectWorkspace::load(root, &cargo_config, &|_| {})?;
+
+    let config = LoadCargoConfig {
+        load_out_dirs_from_check: false,
+        wrap_rustc: false,
+        with_proc_macro: false,
+    };
     let (sender, receiver) = unbounded();
     let mut vfs = vfs::Vfs::default();
     let mut loader = {

@@ -71,11 +71,13 @@ impl serde::Serialize for FileId {
 }
 
 impl<'de> serde::Deserialize<'de> for FileId {
-    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        unimplemented!("deserialize for `FileId` is missing");
+        let s: &str = serde::Deserialize::deserialize(deserializer)?;
+        let id = s.parse::<u32>().unwrap();
+        Ok(FileId(id))
     }
 }
 

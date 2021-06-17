@@ -112,7 +112,7 @@ fn get_crate_data(
 
     let config = LoadCargoConfig {
         load_out_dirs_from_check: false,
-   //     wrap_rustc: false,
+        wrap_rustc: false,
         with_proc_macro: false,
     };
     let (sender, receiver) = unbounded();
@@ -131,7 +131,7 @@ fn get_crate_data(
     };
 
     let build_data = if config.load_out_dirs_from_check {
-        let mut collector = BuildDataCollector::default();
+        let mut collector = BuildDataCollector::new(config.wrap_rustc);
         ws.collect_build_data_configs(&mut collector);
         Some(collector.collect(progress)?)
     } else {

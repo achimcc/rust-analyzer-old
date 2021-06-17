@@ -10,7 +10,7 @@ use std::{convert::TryFrom, env, fs, path::Path, process};
 use lsp_server::Connection;
 use project_model::ProjectManifest;
 use rust_analyzer::{
-    cli::{self, AnalysisStatsCmd, BenchCmd, CreateJsonCmd},
+    cli::{self, AnalysisStatsCmd, CreateJsonCmd},
     config::Config,
     from_json,
     lsp_ext::supports_utf8,

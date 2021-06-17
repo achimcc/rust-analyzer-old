@@ -3,7 +3,7 @@
 pub(crate) mod load_cargo;
 mod analysis_stats;
 mod create_json;
-mod analysis_bench;
+// mod analysis_bench;
 mod diagnostics;
 mod progress_report;
 mod ssr;

@@ -974,3 +974,79 @@ fn param_overrides_fn() {
         "#,
     )
 }
+
+#[test]
+fn lifetime_from_chalk_during_deref() {
+    check_types(
+        r#"
+        #[lang = "deref"]
+        pub trait Deref {
+            type Target;
+        }
+
+        struct Box<T: ?Sized> {}
+        impl<T> Deref for Box<T> {
+            type Target = T;
+
+            fn deref(&self) -> &Self::Target {
+                loop {}
+            }
+        }
+
+        trait Iterator {
+            type Item;
+        }
+
+        pub struct Iter<'a, T: 'a> {
+            inner: Box<dyn IterTrait<'a, T, Item = &'a T> + 'a>,
+        }
+
+        trait IterTrait<'a, T: 'a>: Iterator<Item = &'a T> {
+            fn clone_box(&self);
+        }
+
+        fn clone_iter<T>(s: Iter<T>) {
+            s.inner.clone_box();
+          //^^^^^^^^^^^^^^^^^^^ ()
+        }
+        "#,
+    )
+}
+
+#[test]
+fn issue_8686() {
+    check_infer(
+        r#"
+pub trait Try: FromResidual {
+    type Output;
+    type Residual;
+}
+pub trait FromResidual<R = <Self as Try>::Residual> {
+     fn from_residual(residual: R) -> Self;
+}
+
+struct ControlFlow<B, C>;
+impl<B, C> Try for ControlFlow<B, C> {
+    type Output = C;
+    type Residual = ControlFlow<B, !>;
+}
+impl<B, C> FromResidual for ControlFlow<B, C> {
+    fn from_residual(r: ControlFlow<B, !>) -> Self { ControlFlow }
+}
+
+fn test() {
+    ControlFlow::from_residual(ControlFlow::<u32, !>);
+}
+        "#,
+        expect![[r#"
+            144..152 'residual': R
+            365..366 'r': ControlFlow<B, !>
+            395..410 '{ ControlFlow }': ControlFlow<B, C>
+            397..408 'ControlFlow': ControlFlow<B, C>
+            424..482 '{     ...!>); }': ()
+            430..456 'Contro...sidual': fn from_residual<ControlFlow<u32, {unknown}>, ControlFlow<u32, !>>(ControlFlow<u32, !>) -> ControlFlow<u32, {unknown}>
+            430..479 'Contro...2, !>)': ControlFlow<u32, {unknown}>
+            457..478 'Contro...32, !>': ControlFlow<u32, !>
+        "#]],
+    );
+}

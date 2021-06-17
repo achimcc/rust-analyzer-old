@@ -113,6 +113,9 @@ pub(crate) fn import_on_the_fly(acc: &mut Completions, ctx: &CompletionContext) 
     if ctx.use_item_syntax.is_some()
         || ctx.attribute_under_caret.is_some()
         || ctx.mod_declaration_under_caret.is_some()
+        || ctx.record_lit_syntax.is_some()
+        || ctx.has_trait_parent
+        || ctx.has_impl_parent
     {
         return None;
     }
@@ -129,7 +132,7 @@ pub(crate) fn import_on_the_fly(acc: &mut Completions, ctx: &CompletionContext) 
 
     let user_input_lowercased = potential_import_name.to_lowercase();
     let import_assets = import_assets(ctx, potential_import_name)?;
-    let import_scope = ImportScope::find_insert_use_container(
+    let import_scope = ImportScope::find_insert_use_container_with_macros(
         position_for_import(ctx, Some(import_assets.import_candidate()))?,
         &ctx.sema,
     )?;
@@ -1032,6 +1035,119 @@ fn main() {
     Te$0
 }"#,
             expect![[]],
+        );
+    }
+
+    #[test]
+    fn no_fuzzy_during_fields_of_record_lit_syntax() {
+        check(
+            r#"
+mod m {
+    pub fn some_fn() -> i32 {
+        42
+    }
+}
+struct Foo {
+    some_field: i32,
+}
+fn main() {
+    let _ = Foo { so$0 };
+}
+"#,
+            expect![[]],
+        );
+    }
+
+    #[test]
+    fn fuzzy_after_fields_of_record_lit_syntax() {
+        check(
+            r#"
+mod m {
+    pub fn some_fn() -> i32 {
+        42
+    }
+}
+struct Foo {
+    some_field: i32,
+}
+fn main() {
+    let _ = Foo { some_field: so$0 };
+}
+"#,
+            expect![[r#"
+                fn some_fn() (m::some_fn) fn() -> i32
+            "#]],
+        );
+    }
+
+    #[test]
+    fn no_flyimports_in_traits_and_impl_declarations() {
+        check(
+            r#"
+mod m {
+    pub fn some_fn() -> i32 {
+        42
+    }
+}
+trait Foo {
+    som$0
+}
+"#,
+            expect![[r#""#]],
+        );
+
+        check(
+            r#"
+mod m {
+    pub fn some_fn() -> i32 {
+        42
+    }
+}
+struct Foo;
+impl Foo {
+    som$0
+}
+"#,
+            expect![[r#""#]],
+        );
+
+        check(
+            r#"
+mod m {
+    pub fn some_fn() -> i32 {
+        42
+    }
+}
+struct Foo;
+trait Bar {}
+impl Bar for Foo {
+    som$0
+}
+"#,
+            expect![[r#""#]],
+        );
+    }
+
+    #[test]
+    fn no_inherent_candidates_proposed() {
+        check(
+            r#"
+mod baz {
+    pub trait DefDatabase {
+        fn method1(&self);
+    }
+    pub trait HirDatabase: DefDatabase {
+        fn method2(&self);
+    }
+}
+
+mod bar {
+    fn test(db: &dyn crate::baz::HirDatabase) {
+        db.metho$0
+    }
+}
+            "#,
+            expect![[r#""#]],
         );
     }
 }

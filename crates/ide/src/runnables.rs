@@ -98,6 +98,7 @@ impl Runnable {
 //
 // | VS Code | **Rust Analyzer: Run**
 // |===
+// image::https://user-images.githubusercontent.com/48062697/113065583-055aae80-91b1-11eb-958f-d67efcaf6a2f.gif[]
 pub(crate) fn runnables(db: &RootDatabase, file_id: FileId) -> Vec<Runnable> {
     let sema = Semantics::new(db);
 
@@ -298,16 +299,16 @@ fn module_def_doctest(sema: &Semantics<RootDatabase>, def: hir::ModuleDef) -> Op
             // FIXME: this also looks very wrong
             if let Some(assoc_def) = assoc_def {
                 if let hir::AssocItemContainer::Impl(imp) = assoc_def.container(sema.db) {
-                    let ty = imp.target_ty(sema.db);
+                    let ty = imp.self_ty(sema.db);
                     if let Some(adt) = ty.as_adt() {
                         let name = adt.name(sema.db);
                         let idx = path.rfind(':').map_or(0, |idx| idx + 1);
                         let (prefix, suffix) = path.split_at(idx);
-                        let mut ty_params = ty.type_parameters().peekable();
-                        let params = if ty_params.peek().is_some() {
+                        let mut ty_args = ty.type_arguments().peekable();
+                        let params = if ty_args.peek().is_some() {
                             format!(
                                 "<{}>",
-                                ty_params.format_with(", ", |ty, cb| cb(&ty.display(sema.db)))
+                                ty_args.format_with(", ", |ty, cb| cb(&ty.display(sema.db)))
                             )
                         } else {
                             String::new()

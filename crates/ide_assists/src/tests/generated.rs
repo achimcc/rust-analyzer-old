@@ -206,6 +206,38 @@ const _: i32 = 0b1010;
 }
 
 #[test]
+fn doctest_convert_into_to_from() {
+    check_doc_test(
+        "convert_into_to_from",
+        r#####"
+//- /lib.rs crate:core
+pub mod convert { pub trait Into<T> { pub fn into(self) -> T; } }
+//- /lib.rs crate:main deps:core
+use core::convert::Into;
+impl $0Into<Thing> for usize {
+    fn into(self) -> Thing {
+        Thing {
+            b: self.to_string(),
+            a: self
+        }
+    }
+}
+"#####,
+        r#####"
+use core::convert::Into;
+impl From<usize> for Thing {
+    fn from(val: usize) -> Self {
+        Thing {
+            b: val.to_string(),
+            a: val
+        }
+    }
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_convert_iter_for_each_to_for() {
     check_doc_test(
         "convert_iter_for_each_to_for",
@@ -254,6 +286,47 @@ fn main() {
     }
     foo();
     bar();
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_convert_tuple_struct_to_named_struct() {
+    check_doc_test(
+        "convert_tuple_struct_to_named_struct",
+        r#####"
+struct Point$0(f32, f32);
+
+impl Point {
+    pub fn new(x: f32, y: f32) -> Self {
+        Point(x, y)
+    }
+
+    pub fn x(&self) -> f32 {
+        self.0
+    }
+
+    pub fn y(&self) -> f32 {
+        self.1
+    }
+}
+"#####,
+        r#####"
+struct Point { field1: f32, field2: f32 }
+
+impl Point {
+    pub fn new(x: f32, y: f32) -> Self {
+        Point { field1: x, field2: y }
+    }
+
+    pub fn x(&self) -> f32 {
+        self.field1
+    }
+
+    pub fn y(&self) -> f32 {
+        self.field2
+    }
 }
 "#####,
     )
@@ -324,6 +397,25 @@ enum A { $0One(u32, u32) }
 struct One(pub u32, pub u32);
 
 enum A { One(One) }
+"#####,
+    )
+}
+
+#[test]
+fn doctest_extract_type_alias() {
+    check_doc_test(
+        "extract_type_alias",
+        r#####"
+struct S {
+    field: $0(u8, u8, u8)$0,
+}
+"#####,
+        r#####"
+type $0Type = (u8, u8, u8);
+
+struct S {
+    field: Type,
+}
 "#####,
     )
 }
@@ -494,6 +586,33 @@ impl Example {
 impl Default for Example {
     fn default() -> Self {
         Self::new()
+    }
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_generate_deref() {
+    check_doc_test(
+        "generate_deref",
+        r#####"
+struct A;
+struct B {
+   $0a: A
+}
+"#####,
+        r#####"
+struct A;
+struct B {
+   a: A
+}
+
+impl std::ops::Deref for B {
+    type Target = A;
+
+    fn deref(&self) -> &Self::Target {
+        &self.a
     }
 }
 "#####,

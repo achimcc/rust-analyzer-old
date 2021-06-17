@@ -9,33 +9,33 @@ use hir_ty::display::{
     write_bounds_like_dyn_trait_with_prefix, write_visibility, HirDisplay, HirDisplayError,
     HirFormatter,
 };
+use hir_ty::Interner;
 use syntax::ast::{self, NameOwner};
 
 use crate::{
     Adt, Const, ConstParam, Enum, Field, Function, GenericParam, HasVisibility, LifetimeParam,
-    Module, Static, Struct, Substitution, Trait, Type, TypeAlias, TypeParam, Union, Variant,
+    Module, Static, Struct, Trait, TyBuilder, Type, TypeAlias, TypeParam, Union, Variant,
 };
 
 impl HirDisplay for Function {
     fn hir_fmt(&self, f: &mut HirFormatter) -> Result<(), HirDisplayError> {
         let data = f.db.function_data(self.id);
         write_visibility(self.module(f.db).id, self.visibility(f.db), f)?;
-        let qual = &data.qualifier;
-        if qual.is_default {
+        if data.is_default() {
             write!(f, "default ")?;
         }
-        if qual.is_const {
+        if data.is_const() {
             write!(f, "const ")?;
         }
-        if qual.is_async {
+        if data.is_async() {
             write!(f, "async ")?;
         }
-        if qual.is_unsafe {
+        if data.is_unsafe() {
             write!(f, "unsafe ")?;
         }
-        if let Some(abi) = &qual.abi {
+        if let Some(abi) = &data.abi {
             // FIXME: String escape?
-            write!(f, "extern \"{}\" ", abi)?;
+            write!(f, "extern \"{}\" ", &**abi)?;
         }
         write!(f, "fn {}", data.name)?;
 
@@ -68,7 +68,7 @@ impl HirDisplay for Function {
                 write!(f, ", ")?;
             } else {
                 first = false;
-                if data.has_self_param {
+                if data.has_self_param() {
                     write_self_param(type_ref, f)?;
                     continue;
                 }
@@ -88,10 +88,10 @@ impl HirDisplay for Function {
         // `FunctionData::ret_type` will be `::core::future::Future<Output = ...>` for async fns.
         // Use ugly pattern match to strip the Future trait.
         // Better way?
-        let ret_type = if !qual.is_async {
+        let ret_type = if !data.is_async() {
             &data.ret_type
         } else {
-            match &data.ret_type {
+            match &*data.ret_type {
                 TypeRef::ImplTrait(bounds) => match &bounds[0] {
                     TypeBound::Path(path) => {
                         path.segments().iter().last().unwrap().args_and_bindings.unwrap().bindings
@@ -170,7 +170,7 @@ impl HirDisplay for Field {
     fn hir_fmt(&self, f: &mut HirFormatter) -> Result<(), HirDisplayError> {
         write_visibility(self.parent.module(f.db).id, self.visibility(f.db), f)?;
         write!(f, "{}: ", self.name(f.db))?;
-        self.signature_ty(f.db).hir_fmt(f)
+        self.ty(f.db).hir_fmt(f)
     }
 }
 
@@ -235,8 +235,9 @@ impl HirDisplay for TypeParam {
     fn hir_fmt(&self, f: &mut HirFormatter) -> Result<(), HirDisplayError> {
         write!(f, "{}", self.name(f.db))?;
         let bounds = f.db.generic_predicates_for_param(self.id);
-        let substs = Substitution::type_params(f.db, self.id.parent);
-        let predicates = bounds.iter().cloned().map(|b| b.subst(&substs)).collect::<Vec<_>>();
+        let substs = TyBuilder::type_params_subst(f.db, self.id.parent);
+        let predicates =
+            bounds.iter().cloned().map(|b| b.substitute(&Interner, &substs)).collect::<Vec<_>>();
         if !(predicates.is_empty() || f.omit_verbose_types()) {
             write_bounds_like_dyn_trait_with_prefix(":", &predicates, f)?;
         }

@@ -1,6 +1,8 @@
+use std::time::Instant;
+
 use expect_test::{expect_file, ExpectFile};
 use ide_db::SymbolKind;
-use test_utils::{bench, bench_fixture, skip_slow_tests};
+use test_utils::{bench, bench_fixture, skip_slow_tests, AssertLinear};
 
 use crate::{fixture, FileRange, HlTag, TextRange};
 
@@ -258,6 +260,36 @@ fn benchmark_syntax_highlighting_long_struct() {
 }
 
 #[test]
+fn syntax_highlighting_not_quadratic() {
+    if skip_slow_tests() {
+        return;
+    }
+
+    let mut al = AssertLinear::default();
+    while al.next_round() {
+        for i in 6..=10 {
+            let n = 1 << i;
+
+            let fixture = bench_fixture::big_struct_n(n);
+            let (analysis, file_id) = fixture::file(&fixture);
+
+            let time = Instant::now();
+
+            let hash = analysis
+                .highlight(file_id)
+                .unwrap()
+                .iter()
+                .filter(|it| it.highlight.tag == HlTag::Symbol(SymbolKind::Struct))
+                .count();
+            assert!(hash > n as usize);
+
+            let elapsed = time.elapsed();
+            al.sample(n as f64, elapsed.as_millis() as f64);
+        }
+    }
+}
+
+#[test]
 fn benchmark_syntax_highlighting_parser() {
     if skip_slow_tests() {
         return;
@@ -275,7 +307,7 @@ fn benchmark_syntax_highlighting_parser() {
             .filter(|it| it.highlight.tag == HlTag::Symbol(SymbolKind::Function))
             .count()
     };
-    assert_eq!(hash, 1629);
+    assert_eq!(hash, 1632);
 }
 
 #[test]
@@ -544,9 +576,17 @@ impl Foo {
 }
 
 /// [`Foo`](Foo) is a struct
-/// [`all_the_links`](all_the_links) is this function
+/// This function is > [`all_the_links`](all_the_links) <
 /// [`noop`](noop) is a macro below
+/// [`Item`] is a struct in the module [`module`]
+///
+/// [`Item`]: module::Item
+/// [mix_and_match]: ThisShouldntResolve
 pub fn all_the_links() {}
+
+pub mod module {
+    pub struct Item;
+}
 
 /// ```
 /// noop!(1);

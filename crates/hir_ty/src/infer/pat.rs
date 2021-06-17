@@ -7,15 +7,13 @@ use chalk_ir::Mutability;
 use hir_def::{
     expr::{BindingAnnotation, Expr, Literal, Pat, PatId, RecordFieldPat},
     path::Path,
-    FieldId,
 };
 use hir_expand::name::Name;
 
 use super::{BindingMode, Expectation, InferenceContext};
 use crate::{
-    lower::lower_to_chalk_mutability,
-    utils::{generics, variant_data},
-    Interner, Substitution, Ty, TyKind,
+    lower::lower_to_chalk_mutability, static_lifetime, Interner, Substitution, Ty, TyBuilder,
+    TyExt, TyKind,
 };
 
 impl<'a> InferenceContext<'a> {
@@ -29,13 +27,14 @@ impl<'a> InferenceContext<'a> {
         ellipsis: Option<usize>,
     ) -> Ty {
         let (ty, def) = self.resolve_variant(path);
-        let var_data = def.map(|it| variant_data(self.db.upcast(), it));
+        let var_data = def.map(|it| it.variant_data(self.db.upcast()));
         if let Some(variant) = def {
             self.write_variant_resolution(id.into(), variant);
         }
         self.unify(&ty, expected);
 
-        let substs = ty.substs().cloned().unwrap_or_else(Substitution::empty);
+        let substs =
+            ty.as_adt().map(|(_, s)| s.clone()).unwrap_or_else(|| Substitution::empty(&Interner));
 
         let field_tys = def.map(|it| self.db.field_types(it)).unwrap_or_default();
         let (pre, post) = match ellipsis {
@@ -50,7 +49,9 @@ impl<'a> InferenceContext<'a> {
             let expected_ty = var_data
                 .as_ref()
                 .and_then(|d| d.field(&Name::new_tuple_field(i)))
-                .map_or(self.err_ty(), |field| field_tys[field].clone().subst(&substs));
+                .map_or(self.err_ty(), |field| {
+                    field_tys[field].clone().substitute(&Interner, &substs)
+                });
             let expected_ty = self.normalize_associated_types_in(expected_ty);
             self.infer_pat(subpat, &expected_ty, default_bm);
         }
@@ -67,25 +68,22 @@ impl<'a> InferenceContext<'a> {
         id: PatId,
     ) -> Ty {
         let (ty, def) = self.resolve_variant(path);
-        let var_data = def.map(|it| variant_data(self.db.upcast(), it));
+        let var_data = def.map(|it| it.variant_data(self.db.upcast()));
         if let Some(variant) = def {
             self.write_variant_resolution(id.into(), variant);
         }
 
         self.unify(&ty, expected);
 
-        let substs = ty.substs().cloned().unwrap_or_else(Substitution::empty);
+        let substs =
+            ty.as_adt().map(|(_, s)| s.clone()).unwrap_or_else(|| Substitution::empty(&Interner));
 
         let field_tys = def.map(|it| self.db.field_types(it)).unwrap_or_default();
         for subpat in subpats {
             let matching_field = var_data.as_ref().and_then(|it| it.field(&subpat.name));
-            if let Some(local_id) = matching_field {
-                let field_def = FieldId { parent: def.unwrap(), local_id };
-                self.result.record_pat_field_resolutions.insert(subpat.pat, field_def);
-            }
-
-            let expected_ty = matching_field
-                .map_or(self.err_ty(), |field| field_tys[field].clone().subst(&substs));
+            let expected_ty = matching_field.map_or(self.err_ty(), |field| {
+                field_tys[field].clone().substitute(&Interner, &substs)
+            });
             let expected_ty = self.normalize_associated_types_in(expected_ty);
             self.infer_pat(subpat.pat, &expected_ty, default_bm);
         }
@@ -102,7 +100,7 @@ impl<'a> InferenceContext<'a> {
         let body = Arc::clone(&self.body); // avoid borrow checker problem
 
         if is_non_ref_pat(&body, pat) {
-            while let Some((inner, mutability)) = expected.as_reference() {
+            while let Some((inner, _lifetime, mutability)) = expected.as_reference() {
                 expected = inner;
                 default_bm = match default_bm {
                     BindingMode::Move => BindingMode::Ref(mutability),
@@ -124,7 +122,7 @@ impl<'a> InferenceContext<'a> {
         let ty = match &body[pat] {
             &Pat::Tuple { ref args, ellipsis } => {
                 let expectations = match expected.as_tuple() {
-                    Some(parameters) => &*parameters.0,
+                    Some(parameters) => &*parameters.as_slice(&Interner),
                     _ => &[],
                 };
 
@@ -134,7 +132,8 @@ impl<'a> InferenceContext<'a> {
                 };
                 let n_uncovered_patterns = expectations.len().saturating_sub(args.len());
                 let err_ty = self.err_ty();
-                let mut expectations_iter = expectations.iter().chain(repeat(&err_ty));
+                let mut expectations_iter =
+                    expectations.iter().map(|a| a.assert_ty_ref(&Interner)).chain(repeat(&err_ty));
                 let mut infer_pat = |(&pat, ty)| self.infer_pat(pat, ty, default_bm);
 
                 let mut inner_tys = Vec::with_capacity(n_uncovered_patterns + args.len());
@@ -142,7 +141,8 @@ impl<'a> InferenceContext<'a> {
                 inner_tys.extend(expectations_iter.by_ref().take(n_uncovered_patterns).cloned());
                 inner_tys.extend(post.iter().zip(expectations_iter).map(infer_pat));
 
-                TyKind::Tuple(inner_tys.len(), Substitution(inner_tys.into())).intern(&Interner)
+                TyKind::Tuple(inner_tys.len(), Substitution::from_iter(&Interner, inner_tys))
+                    .intern(&Interner)
             }
             Pat::Or(ref pats) => {
                 if let Some((first_pat, rest)) = pats.split_first() {
@@ -158,7 +158,7 @@ impl<'a> InferenceContext<'a> {
             Pat::Ref { pat, mutability } => {
                 let mutability = lower_to_chalk_mutability(*mutability);
                 let expectation = match expected.as_reference() {
-                    Some((inner_ty, exp_mut)) => {
+                    Some((inner_ty, _lifetime, exp_mut)) => {
                         if mutability != exp_mut {
                             // FIXME: emit type error?
                         }
@@ -167,10 +167,10 @@ impl<'a> InferenceContext<'a> {
                     _ => self.result.standard_types.unknown.clone(),
                 };
                 let subty = self.infer_pat(*pat, &expectation, default_bm);
-                TyKind::Ref(mutability, subty).intern(&Interner)
+                TyKind::Ref(mutability, static_lifetime(), subty).intern(&Interner)
             }
             Pat::TupleStruct { path: p, args: subpats, ellipsis } => self.infer_tuple_struct_pat(
-                p.as_ref(),
+                p.as_deref(),
                 subpats,
                 expected,
                 default_bm,
@@ -178,7 +178,7 @@ impl<'a> InferenceContext<'a> {
                 *ellipsis,
             ),
             Pat::Record { path: p, args: fields, ellipsis: _ } => {
-                self.infer_record_pat(p.as_ref(), fields, expected, default_bm, pat)
+                self.infer_record_pat(p.as_deref(), fields, expected, default_bm, pat)
             }
             Pat::Path(path) => {
                 // FIXME use correct resolver for the surrounding expression
@@ -200,7 +200,8 @@ impl<'a> InferenceContext<'a> {
 
                 let bound_ty = match mode {
                     BindingMode::Ref(mutability) => {
-                        TyKind::Ref(mutability, inner_ty.clone()).intern(&Interner)
+                        TyKind::Ref(mutability, static_lifetime(), inner_ty.clone())
+                            .intern(&Interner)
                     }
                     BindingMode::Move => inner_ty.clone(),
                 };
@@ -209,17 +210,20 @@ impl<'a> InferenceContext<'a> {
                 return inner_ty;
             }
             Pat::Slice { prefix, slice, suffix } => {
-                let (container_ty, elem_ty): (fn(_) -> _, _) = match expected.interned(&Interner) {
-                    TyKind::Array(st) => (TyKind::Array, st.clone()),
-                    TyKind::Slice(st) => (TyKind::Slice, st.clone()),
-                    _ => (TyKind::Slice, self.err_ty()),
+                let elem_ty = match expected.kind(&Interner) {
+                    TyKind::Array(st, _) | TyKind::Slice(st) => st.clone(),
+                    _ => self.err_ty(),
                 };
 
                 for pat_id in prefix.iter().chain(suffix) {
                     self.infer_pat(*pat_id, &elem_ty, default_bm);
                 }
 
-                let pat_ty = container_ty(elem_ty).intern(&Interner);
+                let pat_ty = match expected.kind(&Interner) {
+                    TyKind::Array(_, const_) => TyKind::Array(elem_ty, const_.clone()),
+                    _ => TyKind::Slice(elem_ty),
+                }
+                .intern(&Interner);
                 if let Some(slice_pat_id) = slice {
                     self.infer_pat(*slice_pat_id, &pat_ty, default_bm);
                 }
@@ -236,30 +240,20 @@ impl<'a> InferenceContext<'a> {
             Pat::Box { inner } => match self.resolve_boxed_box() {
                 Some(box_adt) => {
                     let (inner_ty, alloc_ty) = match expected.as_adt() {
-                        Some((adt, subst)) if adt == box_adt => {
-                            (subst[0].clone(), subst.get(1).cloned())
-                        }
+                        Some((adt, subst)) if adt == box_adt => (
+                            subst.at(&Interner, 0).assert_ty_ref(&Interner).clone(),
+                            subst.as_slice(&Interner).get(1).and_then(|a| a.ty(&Interner).cloned()),
+                        ),
                         _ => (self.result.standard_types.unknown.clone(), None),
                     };
 
                     let inner_ty = self.infer_pat(*inner, &inner_ty, default_bm);
-                    let mut sb = Substitution::build_for_generics(&generics(
-                        self.db.upcast(),
-                        box_adt.into(),
-                    ));
-                    sb = sb.push(inner_ty);
-                    if sb.remaining() == 1 {
-                        sb = sb.push(match alloc_ty {
-                            Some(alloc_ty) if !alloc_ty.is_unknown() => alloc_ty,
-                            _ => match self.db.generic_defaults(box_adt.into()).get(1) {
-                                Some(alloc_ty) if !alloc_ty.value.is_unknown() => {
-                                    alloc_ty.value.clone()
-                                }
-                                _ => self.table.new_type_var(),
-                            },
-                        });
+                    let mut b = TyBuilder::adt(self.db, box_adt).push(inner_ty);
+
+                    if let Some(alloc_ty) = alloc_ty {
+                        b = b.push(alloc_ty);
                     }
-                    Ty::adt_ty(box_adt, sb.build())
+                    b.fill_with_defaults(self.db, || self.table.new_type_var()).build()
                 }
                 None => self.err_ty(),
             },

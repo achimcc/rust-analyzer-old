@@ -4,7 +4,7 @@
     alt="rust-analyzer logo">
 </p>
 
-rust-analyzer is an **experimental** modular compiler frontend for the Rust language.
+rust-analyzer is a modular compiler frontend for the Rust language.
 It is a part of a larger rls-2.0 effort to create excellent IDE support for Rust.
 
 Work on rust-analyzer is sponsored by
@@ -33,9 +33,9 @@ For usage and troubleshooting requests, please use "IDEs and Editors" category o
 
 https://users.rust-lang.org/c/ide/14
 
-For questions about development and implementation, join rls-2.0 working group on Zulip:
+For questions about development and implementation, join rust-analyzer working group on Zulip:
 
-https://rust-lang.zulipchat.com/#narrow/stream/185405-t-compiler.2Frls-2.2E0
+https://rust-lang.zulipchat.com/#narrow/stream/185405-t-compiler.2Frust-analyzer
 
 ## Quick Links
 

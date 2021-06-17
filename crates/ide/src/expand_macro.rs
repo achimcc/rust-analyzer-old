@@ -1,9 +1,9 @@
+use std::iter;
+
 use hir::Semantics;
 use ide_db::RootDatabase;
 use syntax::{
-    algo::{find_node_at_offset, SyntaxRewriter},
-    ast, AstNode, NodeOrToken, SyntaxKind,
-    SyntaxKind::*,
+    algo::find_node_at_offset, ast, ted, AstNode, NodeOrToken, SyntaxKind, SyntaxKind::*,
     SyntaxNode, WalkEvent, T,
 };
 
@@ -23,6 +23,8 @@ pub struct ExpandedMacro {
 //
 // | VS Code | **Rust Analyzer: Expand macro recursively**
 // |===
+//
+// image::https://user-images.githubusercontent.com/48062697/113020648-b3973180-917a-11eb-84a9-ecb921293dc5.gif[]
 pub(crate) fn expand_macro(db: &RootDatabase, position: FilePosition) -> Option<ExpandedMacro> {
     let sema = Semantics::new(db);
     let file = sema.parse(position.file_id);
@@ -42,26 +44,23 @@ fn expand_macro_recur(
     sema: &Semantics<RootDatabase>,
     macro_call: &ast::MacroCall,
 ) -> Option<SyntaxNode> {
-    let mut expanded = sema.expand(macro_call)?;
+    let expanded = sema.expand(macro_call)?.clone_for_update();
 
     let children = expanded.descendants().filter_map(ast::MacroCall::cast);
-    let mut rewriter = SyntaxRewriter::default();
+    let mut replacements = Vec::new();
 
-    for child in children.into_iter() {
+    for child in children {
         if let Some(new_node) = expand_macro_recur(sema, &child) {
-            // Replace the whole node if it is root
-            // `replace_descendants` will not replace the parent node
-            // but `SyntaxNode::descendants include itself
+            // check if the whole original syntax is replaced
             if expanded == *child.syntax() {
-                expanded = new_node;
-            } else {
-                rewriter.replace(child.syntax(), &new_node)
+                return Some(new_node);
             }
+            replacements.push((child, new_node));
         }
     }
 
-    let res = rewriter.rewrite(&expanded);
-    Some(res)
+    replacements.into_iter().rev().for_each(|(old, new)| ted::replace(old.syntax(), new));
+    Some(expanded)
 }
 
 // FIXME: It would also be cool to share logic here and in the mbe tests,
@@ -89,24 +88,42 @@ fn insert_whitespaces(syn: SyntaxNode) -> String {
         let is_last =
             |f: fn(SyntaxKind) -> bool, default| -> bool { last.map(f).unwrap_or(default) };
 
-        res += &match token.kind() {
-            k if is_text(k) && is_next(|it| !it.is_punct(), true) => token.text().to_string() + " ",
+        match token.kind() {
+            k if is_text(k) && is_next(|it| !it.is_punct(), true) => {
+                res.push_str(token.text());
+                res.push(' ');
+            }
             L_CURLY if is_next(|it| it != R_CURLY, true) => {
                 indent += 1;
-                let leading_space = if is_last(is_text, false) { " " } else { "" };
-                format!("{}{{\n{}", leading_space, "  ".repeat(indent))
+                if is_last(is_text, false) {
+                    res.push(' ');
+                }
+                res.push_str("{\n");
+                res.extend(iter::repeat(" ").take(2 * indent));
             }
             R_CURLY if is_last(|it| it != L_CURLY, true) => {
                 indent = indent.saturating_sub(1);
-                format!("\n{}}}", "  ".repeat(indent))
+                res.push('\n');
+                res.extend(iter::repeat(" ").take(2 * indent));
+                res.push_str("}");
             }
-            R_CURLY => format!("}}\n{}", "  ".repeat(indent)),
-            T![;] => format!(";\n{}", "  ".repeat(indent)),
-            T![->] => " -> ".to_string(),
-            T![=] => " = ".to_string(),
-            T![=>] => " => ".to_string(),
-            _ => token.text().to_string(),
-        };
+            R_CURLY => {
+                res.push_str("}\n");
+                res.extend(iter::repeat(" ").take(2 * indent));
+            }
+            LIFETIME_IDENT if is_next(|it| it == IDENT, true) => {
+                res.push_str(token.text());
+                res.push(' ');
+            }
+            T![;] => {
+                res.push_str(";\n");
+                res.extend(iter::repeat(" ").take(2 * indent));
+            }
+            T![->] => res.push_str(" -> "),
+            T![=] => res.push_str(" = "),
+            T![=>] => res.push_str(" => "),
+            _ => res.push_str(token.text()),
+        }
 
         last = Some(token.kind());
     }

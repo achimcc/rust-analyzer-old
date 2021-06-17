@@ -1029,6 +1029,42 @@ fn infer_in_elseif() {
 }
 
 #[test]
+fn infer_closure_unify() {
+    check_infer(
+        r#"
+        fn foo(f: bool) {
+            let a = |x| x;
+            let b = |x| x;
+            let id = if f { a } else { b };
+            id(123);
+        }
+        "#,
+        expect![[r#"
+            7..8 'f': bool
+            16..106 '{     ...23); }': ()
+            26..27 'a': |i32| -> i32
+            30..35 '|x| x': |i32| -> i32
+            31..32 'x': i32
+            34..35 'x': i32
+            45..46 'b': |i32| -> i32
+            49..54 '|x| x': |i32| -> i32
+            50..51 'x': i32
+            53..54 'x': i32
+            64..66 'id': |i32| -> i32
+            69..90 'if f {... { b }': |i32| -> i32
+            72..73 'f': bool
+            74..79 '{ a }': |i32| -> i32
+            76..77 'a': |i32| -> i32
+            85..90 '{ b }': |i32| -> i32
+            87..88 'b': |i32| -> i32
+            96..98 'id': |i32| -> i32
+            96..103 'id(123)': i32
+            99..102 '123': i32
+        "#]],
+    )
+}
+
+#[test]
 fn infer_if_match_with_return() {
     check_infer(
         r#"
@@ -1757,6 +1793,24 @@ struct Foo;
 impl i32 { fn foo(&self) -> Foo { Foo } }
 
 fn main() {
+    let x: i32 = i32;
+    x.foo();
+        //^ Foo
+}"#,
+    );
+}
+
+#[test]
+fn shadowing_primitive_with_inner_items() {
+    check_types(
+        r#"
+struct i32;
+struct Foo;
+
+impl i32 { fn foo(&self) -> Foo { Foo } }
+
+fn main() {
+    fn inner() {}
     let x: i32 = i32;
     x.foo();
         //^ Foo
@@ -2562,5 +2616,38 @@ fn f() {
   //^^^^ {unknown}
 }
     "#,
+    )
+}
+
+#[test]
+fn infer_type_alias_variant() {
+    check_infer(
+        r#"
+type Qux = Foo;
+enum Foo {
+    Bar(i32),
+    Baz { baz: f32 }
+}
+
+fn f() {
+    match Foo::Bar(3) {
+        Qux::Bar(bar) => (),
+        Qux::Baz { baz } => (),
+    }
+}
+    "#,
+        expect![[r#"
+            72..166 '{     ...   } }': ()
+            78..164 'match ...     }': ()
+            84..92 'Foo::Bar': Bar(i32) -> Foo
+            84..95 'Foo::Bar(3)': Foo
+            93..94 '3': i32
+            106..119 'Qux::Bar(bar)': Foo
+            115..118 'bar': i32
+            123..125 '()': ()
+            135..151 'Qux::B... baz }': Foo
+            146..149 'baz': f32
+            155..157 '()': ()
+        "#]],
     )
 }

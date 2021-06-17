@@ -17,7 +17,7 @@ use lsp_server::ErrorCode;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
-    CodeActionKind, CodeLens, CompletionItem, Diagnostic, DiagnosticTag, DocumentFormattingParams,
+    CodeLens, CompletionItem, Diagnostic, DiagnosticTag, DocumentFormattingParams,
     DocumentHighlight, FoldingRange, FoldingRangeParams, HoverContents, Location, NumberOrString,
     Position, PrepareRenameResponse, Range, RenameParams, SemanticTokensDeltaParams,
     SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensRangeParams,
@@ -36,7 +36,7 @@ use crate::{
     diff::diff,
     from_proto,
     global_state::{GlobalState, GlobalStateSnapshot},
-    line_index::{LineEndings, LineIndex},
+    line_index::LineEndings,
     lsp_ext::{self, InlayHint, InlayHintsParams},
     lsp_utils::all_edits_are_disjoint,
     to_proto, LspError, Result,
@@ -84,7 +84,8 @@ pub(crate) fn handle_analyzer_status(
 
 pub(crate) fn handle_memory_usage(state: &mut GlobalState, _: ()) -> Result<String> {
     let _p = profile::span("handle_memory_usage");
-    let mem = state.analysis_host.per_query_memory_usage();
+    let mut mem = state.analysis_host.per_query_memory_usage();
+    mem.push(("Remaining".into(), profile::memory_usage().allocated));
 
     let mut out = String::new();
     for (name, bytes) in mem {
@@ -230,7 +231,6 @@ pub(crate) fn handle_on_enter(
     Ok(Some(edit))
 }
 
-// Don't forget to add new trigger characters to `ServerCapabilities` in `caps.rs`.
 pub(crate) fn handle_on_type_formatting(
     snap: GlobalStateSnapshot,
     params: lsp_types::DocumentOnTypeFormattingParams,
@@ -664,10 +664,13 @@ pub(crate) fn handle_completion(
     };
     let line_index = snap.file_line_index(position.file_id)?;
 
+    let insert_replace_support =
+        snap.config.insert_replace_support().then(|| text_document_position.position);
     let items: Vec<CompletionItem> = items
         .into_iter()
         .flat_map(|item| {
-            let mut new_completion_items = to_proto::completion_item(&line_index, item.clone());
+            let mut new_completion_items =
+                to_proto::completion_item(insert_replace_support, &line_index, item.clone());
 
             if completion_config.enable_imports_on_the_fly {
                 for new_item in &mut new_completion_items {
@@ -926,19 +929,22 @@ pub(crate) fn handle_formatting(
     let captured_stderr = String::from_utf8(output.stderr).unwrap_or_default();
 
     if !output.status.success() {
-        match output.status.code() {
-            Some(1) if !captured_stderr.contains("not installed") => {
+        let rustfmt_not_installed =
+            captured_stderr.contains("not installed") || captured_stderr.contains("not available");
+
+        return match output.status.code() {
+            Some(1) if !rustfmt_not_installed => {
                 // While `rustfmt` doesn't have a specific exit code for parse errors this is the
                 // likely cause exiting with 1. Most Language Servers swallow parse errors on
                 // formatting because otherwise an error is surfaced to the user on top of the
                 // syntax error diagnostics they're already receiving. This is especially jarring
                 // if they have format on save enabled.
                 log::info!("rustfmt exited with status 1, assuming parse error and ignoring");
-                return Ok(None);
+                Ok(None)
             }
             _ => {
                 // Something else happened - e.g. `rustfmt` is missing or caught a signal
-                return Err(LspError::new(
+                Err(LspError::new(
                     -32900,
                     format!(
                         r#"rustfmt exited with:
@@ -948,9 +954,9 @@ pub(crate) fn handle_formatting(
                         output.status, captured_stdout, captured_stderr,
                     ),
                 )
-                .into());
+                .into())
             }
-        }
+        };
     }
 
     let (new_text, new_line_endings) = LineEndings::normalize(captured_stdout);
@@ -976,84 +982,52 @@ pub(crate) fn handle_code_action(
     params: lsp_types::CodeActionParams,
 ) -> Result<Option<Vec<lsp_ext::CodeAction>>> {
     let _p = profile::span("handle_code_action");
-    // We intentionally don't support command-based actions, as those either
-    // requires custom client-code anyway, or requires server-initiated edits.
-    // Server initiated edits break causality, so we avoid those as well.
+
     if !snap.config.code_action_literals() {
+        // We intentionally don't support command-based actions, as those either
+        // require either custom client-code or server-initiated edits. Server
+        // initiated edits break causality, so we avoid those.
         return Ok(None);
     }
 
-    let file_id = from_proto::file_id(&snap, &params.text_document.uri)?;
-    let line_index = snap.file_line_index(file_id)?;
-    let range = from_proto::text_range(&line_index, params.range);
-    let frange = FileRange { file_id, range };
+    let line_index =
+        snap.file_line_index(from_proto::file_id(&snap, &params.text_document.uri)?)?;
+    let frange = from_proto::file_range(&snap, params.text_document.clone(), params.range)?;
 
     let mut assists_config = snap.config.assist();
     assists_config.allowed = params
-        .clone()
         .context
         .only
+        .clone()
         .map(|it| it.into_iter().filter_map(from_proto::assist_kind).collect());
 
     let mut res: Vec<lsp_ext::CodeAction> = Vec::new();
 
-    let include_quick_fixes = match &params.context.only {
-        Some(v) => v.iter().any(|it| {
-            it == &lsp_types::CodeActionKind::EMPTY || it == &lsp_types::CodeActionKind::QUICKFIX
-        }),
-        None => true,
-    };
-    if include_quick_fixes {
-        add_quick_fixes(&snap, frange, &line_index, &mut res)?;
+    let code_action_resolve_cap = snap.config.code_action_resolve();
+    let assists = snap.analysis.assists_with_fixes(
+        &assists_config,
+        &snap.config.diagnostics(),
+        !code_action_resolve_cap,
+        frange,
+    )?;
+    for (index, assist) in assists.into_iter().enumerate() {
+        let resolve_data =
+            if code_action_resolve_cap { Some((index, params.clone())) } else { None };
+        let code_action = to_proto::code_action(&snap, assist, resolve_data)?;
+        res.push(code_action)
     }
 
-    if snap.config.code_action_resolve() {
-        for (index, assist) in
-            snap.analysis.assists(&assists_config, false, frange)?.into_iter().enumerate()
-        {
-            res.push(to_proto::unresolved_code_action(&snap, params.clone(), assist, index)?);
-        }
-    } else {
-        for assist in snap.analysis.assists(&assists_config, true, frange)?.into_iter() {
-            res.push(to_proto::resolved_code_action(&snap, assist)?);
+    // Fixes from `cargo check`.
+    for fix in snap.check_fixes.get(&frange.file_id).into_iter().flatten() {
+        // FIXME: this mapping is awkward and shouldn't exist. Refactor
+        // `snap.check_fixes` to not convert to LSP prematurely.
+        let fix_range = from_proto::text_range(&line_index, fix.range);
+        if fix_range.intersect(frange.range).is_some() {
+            res.push(fix.action.clone());
         }
     }
 
     Ok(Some(res))
-}
-
-fn add_quick_fixes(
-    snap: &GlobalStateSnapshot,
-    frange: FileRange,
-    line_index: &LineIndex,
-    acc: &mut Vec<lsp_ext::CodeAction>,
-) -> Result<()> {
-    let diagnostics = snap.analysis.diagnostics(&snap.config.diagnostics(), frange.file_id)?;
-
-    for fix in diagnostics
-        .into_iter()
-        .filter_map(|d| d.fix)
-        .filter(|fix| fix.fix_trigger_range.intersect(frange.range).is_some())
-    {
-        let edit = to_proto::snippet_workspace_edit(&snap, fix.source_change)?;
-        let action = lsp_ext::CodeAction {
-            title: fix.label.to_string(),
-            group: None,
-            kind: Some(CodeActionKind::QUICKFIX),
-            edit: Some(edit),
-            is_preferred: Some(false),
-            data: None,
-        };
-        acc.push(action);
-    }
-
-    for fix in snap.check_fixes.get(&frange.file_id).into_iter().flatten() {
-        let fix_range = from_proto::text_range(&line_index, fix.range);
-        if fix_range.intersect(frange.range).is_some() {
-            acc.push(fix.action.clone());
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn handle_code_action_resolve(
@@ -1078,12 +1052,18 @@ pub(crate) fn handle_code_action_resolve(
         .only
         .map(|it| it.into_iter().filter_map(from_proto::assist_kind).collect());
 
-    let assists = snap.analysis.assists(&assists_config, true, frange)?;
+    let assists = snap.analysis.assists_with_fixes(
+        &assists_config,
+        &snap.config.diagnostics(),
+        true,
+        frange,
+    )?;
+
     let (id, index) = split_once(&params.id, ':').unwrap();
     let index = index.parse::<usize>().unwrap();
     let assist = &assists[index];
     assert!(assist.id.0 == id);
-    let edit = to_proto::resolved_code_action(&snap, assist.clone())?.edit;
+    let edit = to_proto::code_action(&snap, assist.clone(), None)?.edit;
     code_action.edit = edit;
     Ok(code_action)
 }
@@ -1202,7 +1182,7 @@ pub(crate) fn publish_diagnostics(
 
     let diagnostics: Vec<Diagnostic> = snap
         .analysis
-        .diagnostics(&snap.config.diagnostics(), file_id)?
+        .diagnostics(&snap.config.diagnostics(), false, file_id)?
         .into_iter()
         .map(|d| Diagnostic {
             range: to_proto::range(&line_index, d.range),
@@ -1430,7 +1410,7 @@ pub(crate) fn handle_open_cargo_toml(
 pub(crate) fn handle_move_item(
     snap: GlobalStateSnapshot,
     params: lsp_ext::MoveItemParams,
-) -> Result<Option<lsp_types::TextDocumentEdit>> {
+) -> Result<Vec<lsp_ext::SnippetTextEdit>> {
     let _p = profile::span("handle_move_item");
     let file_id = from_proto::file_id(&snap, &params.text_document.uri)?;
     let range = from_proto::file_range(&snap, params.text_document, params.range)?;
@@ -1441,8 +1421,11 @@ pub(crate) fn handle_move_item(
     };
 
     match snap.analysis.move_item(range, direction)? {
-        Some(text_edit) => Ok(Some(to_proto::text_document_edit(&snap, file_id, text_edit)?)),
-        None => Ok(None),
+        Some(text_edit) => {
+            let line_index = snap.file_line_index(file_id)?;
+            Ok(to_proto::snippet_text_edit_vec(&line_index, true, text_edit))
+        }
+        None => Ok(vec![]),
     }
 }
 

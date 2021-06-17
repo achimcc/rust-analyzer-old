@@ -241,26 +241,26 @@ pub struct SsrParams {
     pub selections: Vec<lsp_types::Range>,
 }
 
-pub enum StatusNotification {}
+pub enum ServerStatusNotification {}
 
-#[derive(Serialize, Deserialize)]
+impl Notification for ServerStatusNotification {
+    type Params = ServerStatusParams;
+    const METHOD: &'static str = "experimental/serverStatus";
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Clone)]
+pub struct ServerStatusParams {
+    pub health: Health,
+    pub quiescent: bool,
+    pub message: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub enum Status {
-    Loading,
-    ReadyPartial,
-    Ready,
-    NeedsReload,
-    Invalid,
-}
-
-#[derive(Deserialize, Serialize)]
-pub struct StatusParams {
-    pub status: Status,
-}
-
-impl Notification for StatusNotification {
-    type Params = StatusParams;
-    const METHOD: &'static str = "rust-analyzer/status";
+pub enum Health {
+    Ok,
+    Warning,
+    Error,
 }
 
 pub enum CodeActionRequest {}
@@ -312,6 +312,9 @@ pub struct SnippetWorkspaceEdit {
     pub changes: Option<HashMap<lsp_types::Url, Vec<lsp_types::TextEdit>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document_changes: Option<Vec<SnippetDocumentChangeOperation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_annotations:
+        Option<HashMap<lsp_types::ChangeAnnotationIdentifier, lsp_types::ChangeAnnotation>>,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Deserialize, Serialize)]
@@ -335,6 +338,9 @@ pub struct SnippetTextEdit {
     pub new_text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub insert_text_format: Option<lsp_types::InsertTextFormat>,
+    /// The annotation id if this is an annotated
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotation_id: Option<lsp_types::ChangeAnnotationIdentifier>,
 }
 
 pub enum HoverRequest {}
@@ -407,7 +413,7 @@ pub enum MoveItem {}
 
 impl Request for MoveItem {
     type Params = MoveItemParams;
-    type Result = Option<lsp_types::TextDocumentEdit>;
+    type Result = Vec<SnippetTextEdit>;
     const METHOD: &'static str = "experimental/moveItem";
 }
 

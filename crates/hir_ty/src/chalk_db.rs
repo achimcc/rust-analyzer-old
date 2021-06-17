@@ -1,52 +1,47 @@
-//! Conversion code from/to Chalk.
+//! The implementation of `RustIrDatabase` for Chalk, which provides information
+//! about the code that Chalk needs.
 use std::sync::Arc;
 
 use log::debug;
 
-use chalk_ir::{fold::shift::Shift, CanonicalVarKinds, GenericArg};
+use chalk_ir::{cast::Cast, fold::shift::Shift, CanonicalVarKinds};
 use chalk_solve::rust_ir::{self, OpaqueTyDatumBound, WellKnownTrait};
 
-use base_db::{salsa::InternKey, CrateId};
+use base_db::CrateId;
 use hir_def::{
     lang_item::{lang_attr, LangItemTarget},
-    AssocContainerId, AssocItemId, HasModule, Lookup, TypeAliasId,
+    AssocContainerId, AssocItemId, GenericDefId, HasModule, Lookup, TypeAliasId,
 };
 use hir_expand::name::name;
 
-use super::ChalkContext;
 use crate::{
     db::HirDatabase,
     display::HirDisplay,
-    from_assoc_type_id,
+    from_assoc_type_id, from_chalk_trait_id, make_only_type_binders,
+    mapping::{from_chalk, ToChalk, TypeAliasAsValue},
     method_resolution::{TyFingerprint, ALL_FLOAT_FPS, ALL_INT_FPS},
     to_assoc_type_id, to_chalk_trait_id,
+    traits::ChalkContext,
     utils::generics,
-    AliasEq, AliasTy, BoundVar, CallableDefId, DebruijnIndex, FnDefId, ProjectionTy, Substitution,
-    TraitRef, Ty, TyKind, WhereClause,
-};
-use mapping::{
-    convert_where_clauses, generic_predicate_to_inline_bound, make_binders, TypeAliasAsValue,
+    AliasEq, AliasTy, BoundVar, CallableDefId, DebruijnIndex, FnDefId, Interner, ProjectionTy,
+    ProjectionTyExt, QuantifiedWhereClause, Substitution, TraitRef, TraitRefExt, Ty, TyBuilder,
+    TyExt, TyKind, WhereClause,
 };
 
-pub use self::interner::Interner;
-pub(crate) use self::interner::*;
+pub(crate) type AssociatedTyDatum = chalk_solve::rust_ir::AssociatedTyDatum<Interner>;
+pub(crate) type TraitDatum = chalk_solve::rust_ir::TraitDatum<Interner>;
+pub(crate) type StructDatum = chalk_solve::rust_ir::AdtDatum<Interner>;
+pub(crate) type ImplDatum = chalk_solve::rust_ir::ImplDatum<Interner>;
+pub(crate) type OpaqueTyDatum = chalk_solve::rust_ir::OpaqueTyDatum<Interner>;
 
-pub(super) mod tls;
-mod interner;
-mod mapping;
-
-pub(crate) trait ToChalk {
-    type Chalk;
-    fn to_chalk(self, db: &dyn HirDatabase) -> Self::Chalk;
-    fn from_chalk(db: &dyn HirDatabase, chalk: Self::Chalk) -> Self;
-}
-
-pub(crate) fn from_chalk<T, ChalkT>(db: &dyn HirDatabase, chalk: ChalkT) -> T
-where
-    T: ToChalk<Chalk = ChalkT>,
-{
-    T::from_chalk(db, chalk)
-}
+pub(crate) type AssocTypeId = chalk_ir::AssocTypeId<Interner>;
+pub(crate) type TraitId = chalk_ir::TraitId<Interner>;
+pub(crate) type AdtId = chalk_ir::AdtId<Interner>;
+pub(crate) type ImplId = chalk_ir::ImplId<Interner>;
+pub(crate) type AssociatedTyValueId = chalk_solve::rust_ir::AssociatedTyValueId<Interner>;
+pub(crate) type AssociatedTyValue = chalk_solve::rust_ir::AssociatedTyValue<Interner>;
+pub(crate) type FnDefDatum = chalk_solve::rust_ir::FnDefDatum<Interner>;
+pub(crate) type Variances = chalk_ir::Variances<Interner>;
 
 impl<'a> chalk_solve::RustIrDatabase<Interner> for ChalkContext<'a> {
     fn associated_ty_data(&self, id: AssocTypeId) -> Arc<AssociatedTyDatum> {
@@ -80,19 +75,19 @@ impl<'a> chalk_solve::RustIrDatabase<Interner> for ChalkContext<'a> {
     fn impls_for_trait(
         &self,
         trait_id: TraitId,
-        parameters: &[GenericArg<Interner>],
+        parameters: &[chalk_ir::GenericArg<Interner>],
         binders: &CanonicalVarKinds<Interner>,
     ) -> Vec<ImplId> {
         debug!("impls_for_trait {:?}", trait_id);
-        let trait_: hir_def::TraitId = from_chalk(self.db, trait_id);
+        let trait_: hir_def::TraitId = from_chalk_trait_id(trait_id);
 
-        let ty: Ty = from_chalk(self.db, parameters[0].assert_ty_ref(&Interner).clone());
+        let ty: Ty = parameters[0].assert_ty_ref(&Interner).clone();
 
         fn binder_kind(
             ty: &Ty,
             binders: &CanonicalVarKinds<Interner>,
         ) -> Option<chalk_ir::TyVariableKind> {
-            if let TyKind::BoundVar(bv) = ty.interned(&Interner) {
+            if let TyKind::BoundVar(bv) = ty.kind(&Interner) {
                 let binders = binders.as_slice(&Interner);
                 if bv.debruijn == DebruijnIndex::INNERMOST {
                     if let chalk_ir::VariableKind::Ty(tk) = binders[bv.index].kind {
@@ -103,7 +98,7 @@ impl<'a> chalk_solve::RustIrDatabase<Interner> for ChalkContext<'a> {
             None
         }
 
-        let self_ty_fp = TyFingerprint::for_impl(&ty);
+        let self_ty_fp = TyFingerprint::for_trait_impl(&ty);
         let fps: &[TyFingerprint] = match binder_kind(&ty, binders) {
             Some(chalk_ir::TyVariableKind::Integer) => &ALL_INT_FPS,
             Some(chalk_ir::TyVariableKind::Float) => &ALL_FLOAT_FPS,
@@ -166,7 +161,7 @@ impl<'a> chalk_solve::RustIrDatabase<Interner> for ChalkContext<'a> {
             Some(LangItemTarget::TraitId(trait_)) => trait_,
             _ => return None,
         };
-        Some(trait_.to_chalk(self.db))
+        Some(to_chalk_trait_id(trait_))
     }
 
     fn program_clauses_for_env(
@@ -184,16 +179,16 @@ impl<'a> chalk_solve::RustIrDatabase<Interner> for ChalkContext<'a> {
                     .db
                     .return_type_impl_traits(func)
                     .expect("impl trait id without impl traits");
-                let data = &datas.value.impl_traits[idx as usize];
+                let (datas, binders) = (*datas).as_ref().into_value_and_skipped_binders();
+                let data = &datas.impl_traits[idx as usize];
                 let bound = OpaqueTyDatumBound {
-                    bounds: make_binders(
-                        data.bounds.value.iter().cloned().map(|b| b.to_chalk(self.db)).collect(),
+                    bounds: make_only_type_binders(
                         1,
+                        data.bounds.skip_binders().iter().cloned().collect(),
                     ),
-                    where_clauses: make_binders(vec![], 0),
+                    where_clauses: make_only_type_binders(0, vec![]),
                 };
-                let num_vars = datas.num_binders;
-                make_binders(bound, num_vars)
+                chalk_ir::Binders::new(binders, bound)
             }
             crate::ImplTraitId::AsyncBlockTypeImplTrait(..) => {
                 if let Some((future_trait, future_output)) = self
@@ -215,7 +210,8 @@ impl<'a> chalk_solve::RustIrDatabase<Interner> for ChalkContext<'a> {
                     let impl_bound = WhereClause::Implemented(TraitRef {
                         trait_id: to_chalk_trait_id(future_trait),
                         // Self type as the first parameter.
-                        substitution: Substitution::single(
+                        substitution: Substitution::from1(
+                            &Interner,
                             TyKind::BoundVar(BoundVar {
                                 debruijn: DebruijnIndex::INNERMOST,
                                 index: 0,
@@ -227,7 +223,8 @@ impl<'a> chalk_solve::RustIrDatabase<Interner> for ChalkContext<'a> {
                         alias: AliasTy::Projection(ProjectionTy {
                             associated_ty_id: to_assoc_type_id(future_output),
                             // Self type as the first parameter.
-                            substitution: Substitution::single(
+                            substitution: Substitution::from1(
+                                &Interner,
                                 TyKind::BoundVar(BoundVar::new(DebruijnIndex::INNERMOST, 0))
                                     .intern(&Interner),
                             ),
@@ -237,25 +234,25 @@ impl<'a> chalk_solve::RustIrDatabase<Interner> for ChalkContext<'a> {
                             .intern(&Interner),
                     });
                     let bound = OpaqueTyDatumBound {
-                        bounds: make_binders(
-                            vec![
-                                wrap_in_empty_binders(impl_bound).to_chalk(self.db),
-                                wrap_in_empty_binders(proj_bound).to_chalk(self.db),
-                            ],
+                        bounds: make_only_type_binders(
                             1,
+                            vec![
+                                crate::wrap_empty_binders(impl_bound),
+                                crate::wrap_empty_binders(proj_bound),
+                            ],
                         ),
-                        where_clauses: make_binders(vec![], 0),
+                        where_clauses: make_only_type_binders(0, vec![]),
                     };
                     // The opaque type has 1 parameter.
-                    make_binders(bound, 1)
+                    make_only_type_binders(1, bound)
                 } else {
                     // If failed to find Symbol’s value as variable is void: Future::Output, return empty bounds as fallback.
                     let bound = OpaqueTyDatumBound {
-                        bounds: make_binders(vec![], 0),
-                        where_clauses: make_binders(vec![], 0),
+                        bounds: make_only_type_binders(0, vec![]),
+                        where_clauses: make_only_type_binders(0, vec![]),
                     };
                     // The opaque type has 1 parameter.
-                    make_binders(bound, 1)
+                    make_only_type_binders(1, bound)
                 }
             }
         };
@@ -265,7 +262,7 @@ impl<'a> chalk_solve::RustIrDatabase<Interner> for ChalkContext<'a> {
 
     fn hidden_opaque_type(&self, _id: chalk_ir::OpaqueTyId<Interner>) -> chalk_ir::Ty<Interner> {
         // FIXME: actually provide the hidden type; it is relevant for auto traits
-        TyKind::Unknown.intern(&Interner).to_chalk(self.db)
+        TyKind::Error.intern(&Interner)
     }
 
     fn is_object_safe(&self, _trait_id: chalk_ir::TraitId<Interner>) -> bool {
@@ -286,33 +283,32 @@ impl<'a> chalk_solve::RustIrDatabase<Interner> for ChalkContext<'a> {
         _closure_id: chalk_ir::ClosureId<Interner>,
         substs: &chalk_ir::Substitution<Interner>,
     ) -> chalk_ir::Binders<rust_ir::FnDefInputsAndOutputDatum<Interner>> {
-        let sig_ty: Ty =
-            from_chalk(self.db, substs.at(&Interner, 0).assert_ty_ref(&Interner).clone());
+        let sig_ty = substs.at(&Interner, 0).assert_ty_ref(&Interner).clone();
         let sig = &sig_ty.callable_sig(self.db).expect("first closure param should be fn ptr");
         let io = rust_ir::FnDefInputsAndOutputDatum {
-            argument_types: sig.params().iter().map(|ty| ty.clone().to_chalk(self.db)).collect(),
-            return_type: sig.ret().clone().to_chalk(self.db),
+            argument_types: sig.params().iter().cloned().collect(),
+            return_type: sig.ret().clone(),
         };
-        make_binders(io.shifted_in(&Interner), 0)
+        make_only_type_binders(0, io.shifted_in(&Interner))
     }
     fn closure_upvars(
         &self,
         _closure_id: chalk_ir::ClosureId<Interner>,
         _substs: &chalk_ir::Substitution<Interner>,
     ) -> chalk_ir::Binders<chalk_ir::Ty<Interner>> {
-        let ty = Ty::unit().to_chalk(self.db);
-        make_binders(ty, 0)
+        let ty = TyBuilder::unit();
+        make_only_type_binders(0, ty)
     }
     fn closure_fn_substitution(
         &self,
         _closure_id: chalk_ir::ClosureId<Interner>,
         _substs: &chalk_ir::Substitution<Interner>,
     ) -> chalk_ir::Substitution<Interner> {
-        Substitution::empty().to_chalk(self.db)
+        Substitution::empty(&Interner)
     }
 
     fn trait_name(&self, trait_id: chalk_ir::TraitId<Interner>) -> String {
-        let id = from_chalk(self.db, trait_id);
+        let id = from_chalk_trait_id(trait_id);
         self.db.trait_data(id).name.to_string()
     }
     fn adt_name(&self, chalk_ir::AdtId(adt_id): AdtId) -> String {
@@ -387,7 +383,7 @@ pub(crate) fn associated_ty_data_query(
     // Lower bounds -- we could/should maybe move this to a separate query in `lower`
     let type_alias_data = db.type_alias_data(type_alias);
     let generic_params = generics(db.upcast(), type_alias.into());
-    let bound_vars = Substitution::bound_vars(&generic_params, DebruijnIndex::INNERMOST);
+    let bound_vars = generic_params.bound_vars_subst(DebruijnIndex::INNERMOST);
     let resolver = hir_def::resolver::HasResolver::resolver(type_alias, db.upcast());
     let ctx = crate::TyLoweringContext::new(db, &resolver)
         .with_type_param_mode(crate::lower::TypeParamLoweringMode::Variable);
@@ -403,10 +399,10 @@ pub(crate) fn associated_ty_data_query(
     let where_clauses = convert_where_clauses(db, type_alias.into(), &bound_vars);
     let bound_data = rust_ir::AssociatedTyDatumBound { bounds, where_clauses };
     let datum = AssociatedTyDatum {
-        trait_id: trait_.to_chalk(db),
+        trait_id: to_chalk_trait_id(trait_),
         id,
         name: type_alias,
-        binders: make_binders(bound_data, generic_params.len()),
+        binders: make_only_type_binders(generic_params.len(), bound_data),
     };
     Arc::new(datum)
 }
@@ -417,11 +413,11 @@ pub(crate) fn trait_datum_query(
     trait_id: TraitId,
 ) -> Arc<TraitDatum> {
     debug!("trait_datum {:?}", trait_id);
-    let trait_: hir_def::TraitId = from_chalk(db, trait_id);
+    let trait_ = from_chalk_trait_id(trait_id);
     let trait_data = db.trait_data(trait_);
     debug!("trait {:?} = {:?}", trait_id, trait_data.name);
     let generic_params = generics(db.upcast(), trait_.into());
-    let bound_vars = Substitution::bound_vars(&generic_params, DebruijnIndex::INNERMOST);
+    let bound_vars = generic_params.bound_vars_subst(DebruijnIndex::INNERMOST);
     let flags = rust_ir::TraitFlags {
         auto: trait_data.is_auto,
         upstream: trait_.lookup(db.upcast()).container.krate() != krate,
@@ -439,7 +435,7 @@ pub(crate) fn trait_datum_query(
         lang_attr(db.upcast(), trait_).and_then(|name| well_known_trait_from_lang_attr(&name));
     let trait_datum = TraitDatum {
         id: trait_id,
-        binders: make_binders(trait_datum_bound, bound_vars.len()),
+        binders: make_only_type_binders(bound_vars.len(&Interner), trait_datum_bound),
         flags,
         associated_ty_ids,
         well_known,
@@ -490,7 +486,7 @@ pub(crate) fn struct_datum_query(
     let upstream = adt_id.module(db.upcast()).krate() != krate;
     let where_clauses = {
         let generic_params = generics(db.upcast(), adt_id.into());
-        let bound_vars = Substitution::bound_vars(&generic_params, DebruijnIndex::INNERMOST);
+        let bound_vars = generic_params.bound_vars_subst(DebruijnIndex::INNERMOST);
         convert_where_clauses(db, adt_id.into(), &bound_vars)
     };
     let flags = rust_ir::AdtFlags {
@@ -508,7 +504,7 @@ pub(crate) fn struct_datum_query(
         // FIXME set ADT kind
         kind: rust_ir::AdtKind::Struct,
         id: struct_id,
-        binders: make_binders(struct_datum_bound, num_params),
+        binders: make_only_type_binders(num_params, struct_datum_bound),
         flags,
     };
     Arc::new(struct_datum)
@@ -535,11 +531,12 @@ fn impl_def_datum(
         .impl_trait(impl_id)
         // ImplIds for impls where the trait ref can't be resolved should never reach Chalk
         .expect("invalid impl passed to Chalk")
-        .value;
+        .into_value_and_skipped_binders()
+        .0;
     let impl_data = db.impl_data(impl_id);
 
     let generic_params = generics(db.upcast(), impl_id.into());
-    let bound_vars = Substitution::bound_vars(&generic_params, DebruijnIndex::INNERMOST);
+    let bound_vars = generic_params.bound_vars_subst(DebruijnIndex::INNERMOST);
     let trait_ = trait_ref.hir_trait_id();
     let impl_type = if impl_id.lookup(db.upcast()).container.krate() == krate {
         rust_ir::ImplType::Local
@@ -555,7 +552,6 @@ fn impl_def_datum(
         trait_ref.display(db),
         where_clauses
     );
-    let trait_ref = trait_ref.to_chalk(db);
 
     let polarity = if negative { rust_ir::Polarity::Negative } else { rust_ir::Polarity::Positive };
 
@@ -577,7 +573,7 @@ fn impl_def_datum(
         .collect();
     debug!("impl_datum: {:?}", impl_datum_bound);
     let impl_datum = ImplDatum {
-        binders: make_binders(impl_datum_bound, bound_vars.len()),
+        binders: make_only_type_binders(bound_vars.len(&Interner), impl_datum_bound),
         impl_type,
         polarity,
         associated_ty_value_ids,
@@ -605,18 +601,22 @@ fn type_alias_associated_ty_value(
         _ => panic!("assoc ty value should be in impl"),
     };
 
-    let trait_ref = db.impl_trait(impl_id).expect("assoc ty value should not exist").value; // we don't return any assoc ty values if the impl'd trait can't be resolved
+    let trait_ref = db
+        .impl_trait(impl_id)
+        .expect("assoc ty value should not exist")
+        .into_value_and_skipped_binders()
+        .0; // we don't return any assoc ty values if the impl'd trait can't be resolved
 
     let assoc_ty = db
         .trait_data(trait_ref.hir_trait_id())
         .associated_type_by_name(&type_alias_data.name)
         .expect("assoc ty value should not exist"); // validated when building the impl data as well
-    let ty = db.ty(type_alias.into());
-    let value_bound = rust_ir::AssociatedTyValueBound { ty: ty.value.to_chalk(db) };
+    let (ty, binders) = db.ty(type_alias.into()).into_value_and_skipped_binders();
+    let value_bound = rust_ir::AssociatedTyValueBound { ty };
     let value = rust_ir::AssociatedTyValue {
         impl_id: impl_id.to_chalk(db),
         associated_ty_id: to_assoc_type_id(assoc_ty),
-        value: make_binders(value_bound, ty.num_binders),
+        value: chalk_ir::Binders::new(binders, value_bound),
     };
     Arc::new(value)
 }
@@ -628,34 +628,25 @@ pub(crate) fn fn_def_datum_query(
 ) -> Arc<FnDefDatum> {
     let callable_def: CallableDefId = from_chalk(db, fn_def_id);
     let generic_params = generics(db.upcast(), callable_def.into());
-    let sig = db.callable_item_signature(callable_def);
-    let bound_vars = Substitution::bound_vars(&generic_params, DebruijnIndex::INNERMOST);
+    let (sig, binders) = db.callable_item_signature(callable_def).into_value_and_skipped_binders();
+    let bound_vars = generic_params.bound_vars_subst(DebruijnIndex::INNERMOST);
     let where_clauses = convert_where_clauses(db, callable_def.into(), &bound_vars);
     let bound = rust_ir::FnDefDatumBound {
         // Note: Chalk doesn't actually use this information yet as far as I am aware, but we provide it anyway
-        inputs_and_output: make_binders(
+        inputs_and_output: make_only_type_binders(
+            0,
             rust_ir::FnDefInputsAndOutputDatum {
-                argument_types: sig
-                    .value
-                    .params()
-                    .iter()
-                    .map(|ty| ty.clone().to_chalk(db))
-                    .collect(),
-                return_type: sig.value.ret().clone().to_chalk(db),
+                argument_types: sig.params().iter().cloned().collect(),
+                return_type: sig.ret().clone(),
             }
             .shifted_in(&Interner),
-            0,
         ),
         where_clauses,
     };
     let datum = FnDefDatum {
         id: fn_def_id,
-        sig: chalk_ir::FnSig {
-            abi: (),
-            safety: chalk_ir::Safety::Safe,
-            variadic: sig.value.is_varargs,
-        },
-        binders: make_binders(bound, sig.num_binders),
+        sig: chalk_ir::FnSig { abi: (), safety: chalk_ir::Safety::Safe, variadic: sig.is_varargs },
+        binders: chalk_ir::Binders::new(binders, bound),
     };
     Arc::new(datum)
 }
@@ -685,42 +676,65 @@ pub(crate) fn adt_variance_query(
     )
 }
 
-impl From<FnDefId> for crate::db::InternedCallableDefId {
-    fn from(fn_def_id: FnDefId) -> Self {
-        InternKey::from_intern_id(fn_def_id.0)
+pub(super) fn convert_where_clauses(
+    db: &dyn HirDatabase,
+    def: GenericDefId,
+    substs: &Substitution,
+) -> Vec<chalk_ir::QuantifiedWhereClause<Interner>> {
+    let generic_predicates = db.generic_predicates(def);
+    let mut result = Vec::with_capacity(generic_predicates.len());
+    for pred in generic_predicates.iter() {
+        result.push(pred.clone().substitute(&Interner, substs));
     }
+    result
 }
 
-impl From<crate::db::InternedCallableDefId> for FnDefId {
-    fn from(callable_def_id: crate::db::InternedCallableDefId) -> Self {
-        chalk_ir::FnDefId(callable_def_id.as_intern_id())
+pub(super) fn generic_predicate_to_inline_bound(
+    db: &dyn HirDatabase,
+    pred: &QuantifiedWhereClause,
+    self_ty: &Ty,
+) -> Option<chalk_ir::Binders<rust_ir::InlineBound<Interner>>> {
+    // An InlineBound is like a GenericPredicate, except the self type is left out.
+    // We don't have a special type for this, but Chalk does.
+    let self_ty_shifted_in = self_ty.clone().shifted_in_from(&Interner, DebruijnIndex::ONE);
+    let (pred, binders) = pred.as_ref().into_value_and_skipped_binders();
+    match pred {
+        WhereClause::Implemented(trait_ref) => {
+            if trait_ref.self_type_parameter(&Interner) != self_ty_shifted_in {
+                // we can only convert predicates back to type bounds if they
+                // have the expected self type
+                return None;
+            }
+            let args_no_self = trait_ref.substitution.as_slice(&Interner)[1..]
+                .iter()
+                .map(|ty| ty.clone().cast(&Interner))
+                .collect();
+            let trait_bound = rust_ir::TraitBound { trait_id: trait_ref.trait_id, args_no_self };
+            Some(chalk_ir::Binders::new(binders, rust_ir::InlineBound::TraitBound(trait_bound)))
+        }
+        WhereClause::AliasEq(AliasEq { alias: AliasTy::Projection(projection_ty), ty }) => {
+            if projection_ty.self_type_parameter(&Interner) != self_ty_shifted_in {
+                return None;
+            }
+            let trait_ = projection_ty.trait_(db);
+            let args_no_self = projection_ty.substitution.as_slice(&Interner)[1..]
+                .iter()
+                .map(|ty| ty.clone().cast(&Interner))
+                .collect();
+            let alias_eq_bound = rust_ir::AliasEqBound {
+                value: ty.clone(),
+                trait_bound: rust_ir::TraitBound {
+                    trait_id: to_chalk_trait_id(trait_),
+                    args_no_self,
+                },
+                associated_ty_id: projection_ty.associated_ty_id,
+                parameters: Vec::new(), // FIXME we don't support generic associated types yet
+            };
+            Some(chalk_ir::Binders::new(
+                binders,
+                rust_ir::InlineBound::AliasEqBound(alias_eq_bound),
+            ))
+        }
+        _ => None,
     }
-}
-
-impl From<OpaqueTyId> for crate::db::InternedOpaqueTyId {
-    fn from(id: OpaqueTyId) -> Self {
-        InternKey::from_intern_id(id.0)
-    }
-}
-
-impl From<crate::db::InternedOpaqueTyId> for OpaqueTyId {
-    fn from(id: crate::db::InternedOpaqueTyId) -> Self {
-        chalk_ir::OpaqueTyId(id.as_intern_id())
-    }
-}
-
-impl From<chalk_ir::ClosureId<Interner>> for crate::db::InternedClosureId {
-    fn from(id: chalk_ir::ClosureId<Interner>) -> Self {
-        Self::from_intern_id(id.0)
-    }
-}
-
-impl From<crate::db::InternedClosureId> for chalk_ir::ClosureId<Interner> {
-    fn from(id: crate::db::InternedClosureId) -> Self {
-        chalk_ir::ClosureId(id.as_intern_id())
-    }
-}
-
-fn wrap_in_empty_binders<T: crate::TypeWalk>(value: T) -> crate::Binders<T> {
-    crate::Binders::wrap_empty(value)
 }

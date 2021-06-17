@@ -1,7 +1,7 @@
 # Contributing Quick Start
 
-Rust Analyzer is an ordinary Rust project, which is organized as a Cargo
-workspace, builds on stable and doesn't depend on C libraries. So, just
+Rust Analyzer is an ordinary Rust project, which is organized as a Cargo workspace, builds on stable and doesn't depend on C libraries.
+So, just
 
 ```
 $ cargo test
@@ -13,9 +13,8 @@ To learn more about how rust-analyzer works, see [./architecture.md](./architect
 It also explains the high-level layout of the source code.
 Do skim through that document.
 
-We also publish rustdoc docs to pages:
-
-https://rust-analyzer.github.io/rust-analyzer/ide/
+We also publish rustdoc docs to pages: https://rust-analyzer.github.io/rust-analyzer/ide/.
+Note though, that internal documentation is very incomplete.
 
 Various organizational and process issues are discussed in this document.
 
@@ -25,7 +24,7 @@ Rust Analyzer is a part of [RLS-2.0 working
 group](https://github.com/rust-lang/compiler-team/tree/6a769c13656c0a6959ebc09e7b1f7c09b86fb9c0/working-groups/rls-2.0).
 Discussion happens in this Zulip stream:
 
-https://rust-lang.zulipchat.com/#narrow/stream/185405-t-compiler.2Fwg-rls-2.2E0
+https://rust-lang.zulipchat.com/#narrow/stream/185405-t-compiler.2Frust-analyzer
 
 # Issue Labels
 
@@ -33,6 +32,8 @@ https://rust-lang.zulipchat.com/#narrow/stream/185405-t-compiler.2Fwg-rls-2.2E0
   are good issues to get into the project.
 * [E-has-instructions](https://github.com/rust-analyzer/rust-analyzer/issues?q=is%3Aopen+is%3Aissue+label%3AE-has-instructions)
   issues have links to the code in question and tests.
+* [Broken Window](https://github.com/rust-analyzer/rust-analyzer/issues?q=is:issue+is:open+label:%22Broken+Window%22)
+  are issues which are not critical by themselves, but which should be fixed ASAP regardless, to avoid accumulation of technical debt.
 * [E-easy](https://github.com/rust-analyzer/rust-analyzer/issues?q=is%3Aopen+is%3Aissue+label%3AE-easy),
   [E-medium](https://github.com/rust-analyzer/rust-analyzer/issues?q=is%3Aopen+is%3Aissue+label%3AE-medium),
   [E-hard](https://github.com/rust-analyzer/rust-analyzer/issues?q=is%3Aopen+is%3Aissue+label%3AE-hard),
@@ -49,21 +50,28 @@ https://rust-lang.zulipchat.com/#narrow/stream/185405-t-compiler.2Fwg-rls-2.2E0
   Also a kind of fun.
   These issues should generally include a link to a Zulip discussion thread.
 
-# CI
+# Code Style & Review Process
 
-We use GitHub Actions for CI. Most of the things, including formatting, are checked by
-`cargo test` so, if `cargo test` passes locally, that's a good sign that CI will
-be green as well. The only exception is that some long-running tests are skipped locally by default.
+Do see [./style.md](./style.md).
+
+# Cookbook
+
+## CI
+
+We use GitHub Actions for CI.
+Most of the things, including formatting, are checked by `cargo test`.
+If `cargo test` passes locally, that's a good sign that CI will be green as well.
+The only exception is that some long-running tests are skipped locally by default.
 Use `env RUN_SLOW_TESTS=1 cargo test` to run the full suite.
 
 We use bors-ng to enforce the [not rocket science](https://graydon2.dreamwidth.org/1597.html) rule.
 
-# Launching rust-analyzer
+## Launching rust-analyzer
 
 Debugging the language server can be tricky.
 LSP is rather chatty, so driving it from the command line is not really feasible, driving it via VS Code requires interacting with two processes.
 
-For this reason, the best way to see how rust-analyzer works is to find a relevant test and execute it.
+For this reason, the best way to see how rust-analyzer works is to **find a relevant test and execute it**.
 VS Code & Emacs include an action for running a single test.
 
 Launching a VS Code instance with a locally built language server is also possible.
@@ -107,12 +115,7 @@ cd editors/code
 npm ci
 npm run lint
 ```
-
-# Code Style & Review Process
-
-Do see [./style.md](./style.md).
-
-# How to ...
+## How to ...
 
 * ... add an assist? [#7535](https://github.com/rust-analyzer/rust-analyzer/pull/7535)
 * ... add a new protocol extension? [#4569](https://github.com/rust-analyzer/rust-analyzer/pull/4569)
@@ -120,33 +123,30 @@ Do see [./style.md](./style.md).
 * ... add a new completion? [#6964](https://github.com/rust-analyzer/rust-analyzer/pull/6964)
 * ... allow new syntax in the parser? [#7338](https://github.com/rust-analyzer/rust-analyzer/pull/7338)
 
-# Logging
+## Logging
 
-Logging is done by both rust-analyzer and VS Code, so it might be tricky to
-figure out where logs go.
+Logging is done by both rust-analyzer and VS Code, so it might be tricky to figure out where logs go.
 
-Inside rust-analyzer, we use the standard `log` crate for logging, and
-`env_logger` for logging frontend. By default, log goes to stderr, but the
-stderr itself is processed by VS Code.
+Inside rust-analyzer, we use the standard `log` crate for logging, and `env_logger` for logging frontend.
+By default, log goes to stderr, but the stderr itself is processed by VS Code.
+`--log-file <PATH>` CLI argument allows logging to file.
 
-To see stderr in the running VS Code instance, go to the "Output" tab of the
-panel and select `rust-analyzer`. This shows `eprintln!` as well. Note that
-`stdout` is used for the actual protocol, so `println!` will break things.
+To see stderr in the running VS Code instance, go to the "Output" tab of the panel and select `rust-analyzer`.
+This shows `eprintln!` as well.
+Note that `stdout` is used for the actual protocol, so `println!` will break things.
 
 To log all communication between the server and the client, there are two choices:
 
-* you can log on the server side, by running something like
+* You can log on the server side, by running something like
   ```
   env RA_LOG=lsp_server=debug code .
   ```
-
-* you can log on the client side, by enabling `"rust-analyzer.trace.server":
-  "verbose"` workspace setting. These logs are shown in a separate tab in the
-  output and could be used with LSP inspector. Kudos to
-  [@DJMcNab](https://github.com/DJMcNab) for setting this awesome infra up!
+* You can log on the client side, by enabling `"rust-analyzer.trace.server": "verbose"` workspace setting.
+  These logs are shown in a separate tab in the output and could be used with LSP inspector.
+  Kudos to [@DJMcNab](https://github.com/DJMcNab) for setting this awesome infra up!
 
 
-There are also two VS Code commands which might be of interest:
+There are also several VS Code commands which might be of interest:
 
 * `Rust Analyzer: Status` shows some memory-usage statistics.
 
@@ -164,7 +164,7 @@ There are also two VS Code commands which might be of interest:
 
   ![demo](https://user-images.githubusercontent.com/36276403/78225773-6636a480-74d3-11ea-9d9f-1c9d42da03b0.png)
 
-# Profiling
+## Profiling
 
 We have a built-in hierarchical profiler, you can enable it by using `RA_PROFILE` env-var:
 
@@ -192,7 +192,9 @@ $ cargo run --release -p rust-analyzer -- analysis-bench ../chalk/ --highlight .
 $ cargo run --release -p rust-analyzer -- analysis-bench ../chalk/ --complete ../chalk/chalk-engine/src/logic.rs:94:0
 ```
 
-# Release Process
+Look for `fn benchmark_xxx` tests for a quick way to reproduce performance problems.
+
+## Release Process
 
 Release process is handled by `release`, `dist` and `promote` xtasks, `release` being the main one.
 
@@ -206,20 +208,26 @@ Release process is handled by `release`, `dist` and `promote` xtasks, `release` 
 
 Additionally, it assumes that remote for `rust-analyzer` is called `upstream` (I use `origin` to point to my fork).
 
+`release` calls the GitHub API calls to scrape pull request comments and categorize them in the changelog.
+This step uses the `curl` and `jq` applications, which need to be available in `PATH`.
+Finally, you need to obtain a GitHub personal access token and set the `GITHUB_TOKEN` environment variable.
+
 Release steps:
 
-1. Inside rust-analyzer, run `cargo xtask release`. This will:
+1. Set the `GITHUB_TOKEN` environment variable.
+2. Inside rust-analyzer, run `cargo xtask release`. This will:
    * checkout the `release` branch
    * reset it to `upstream/nightly`
    * push it to `upstream`. This triggers GitHub Actions which:
      * runs `cargo xtask dist` to package binaries and VS Code extension
      * makes a GitHub release
      * pushes VS Code extension to the marketplace
-   * create new changelog in `rust-analyzer.github.io`
-2. While the release is in progress, fill in the changelog
-3. Commit & push the changelog
-4. Tweet
-5. Inside `rust-analyzer`, run `cargo xtask promote` -- this will create a PR to rust-lang/rust updating rust-analyzer's submodule.
+   * call the GitHub API for PR details
+   * create a new changelog in `rust-analyzer.github.io`
+3. While the release is in progress, fill in the changelog
+4. Commit & push the changelog
+5. Tweet
+6. Inside `rust-analyzer`, run `cargo xtask promote` -- this will create a PR to rust-lang/rust updating rust-analyzer's submodule.
    Self-approve the PR.
 
 If the GitHub Actions release fails because of a transient problem like a timeout, you can re-run the job from the Actions console.
@@ -227,18 +235,27 @@ If it fails because of something that needs to be fixed, remove the release tag 
 Make sure to remove the new changelog post created when running `cargo xtask release` a second time.
 
 We release "nightly" every night automatically and promote the latest nightly to "stable" manually, every week.
-We don't do "patch" releases, unless something truly egregious comes up.
 
-# Permissions
+We don't do "patch" releases, unless something truly egregious comes up.
+To do a patch release, cherry-pick the fix on top of the current `release` branch and push the branch.
+There's no need to write a changelog for a patch release, it's OK to include the notes about the fix into the next weekly one.
+Note: we tag releases by dates, releasing a patch release on the same day should work (by overwriting a tag), but I am not 100% sure.
+
+## Permissions
 
 There are three sets of people with extra permissions:
 
-* rust-analyzer GitHub organization **admins** (which include current t-compiler leads).
+* rust-analyzer GitHub organization [**admins**](https://github.com/orgs/rust-analyzer/people?query=role:owner) (which include current t-compiler leads).
   Admins have full access to the org.
-* **review** team in the organization.
+* [**review**](https://github.com/orgs/rust-analyzer/teams/review) team in the organization.
   Reviewers have `r+` access to all of organization's repositories and publish rights on crates.io.
   They also have direct commit access, but all changes should via bors queue.
   It's ok to self-approve if you think you know what you are doing!
   bors should automatically sync the permissions.
-* **triage** team in the organization.
+  Feel free to request a review or assign any PR to a reviewer with the relevant expertise to bring the work to their attention.
+  Don't feel pressured to review assigned PRs though.
+  If you don't feel like reviewing for whatever reason, someone else will pick the review up!
+* [**triage**](https://github.com/orgs/rust-analyzer/teams/triage) team in the organization.
   This team can label and close issues.
+
+Note that at the time being you need to be a member of the org yourself to view the links.

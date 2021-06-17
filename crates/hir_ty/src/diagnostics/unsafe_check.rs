@@ -11,7 +11,9 @@ use hir_def::{
 };
 use hir_expand::diagnostics::DiagnosticSink;
 
-use crate::{db::HirDatabase, diagnostics::MissingUnsafe, InferenceResult, Interner, TyKind};
+use crate::{
+    db::HirDatabase, diagnostics::MissingUnsafe, InferenceResult, Interner, TyExt, TyKind,
+};
 
 pub(super) struct UnsafeValidator<'a, 'b: 'a> {
     owner: DefWithBodyId,
@@ -32,7 +34,7 @@ impl<'a, 'b> UnsafeValidator<'a, 'b> {
         let def = self.owner;
         let unsafe_expressions = unsafe_expressions(db, self.infer.as_ref(), def);
         let is_unsafe = match self.owner {
-            DefWithBodyId::FunctionId(it) => db.function_data(it).qualifier.is_unsafe,
+            DefWithBodyId::FunctionId(it) => db.function_data(it).is_unsafe(),
             DefWithBodyId::StaticId(_) | DefWithBodyId::ConstId(_) => false,
         };
         if is_unsafe
@@ -86,7 +88,7 @@ fn walk_unsafe(
     match expr {
         &Expr::Call { callee, .. } => {
             if let Some(func) = infer[callee].as_fn_def(db) {
-                if db.function_data(func).qualifier.is_unsafe {
+                if db.function_data(func).is_unsafe() {
                     unsafe_exprs.push(UnsafeExpr { expr: current, inside_unsafe_block });
                 }
             }
@@ -103,14 +105,14 @@ fn walk_unsafe(
         Expr::MethodCall { .. } => {
             if infer
                 .method_resolution(current)
-                .map(|func| db.function_data(func).qualifier.is_unsafe)
+                .map(|func| db.function_data(func).is_unsafe())
                 .unwrap_or(false)
             {
                 unsafe_exprs.push(UnsafeExpr { expr: current, inside_unsafe_block });
             }
         }
         Expr::UnaryOp { expr, op: UnaryOp::Deref } => {
-            if let TyKind::Raw(..) = &infer[*expr].interned(&Interner) {
+            if let TyKind::Raw(..) = &infer[*expr].kind(&Interner) {
                 unsafe_exprs.push(UnsafeExpr { expr: current, inside_unsafe_block });
             }
         }

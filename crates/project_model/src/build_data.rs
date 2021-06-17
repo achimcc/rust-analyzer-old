@@ -1,7 +1,6 @@
 //! Handles build script specific information
 
 use std::{
-    io::BufReader,
     path::PathBuf,
     process::{Command, Stdio},
     sync::Arc,
@@ -13,12 +12,13 @@ use cargo_metadata::{BuildScript, Message};
 use itertools::Itertools;
 use paths::{AbsPath, AbsPathBuf};
 use rustc_hash::FxHashMap;
-use stdx::JodChild;
+use serde::Deserialize;
+use stdx::format_to;
 
 use crate::{cfg_flag::CfgFlag, CargoConfig};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct BuildData {
+pub(crate) struct PackageBuildData {
     /// List of config flags defined by this package's build script
     pub(crate) cfgs: Vec<CfgFlag>,
     /// List of cargo-related environment variables with their value
@@ -30,6 +30,17 @@ pub(crate) struct BuildData {
     pub(crate) out_dir: Option<AbsPathBuf>,
     /// Path to the proc-macro library file if this package exposes proc-macros
     pub(crate) proc_macro_dylib_path: Option<AbsPathBuf>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
+pub(crate) struct WorkspaceBuildData {
+    per_package: FxHashMap<String, PackageBuildData>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
+pub struct BuildDataResult {
+    per_workspace: FxHashMap<AbsPathBuf, WorkspaceBuildData>,
 }
 
 #[derive(Clone, Debug)]
@@ -47,19 +58,17 @@ impl PartialEq for BuildDataConfig {
 
 impl Eq for BuildDataConfig {}
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct BuildDataCollector {
+    wrap_rustc: bool,
     configs: FxHashMap<AbsPathBuf, BuildDataConfig>,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct BuildDataResult {
-    data: FxHashMap<AbsPathBuf, BuildDataMap>,
-}
-
-pub(crate) type BuildDataMap = FxHashMap<String, BuildData>;
-
 impl BuildDataCollector {
+    pub fn new(wrap_rustc: bool) -> Self {
+        Self { wrap_rustc, configs: FxHashMap::default() }
+    }
+
     pub(crate) fn add_config(&mut self, workspace_root: &AbsPath, config: BuildDataConfig) {
         self.configs.insert(workspace_root.to_path_buf(), config);
     }
@@ -67,23 +76,41 @@ impl BuildDataCollector {
     pub fn collect(&mut self, progress: &dyn Fn(String)) -> Result<BuildDataResult> {
         let mut res = BuildDataResult::default();
         for (path, config) in self.configs.iter() {
-            res.data.insert(
-                path.clone(),
-                collect_from_workspace(
-                    &config.cargo_toml,
-                    &config.cargo_features,
-                    &config.packages,
-                    progress,
-                )?,
-            );
+            let workspace_build_data = WorkspaceBuildData::collect(
+                &config.cargo_toml,
+                &config.cargo_features,
+                &config.packages,
+                self.wrap_rustc,
+                progress,
+            )?;
+            res.per_workspace.insert(path.clone(), workspace_build_data);
         }
         Ok(res)
     }
 }
 
+impl WorkspaceBuildData {
+    pub(crate) fn get(&self, package_id: &str) -> Option<&PackageBuildData> {
+        self.per_package.get(package_id)
+    }
+}
+
 impl BuildDataResult {
-    pub(crate) fn get(&self, root: &AbsPath) -> Option<&BuildDataMap> {
-        self.data.get(&root.to_path_buf())
+    pub(crate) fn get(&self, workspace_root: &AbsPath) -> Option<&WorkspaceBuildData> {
+        self.per_workspace.get(workspace_root)
+    }
+    pub fn error(&self) -> Option<String> {
+        let mut buf = String::new();
+        for (_workspace_root, build_data) in &self.per_workspace {
+            if let Some(err) = &build_data.error {
+                format_to!(buf, "cargo check failed:\n{}", err);
+            }
+        }
+        if buf.is_empty() {
+            return None;
+        }
+
+        Some(buf)
     }
 }
 
@@ -97,108 +124,155 @@ impl BuildDataConfig {
     }
 }
 
-fn collect_from_workspace(
-    cargo_toml: &AbsPath,
-    cargo_features: &CargoConfig,
-    packages: &Vec<cargo_metadata::Package>,
-    progress: &dyn Fn(String),
-) -> Result<BuildDataMap> {
-    let mut cmd = Command::new(toolchain::cargo());
-    cmd.args(&["check", "--workspace", "--message-format=json", "--manifest-path"])
-        .arg(cargo_toml.as_ref());
+impl WorkspaceBuildData {
+    fn collect(
+        cargo_toml: &AbsPath,
+        cargo_features: &CargoConfig,
+        packages: &Vec<cargo_metadata::Package>,
+        wrap_rustc: bool,
+        progress: &dyn Fn(String),
+    ) -> Result<WorkspaceBuildData> {
+        let mut cmd = Command::new(toolchain::cargo());
 
-    // --all-targets includes tests, benches and examples in addition to the
-    // default lib and bins. This is an independent concept from the --targets
-    // flag below.
-    cmd.arg("--all-targets");
-
-    if let Some(target) = &cargo_features.target {
-        cmd.args(&["--target", target]);
-    }
-
-    if cargo_features.all_features {
-        cmd.arg("--all-features");
-    } else {
-        if cargo_features.no_default_features {
-            // FIXME: `NoDefaultFeatures` is mutual exclusive with `SomeFeatures`
-            // https://github.com/oli-obk/cargo_metadata/issues/79
-            cmd.arg("--no-default-features");
+        if wrap_rustc {
+            // Setup RUSTC_WRAPPER to point to `rust-analyzer` binary itself. We use
+            // that to compile only proc macros and build scripts during the initial
+            // `cargo check`.
+            let myself = std::env::current_exe()?;
+            cmd.env("RUSTC_WRAPPER", myself);
+            cmd.env("RA_RUSTC_WRAPPER", "1");
         }
-        if !cargo_features.features.is_empty() {
-            cmd.arg("--features");
-            cmd.arg(cargo_features.features.join(" "));
+
+        cmd.args(&["check", "--quiet", "--workspace", "--message-format=json", "--manifest-path"])
+            .arg(cargo_toml.as_ref());
+
+        // --all-targets includes tests, benches and examples in addition to the
+        // default lib and bins. This is an independent concept from the --targets
+        // flag below.
+        cmd.arg("--all-targets");
+
+        if let Some(target) = &cargo_features.target {
+            cmd.args(&["--target", target]);
         }
-    }
 
-    cmd.stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
+        if cargo_features.all_features {
+            cmd.arg("--all-features");
+        } else {
+            if cargo_features.no_default_features {
+                // FIXME: `NoDefaultFeatures` is mutual exclusive with `SomeFeatures`
+                // https://github.com/oli-obk/cargo_metadata/issues/79
+                cmd.arg("--no-default-features");
+            }
+            if !cargo_features.features.is_empty() {
+                cmd.arg("--features");
+                cmd.arg(cargo_features.features.join(" "));
+            }
+        }
 
-    let mut child = cmd.spawn().map(JodChild)?;
-    let child_stdout = child.stdout.take().unwrap();
-    let stdout = BufReader::new(child_stdout);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
 
-    let mut res = BuildDataMap::default();
-    for message in cargo_metadata::Message::parse_stream(stdout).flatten() {
-        match message {
-            Message::BuildScriptExecuted(BuildScript {
-                package_id, out_dir, cfgs, env, ..
-            }) => {
-                let cfgs = {
-                    let mut acc = Vec::new();
-                    for cfg in cfgs {
-                        match cfg.parse::<CfgFlag>() {
-                            Ok(it) => acc.push(it),
-                            Err(err) => {
-                                anyhow::bail!("invalid cfg from cargo-metadata: {}", err)
+        let mut res = WorkspaceBuildData::default();
+
+        let mut callback_err = None;
+        let output = stdx::process::streaming_output(
+            cmd,
+            &mut |line| {
+                if callback_err.is_some() {
+                    return;
+                }
+
+                // Copy-pasted from existing cargo_metadata. It seems like we
+                // should be using sered_stacker here?
+                let mut deserializer = serde_json::Deserializer::from_str(&line);
+                deserializer.disable_recursion_limit();
+                let message = Message::deserialize(&mut deserializer)
+                    .unwrap_or(Message::TextLine(line.to_string()));
+
+                match message {
+                    Message::BuildScriptExecuted(BuildScript {
+                        package_id,
+                        out_dir,
+                        cfgs,
+                        env,
+                        ..
+                    }) => {
+                        let cfgs = {
+                            let mut acc = Vec::new();
+                            for cfg in cfgs {
+                                match cfg.parse::<CfgFlag>() {
+                                    Ok(it) => acc.push(it),
+                                    Err(err) => {
+                                        callback_err = Some(anyhow::format_err!(
+                                            "invalid cfg from cargo-metadata: {}",
+                                            err
+                                        ));
+                                        return;
+                                    }
+                                };
                             }
+                            acc
                         };
+                        let package_build_data =
+                            res.per_package.entry(package_id.repr.clone()).or_default();
+                        // cargo_metadata crate returns default (empty) path for
+                        // older cargos, which is not absolute, so work around that.
+                        if !out_dir.as_str().is_empty() {
+                            let out_dir =
+                                AbsPathBuf::assert(PathBuf::from(out_dir.into_os_string()));
+                            package_build_data.out_dir = Some(out_dir);
+                            package_build_data.cfgs = cfgs;
+                        }
+
+                        package_build_data.envs = env;
                     }
-                    acc
-                };
-                let res = res.entry(package_id.repr.clone()).or_default();
-                // cargo_metadata crate returns default (empty) path for
-                // older cargos, which is not absolute, so work around that.
-                if !out_dir.as_str().is_empty() {
-                    let out_dir = AbsPathBuf::assert(PathBuf::from(out_dir.into_os_string()));
-                    res.out_dir = Some(out_dir);
-                    res.cfgs = cfgs;
-                }
+                    Message::CompilerArtifact(message) => {
+                        progress(format!("metadata {}", message.target.name));
 
-                res.envs = env;
-            }
-            Message::CompilerArtifact(message) => {
-                progress(format!("metadata {}", message.target.name));
-
-                if message.target.kind.contains(&"proc-macro".to_string()) {
-                    let package_id = message.package_id;
-                    // Skip rmeta file
-                    if let Some(filename) = message.filenames.iter().find(|name| is_dylib(name)) {
-                        let filename = AbsPathBuf::assert(PathBuf::from(&filename));
-                        let res = res.entry(package_id.repr.clone()).or_default();
-                        res.proc_macro_dylib_path = Some(filename);
+                        if message.target.kind.contains(&"proc-macro".to_string()) {
+                            let package_id = message.package_id;
+                            // Skip rmeta file
+                            if let Some(filename) =
+                                message.filenames.iter().find(|name| is_dylib(name))
+                            {
+                                let filename = AbsPathBuf::assert(PathBuf::from(&filename));
+                                let package_build_data =
+                                    res.per_package.entry(package_id.repr.clone()).or_default();
+                                package_build_data.proc_macro_dylib_path = Some(filename);
+                            }
+                        }
                     }
+                    Message::CompilerMessage(message) => {
+                        progress(message.target.name.clone());
+                    }
+                    Message::BuildFinished(_) => {}
+                    Message::TextLine(_) => {}
+                    _ => {}
+                }
+            },
+            &mut |_| (),
+        )?;
+
+        for package in packages {
+            let package_build_data = res.per_package.entry(package.id.repr.clone()).or_default();
+            inject_cargo_env(package, package_build_data);
+            if let Some(out_dir) = &package_build_data.out_dir {
+                // NOTE: cargo and rustc seem to hide non-UTF-8 strings from env! and option_env!()
+                if let Some(out_dir) = out_dir.to_str().map(|s| s.to_owned()) {
+                    package_build_data.envs.push(("OUT_DIR".to_string(), out_dir));
                 }
             }
-            Message::CompilerMessage(message) => {
-                progress(message.target.name.clone());
-            }
-            Message::BuildFinished(_) => {}
-            Message::TextLine(_) => {}
-            _ => {}
         }
-    }
 
-    for package in packages {
-        let build_data = res.entry(package.id.repr.clone()).or_default();
-        inject_cargo_env(package, build_data);
-        if let Some(out_dir) = &build_data.out_dir {
-            // NOTE: cargo and rustc seem to hide non-UTF-8 strings from env! and option_env!()
-            if let Some(out_dir) = out_dir.to_str().map(|s| s.to_owned()) {
-                build_data.envs.push(("OUT_DIR".to_string(), out_dir));
+        if !output.status.success() {
+            let mut stderr = String::from_utf8(output.stderr).unwrap_or_default();
+            if stderr.is_empty() {
+                stderr = "cargo check failed".to_string();
             }
+            res.error = Some(stderr)
         }
-    }
 
-    Ok(res)
+        Ok(res)
+    }
 }
 
 // FIXME: File a better way to know if it is a dylib
@@ -212,7 +286,7 @@ fn is_dylib(path: &Utf8Path) -> bool {
 /// Recreates the compile-time environment variables that Cargo sets.
 ///
 /// Should be synced with <https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-crates>
-fn inject_cargo_env(package: &cargo_metadata::Package, build_data: &mut BuildData) {
+fn inject_cargo_env(package: &cargo_metadata::Package, build_data: &mut PackageBuildData) {
     let env = &mut build_data.envs;
 
     // FIXME: Missing variables:

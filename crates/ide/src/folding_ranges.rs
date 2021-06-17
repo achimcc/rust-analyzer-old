@@ -17,6 +17,9 @@ pub enum FoldKind {
     Block,
     ArgList,
     Region,
+    Consts,
+    Statics,
+    Array,
 }
 
 #[derive(Debug)]
@@ -30,6 +33,8 @@ pub(crate) fn folding_ranges(file: &SourceFile) -> Vec<Fold> {
     let mut visited_comments = FxHashSet::default();
     let mut visited_imports = FxHashSet::default();
     let mut visited_mods = FxHashSet::default();
+    let mut visited_consts = FxHashSet::default();
+    let mut visited_statics = FxHashSet::default();
     // regions can be nested, here is a LIFO buffer
     let mut regions_starts: Vec<TextSize> = vec![];
 
@@ -91,6 +96,19 @@ pub(crate) fn folding_ranges(file: &SourceFile) -> Vec<Fold> {
                         res.push(Fold { range, kind: FoldKind::Mods })
                     }
                 }
+
+                // Fold groups of consts
+                if node.kind() == CONST && !visited_consts.contains(&node) {
+                    if let Some(range) = contiguous_range_for_group(&node, &mut visited_consts) {
+                        res.push(Fold { range, kind: FoldKind::Consts })
+                    }
+                }
+                // Fold groups of consts
+                if node.kind() == STATIC && !visited_statics.contains(&node) {
+                    if let Some(range) = contiguous_range_for_group(&node, &mut visited_statics) {
+                        res.push(Fold { range, kind: FoldKind::Statics })
+                    }
+                }
             }
         }
     }
@@ -102,6 +120,7 @@ fn fold_kind(kind: SyntaxKind) -> Option<FoldKind> {
     match kind {
         COMMENT => Some(FoldKind::Comment),
         ARG_LIST | PARAM_LIST => Some(FoldKind::ArgList),
+        ARRAY_EXPR => Some(FoldKind::Array),
         ASSOC_ITEM_LIST
         | RECORD_FIELD_LIST
         | RECORD_PAT_FIELD_LIST
@@ -250,6 +269,9 @@ mod tests {
                 FoldKind::Block => "block",
                 FoldKind::ArgList => "arglist",
                 FoldKind::Region => "region",
+                FoldKind::Consts => "consts",
+                FoldKind::Statics => "statics",
+                FoldKind::Array => "array",
             };
             assert_eq!(kind, &attr.unwrap());
         }
@@ -446,6 +468,20 @@ fn foo<fold arglist>(
     }
 
     #[test]
+    fn fold_multiline_array() {
+        check(
+            r#"
+const FOO: [usize; 4] = <fold array>[
+    1,
+    2,
+    3,
+    4,
+]</fold>;
+"#,
+        )
+    }
+
+    #[test]
     fn fold_region() {
         check(
             r#"
@@ -455,6 +491,26 @@ fn foo<fold arglist>(
 calling_function(x,y);
 // endregion: test</fold>
 "#,
+        )
+    }
+
+    #[test]
+    fn fold_consecutive_const() {
+        check(
+            r#"
+<fold consts>const FIRST_CONST: &str = "first";
+const SECOND_CONST: &str = "second";</fold>
+            "#,
+        )
+    }
+
+    #[test]
+    fn fold_consecutive_static() {
+        check(
+            r#"
+<fold statics>static FIRST_STATIC: &str = "first";
+static SECOND_STATIC: &str = "second";</fold>
+            "#,
         )
     }
 }

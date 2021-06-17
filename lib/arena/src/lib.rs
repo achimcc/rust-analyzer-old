@@ -90,7 +90,7 @@ impl<T> Idx<T> {
 }
 
 /// Yet another index-based arena.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Arena<T> {
     data: Vec<T>,
 }
@@ -192,6 +192,29 @@ impl<T> Arena<T> {
         &self,
     ) -> impl Iterator<Item = (Idx<T>, &T)> + ExactSizeIterator + DoubleEndedIterator {
         self.data.iter().enumerate().map(|(idx, value)| (Idx::from_raw(RawIdx(idx as u32)), value))
+    }
+
+    /// Returns an iterator over the arena’s mutable elements.
+    ///
+    /// ```
+    /// let mut arena = la_arena::Arena::new();
+    /// let idx1 = arena.alloc(20);
+    ///
+    /// assert_eq!(arena[idx1], 20);
+    ///
+    /// let mut iterator = arena.iter_mut();
+    /// *iterator.next().unwrap().1 = 10;
+    /// drop(iterator);
+    ///
+    /// assert_eq!(arena[idx1], 10);
+    /// ```
+    pub fn iter_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (Idx<T>, &mut T)> + ExactSizeIterator + DoubleEndedIterator {
+        self.data
+            .iter_mut()
+            .enumerate()
+            .map(|(idx, value)| (Idx::from_raw(RawIdx(idx as u32)), value))
     }
 
     /// Reallocates the arena to make it take up as little space as possible.

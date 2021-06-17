@@ -1,17 +1,7 @@
 //! Transforms markdown
+use ide_db::helpers::rust_doc::is_rust_fence;
 
 const RUSTDOC_FENCE: &str = "```";
-const RUSTDOC_CODE_BLOCK_ATTRIBUTES_RUST_SPECIFIC: &[&str] = &[
-    "",
-    "rust",
-    "should_panic",
-    "ignore",
-    "no_run",
-    "compile_fail",
-    "edition2015",
-    "edition2018",
-    "edition2021",
-];
 
 pub(crate) fn format_docs(src: &str) -> String {
     let mut processed_lines = Vec::new();
@@ -27,9 +17,7 @@ pub(crate) fn format_docs(src: &str) -> String {
             in_code_block ^= true;
 
             if in_code_block {
-                is_rust = header
-                    .split(',')
-                    .all(|sub| RUSTDOC_CODE_BLOCK_ATTRIBUTES_RUST_SPECIFIC.contains(&sub.trim()));
+                is_rust = is_rust_fence(header);
 
                 if is_rust {
                     line = "```rust";
@@ -79,6 +67,12 @@ mod tests {
     fn test_format_docs_handles_complex_code_block_attrs() {
         let comment = "```rust,no_run\nlet z = 55;\n```";
         assert_eq!(format_docs(comment), "```rust\nlet z = 55;\n```");
+    }
+
+    #[test]
+    fn test_format_docs_handles_error_codes() {
+        let comment = "```compile_fail,E0641\nlet b = 0 as *const _;\n```";
+        assert_eq!(format_docs(comment), "```rust\nlet b = 0 as *const _;\n```");
     }
 
     #[test]

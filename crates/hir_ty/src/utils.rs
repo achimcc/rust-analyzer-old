@@ -1,22 +1,27 @@
 //! Helper functions for working with def, which don't need to be a separate
 //! query, but can't be computed directly from `*Data` (ie, which need a `db`).
-use std::sync::Arc;
 
-use chalk_ir::DebruijnIndex;
+use std::iter;
+
+use chalk_ir::{fold::Shift, BoundVar, DebruijnIndex};
 use hir_def::{
-    adt::VariantData,
     db::DefDatabase,
     generics::{
         GenericParams, TypeParamData, TypeParamProvenance, WherePredicate, WherePredicateTypeTarget,
     },
+    intern::Interned,
     path::Path,
     resolver::{HasResolver, TypeNs},
     type_ref::TypeRef,
-    AssocContainerId, GenericDefId, Lookup, TraitId, TypeAliasId, TypeParamId, VariantId,
+    AssocContainerId, GenericDefId, Lookup, TraitId, TypeAliasId, TypeParamId,
 };
 use hir_expand::name::{name, Name};
+use rustc_hash::FxHashSet;
 
-use crate::{db::HirDatabase, TraitRef, TypeWalk, WhereClause};
+use crate::{
+    db::HirDatabase, ChalkTraitId, Interner, Substitution, TraitRef, TraitRefExt, TyKind,
+    WhereClause,
+};
 
 fn direct_super_traits(db: &dyn DefDatabase, trait_: TraitId) -> Vec<TraitId> {
     let resolver = trait_.resolver(db);
@@ -32,11 +37,10 @@ fn direct_super_traits(db: &dyn DefDatabase, trait_: TraitId) -> Vec<TraitId> {
         .filter_map(|pred| match pred {
             WherePredicate::ForLifetime { target, bound, .. }
             | WherePredicate::TypeBound { target, bound } => match target {
-                WherePredicateTypeTarget::TypeRef(TypeRef::Path(p))
-                    if p == &Path::from(name![Self]) =>
-                {
-                    bound.as_path()
-                }
+                WherePredicateTypeTarget::TypeRef(type_ref) => match &**type_ref {
+                    TypeRef::Path(p) if p == &Path::from(name![Self]) => bound.as_path(),
+                    _ => None,
+                },
                 WherePredicateTypeTarget::TypeParam(local_id) if Some(*local_id) == trait_self => {
                     bound.as_path()
                 }
@@ -66,19 +70,21 @@ fn direct_super_trait_refs(db: &dyn HirDatabase, trait_ref: &TraitRef) -> Vec<Tr
         .filter_map(|pred| {
             pred.as_ref().filter_map(|pred| match pred.skip_binders() {
                 // FIXME: how to correctly handle higher-ranked bounds here?
-                WhereClause::Implemented(tr) => {
-                    Some(tr.clone().shift_bound_vars_out(DebruijnIndex::ONE))
-                }
+                WhereClause::Implemented(tr) => Some(
+                    tr.clone()
+                        .shifted_out_to(&Interner, DebruijnIndex::ONE)
+                        .expect("FIXME unexpected higher-ranked trait bound"),
+                ),
                 _ => None,
             })
         })
-        .map(|pred| pred.subst(&trait_ref.substitution))
+        .map(|pred| pred.substitute(&Interner, &trait_ref.substitution))
         .collect()
 }
 
 /// Returns an iterator over the whole super trait hierarchy (including the
 /// trait itself).
-pub(super) fn all_super_traits(db: &dyn DefDatabase, trait_: TraitId) -> Vec<TraitId> {
+pub fn all_super_traits(db: &dyn DefDatabase, trait_: TraitId) -> Vec<TraitId> {
     // we need to take care a bit here to avoid infinite loops in case of cycles
     // (i.e. if we have `trait A: B; trait B: A;`)
     let mut result = vec![trait_];
@@ -102,23 +108,35 @@ pub(super) fn all_super_traits(db: &dyn DefDatabase, trait_: TraitId) -> Vec<Tra
 /// `all_super_traits` is that we keep track of type parameters; for example if
 /// we have `Self: Trait<u32, i32>` and `Trait<T, U>: OtherTrait<U>` we'll get
 /// `Self: OtherTrait<i32>`.
-pub(super) fn all_super_trait_refs(db: &dyn HirDatabase, trait_ref: TraitRef) -> Vec<TraitRef> {
-    // we need to take care a bit here to avoid infinite loops in case of cycles
-    // (i.e. if we have `trait A: B; trait B: A;`)
-    let mut result = vec![trait_ref];
-    let mut i = 0;
-    while i < result.len() {
-        let t = &result[i];
-        // yeah this is quadratic, but trait hierarchies should be flat
-        // enough that this doesn't matter
-        for tt in direct_super_trait_refs(db, t) {
-            if !result.iter().any(|tr| tr.trait_id == tt.trait_id) {
-                result.push(tt);
-            }
-        }
-        i += 1;
+pub(super) fn all_super_trait_refs(db: &dyn HirDatabase, trait_ref: TraitRef) -> SuperTraits {
+    SuperTraits { db, seen: iter::once(trait_ref.trait_id).collect(), stack: vec![trait_ref] }
+}
+
+pub(super) struct SuperTraits<'a> {
+    db: &'a dyn HirDatabase,
+    stack: Vec<TraitRef>,
+    seen: FxHashSet<ChalkTraitId>,
+}
+
+impl<'a> SuperTraits<'a> {
+    fn elaborate(&mut self, trait_ref: &TraitRef) {
+        let mut trait_refs = direct_super_trait_refs(self.db, trait_ref);
+        trait_refs.retain(|tr| !self.seen.contains(&tr.trait_id));
+        self.stack.extend(trait_refs);
     }
-    result
+}
+
+impl<'a> Iterator for SuperTraits<'a> {
+    type Item = TraitRef;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(next) = self.stack.pop() {
+            self.elaborate(&next);
+            Some(next)
+        } else {
+            None
+        }
+    }
 }
 
 pub(super) fn associated_type_by_name_including_super_traits(
@@ -126,29 +144,10 @@ pub(super) fn associated_type_by_name_including_super_traits(
     trait_ref: TraitRef,
     name: &Name,
 ) -> Option<(TraitRef, TypeAliasId)> {
-    all_super_trait_refs(db, trait_ref).into_iter().find_map(|t| {
+    all_super_trait_refs(db, trait_ref).find_map(|t| {
         let assoc_type = db.trait_data(t.hir_trait_id()).associated_type_by_name(name)?;
         Some((t, assoc_type))
     })
-}
-
-pub(super) fn variant_data(db: &dyn DefDatabase, var: VariantId) -> Arc<VariantData> {
-    match var {
-        VariantId::StructId(it) => db.struct_data(it).variant_data.clone(),
-        VariantId::UnionId(it) => db.union_data(it).variant_data.clone(),
-        VariantId::EnumVariantId(it) => {
-            db.enum_data(it.parent).variants[it.local_id].variant_data.clone()
-        }
-    }
-}
-
-/// Helper for mutating `Arc<[T]>` (i.e. `Arc::make_mut` for Arc slices).
-/// The underlying values are cloned if there are other strong references.
-pub(crate) fn make_mut_slice<T: Clone>(a: &mut Arc<[T]>) -> &mut [T] {
-    if Arc::get_mut(a).is_none() {
-        *a = a.iter().cloned().collect();
-    }
-    Arc::get_mut(a).unwrap()
 }
 
 pub(crate) fn generics(db: &dyn DefDatabase, def: GenericDefId) -> Generics {
@@ -159,7 +158,7 @@ pub(crate) fn generics(db: &dyn DefDatabase, def: GenericDefId) -> Generics {
 #[derive(Debug)]
 pub(crate) struct Generics {
     def: GenericDefId,
-    pub(crate) params: Arc<GenericParams>,
+    pub(crate) params: Interned<GenericParams>,
     parent_generics: Option<Box<Generics>>,
 }
 
@@ -248,6 +247,26 @@ impl Generics {
         } else {
             self.parent_generics.as_ref().and_then(|g| g.find_param(param))
         }
+    }
+
+    /// Returns a Substitution that replaces each parameter by a bound variable.
+    pub(crate) fn bound_vars_subst(&self, debruijn: DebruijnIndex) -> Substitution {
+        Substitution::from_iter(
+            &Interner,
+            self.iter()
+                .enumerate()
+                .map(|(idx, _)| TyKind::BoundVar(BoundVar::new(debruijn, idx)).intern(&Interner)),
+        )
+    }
+
+    /// Returns a Substitution that replaces each parameter by itself (i.e. `Ty::Param`).
+    pub(crate) fn type_params_subst(&self, db: &dyn HirDatabase) -> Substitution {
+        Substitution::from_iter(
+            &Interner,
+            self.iter().map(|(id, _)| {
+                TyKind::Placeholder(crate::to_placeholder_idx(db, id)).intern(&Interner)
+            }),
+        )
     }
 }
 

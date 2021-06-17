@@ -227,7 +227,7 @@ use hir_def::{
 use la_arena::Idx;
 use smallvec::{smallvec, SmallVec};
 
-use crate::{db::HirDatabase, AdtId, InferenceResult, Interner, TyKind};
+use crate::{db::HirDatabase, AdtId, InferenceResult, Interner, TyExt, TyKind};
 
 #[derive(Debug, Clone, Copy)]
 /// Either a pattern from the source code being analyzed, represented as
@@ -539,7 +539,7 @@ impl Matrix {
         if let Some(Pat::Or(pat_ids)) = row.get_head().map(|pat_id| pat_id.as_pat(cx)) {
             // Or patterns are expanded here
             for pat_id in pat_ids {
-                self.0.push(PatStack::from_pattern(pat_id));
+                self.0.push(row.replace_head_with([pat_id].iter()));
             }
         } else {
             self.0.push(row);
@@ -626,7 +626,7 @@ pub(super) fn is_useful(
     // - enum with no variants
     // - `!` type
     // In those cases, no match arm is useful.
-    match cx.infer[cx.match_expr].strip_references().interned(&Interner) {
+    match cx.infer[cx.match_expr].strip_references().kind(&Interner) {
         TyKind::Adt(AdtId(hir_def::AdtId::EnumId(enum_id)), ..) => {
             if cx.db.enum_data(*enum_id).variants.is_empty() {
                 return Ok(Usefulness::NotUseful);
@@ -792,7 +792,10 @@ fn pat_constructor(cx: &MatchCheckCtx, pat: PatIdOrWild) -> MatchCheckResult<Opt
         Pat::Tuple { .. } => {
             let pat_id = pat.as_id().expect("we already know this pattern is not a wild");
             Some(Constructor::Tuple {
-                arity: cx.infer.type_of_pat[pat_id].as_tuple().ok_or(MatchCheckErr::Unknown)?.len(),
+                arity: cx.infer.type_of_pat[pat_id]
+                    .as_tuple()
+                    .ok_or(MatchCheckErr::Unknown)?
+                    .len(&Interner),
             })
         }
         Pat::Lit(lit_expr) => match cx.body.exprs[lit_expr] {
@@ -1085,6 +1088,20 @@ fn main() {
     }
 
     #[test]
+    fn or_pattern_no_diagnostic() {
+        check_diagnostics(
+            r#"
+enum Either {A, B}
+
+fn main() {
+    match (Either::A, Either::B) {
+        (Either::A | Either::B, _) => (),
+    }
+}"#,
+        )
+    }
+
+    #[test]
     fn mismatched_types() {
         // Match statements with arms that don't match the
         // expression pattern do not fire this diagnostic.
@@ -1330,30 +1347,6 @@ fn enum_ref(never: &Never) {
 }
 fn bang(never: !) {
     match never {}
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn or_pattern_panic() {
-        check_diagnostics(
-            r#"
-pub enum Category { Infinity, Zero }
-
-fn panic(a: Category, b: Category) {
-    match (a, b) {
-        (Category::Zero | Category::Infinity, _) => (),
-        (_, Category::Zero | Category::Infinity) => (),
-    }
-
-    // FIXME: This is a false positive, but the code used to cause a panic in the match checker,
-    // so this acts as a regression test for that.
-    match (a, b) {
-        //^^^^^^ Missing match arm
-        (Category::Infinity, Category::Infinity) | (Category::Zero, Category::Zero) => (),
-        (Category::Infinity | Category::Zero, _) => (),
-    }
 }
 "#,
         );

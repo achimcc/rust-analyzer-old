@@ -283,6 +283,11 @@
                     "default": true,
                     "description": "Whether to show inlay hints."
                 },
+                "rust-analyzer.inlayHints.smallerHints": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Whether inlay hints font size should be smaller than editor's font size."
+                },
                 "rust-analyzer.updates.channel": {
                     "type": "string",
                     "enum": [
@@ -354,7 +359,8 @@
                     ]
                 },
                 "rust-analyzer.debug.sourceFileMap": {
-                    "type": "object",
+                    "type": ["object", "string"],
+                    "const": "auto",
                     "description": "Optional source file mappings passed to the debug engine.",
                     "default": {
                         "/rustc/<id>": "${env:USERPROFILE}/.rustup/toolchains/<toolchain-id>/lib/rustlib/src/rust"
@@ -431,6 +437,11 @@
                 },
                 "rust-analyzer.cargo.runBuildScripts": {
                     "markdownDescription": "Run build scripts (`build.rs`) for more precise code analysis.",
+                    "default": true,
+                    "type": "boolean"
+                },
+                "rust-analyzer.cargo.useRustcWrapperForBuildScripts": {
+                    "markdownDescription": "Use `RUSTC_WRAPPER=rust-analyzer` when running build scripts to\navoid compiling unnecessary things.",
                     "default": true,
                     "type": "boolean"
                 },
@@ -559,6 +570,11 @@
                         "type": "string"
                     },
                     "uniqueItems": true
+                },
+                "rust-analyzer.diagnostics.remapPrefix": {
+                    "markdownDescription": "Map of prefixes to be substituted when parsing diagnostic file paths.\nThis should be the reverse mapping of what is passed to `rustc` as `--remap-path-prefix`.",
+                    "default": {},
+                    "type": "object"
                 },
                 "rust-analyzer.diagnostics.warningsAsHint": {
                     "markdownDescription": "List of warnings that should be displayed with info severity.\n\nThe warnings will be indicated by a blue squiggly underline in code\nand a blue icon in the `Problems Panel`.",

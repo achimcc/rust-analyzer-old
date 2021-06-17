@@ -4,10 +4,7 @@ use expect_test::expect;
 use hir::Semantics;
 use ide_db::{
     base_db::{fixture::WithFixture, FileId, FileRange, SourceDatabaseExt},
-    helpers::{
-        insert_use::{InsertUseConfig, MergeBehavior},
-        SnippetCap,
-    },
+    helpers::{insert_use::InsertUseConfig, merge_imports::MergeBehavior, SnippetCap},
     source_change::FileSystemEdit,
     RootDatabase,
 };
@@ -84,7 +81,8 @@ fn check_doc_test(assist_id: &str, before: &str, after: &str) {
         });
 
     let actual = {
-        let source_change = assist.source_change.unwrap();
+        let source_change =
+            assist.source_change.expect("Assist did not contain any source changes");
         let mut actual = before;
         if let Some(source_file_edit) = source_change.get_source_edit(file_id) {
             source_file_edit.apply(&mut actual);
@@ -121,7 +119,8 @@ fn check(handler: Handler, before: &str, expected: ExpectedResult, assist_label:
 
     match (assist, expected) {
         (Some(assist), ExpectedResult::After(after)) => {
-            let source_change = assist.source_change.unwrap();
+            let source_change =
+                assist.source_change.expect("Assist did not contain any source changes");
             assert!(!source_change.source_file_edits.is_empty());
             let skip_header = source_change.source_file_edits.len() == 1
                 && source_change.file_system_edits.len() == 0;
@@ -191,6 +190,7 @@ fn assist_order_field_struct() {
     let mut assists = assists.iter();
 
     assert_eq!(assists.next().expect("expected assist").label, "Change visibility to pub(crate)");
+    assert_eq!(assists.next().expect("expected assist").label, "Generate `Deref` impl using `bar`");
     assert_eq!(assists.next().expect("expected assist").label, "Generate a mut getter method");
     assert_eq!(assists.next().expect("expected assist").label, "Generate a getter method");
     assert_eq!(assists.next().expect("expected assist").label, "Generate a setter method");

@@ -6,10 +6,11 @@ use std::{cell::RefCell, fmt, iter::successors};
 
 use base_db::{FileId, FileRange};
 use hir_def::{
+    body,
     resolver::{self, HasResolver, Resolver, TypeNs},
     AsMacroCall, FunctionId, TraitId, VariantId,
 };
-use hir_expand::{hygiene::Hygiene, name::AsName, ExpansionInfo};
+use hir_expand::{name::AsName, ExpansionInfo};
 use hir_ty::associated_type_shorthand_candidates;
 use itertools::Itertools;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -76,9 +77,11 @@ impl PathResolution {
     pub fn assoc_type_shorthand_candidates<R>(
         &self,
         db: &dyn HirDatabase,
-        mut cb: impl FnMut(TypeAlias) -> Option<R>,
+        mut cb: impl FnMut(&Name, TypeAlias) -> Option<R>,
     ) -> Option<R> {
-        associated_type_shorthand_candidates(db, self.in_type_ns()?, |_, _, id| cb(id.into()))
+        associated_type_shorthand_candidates(db, self.in_type_ns()?, |name, _, id| {
+            cb(name, id.into())
+        })
     }
 }
 
@@ -492,9 +495,9 @@ impl<'db> SemanticsImpl<'db> {
     fn resolve_method_call_as_callable(&self, call: &ast::MethodCallExpr) -> Option<Callable> {
         // FIXME: this erases Substs
         let func = self.resolve_method_call(call)?;
-        let ty = self.db.value_ty(func.into());
+        let (ty, _) = self.db.value_ty(func.into()).into_value_and_skipped_binders();
         let resolver = self.analyze(call.syntax()).resolver;
-        let ty = Type::new_with_resolver(self.db, &resolver, ty.value)?;
+        let ty = Type::new_with_resolver(self.db, &resolver, ty)?;
         let mut res = ty.as_callable(self.db)?;
         res.is_bound_method = true;
         Some(res)
@@ -851,8 +854,8 @@ impl<'a> SemanticsScope<'a> {
     /// Resolve a path as-if it was written at the given scope. This is
     /// necessary a heuristic, as it doesn't take hygiene into account.
     pub fn speculative_resolve(&self, path: &ast::Path) -> Option<PathResolution> {
-        let hygiene = Hygiene::new(self.db.upcast(), self.file_id);
-        let path = Path::from_src(path.clone(), &hygiene)?;
+        let ctx = body::LowerCtx::new(self.db.upcast(), self.file_id);
+        let path = Path::from_src(path.clone(), &ctx)?;
         resolve_hir_path(self.db, &self.resolver, &path)
     }
 }

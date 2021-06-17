@@ -1,6 +1,6 @@
 use either::Either;
 use hir::{
-    AsAssocItem, AssocItemContainer, GenericParam, HasAttrs, HasSource, HirDisplay, Module,
+    AsAssocItem, AssocItemContainer, GenericParam, HasAttrs, HasSource, HirDisplay, InFile, Module,
     ModuleDef, Semantics,
 };
 use ide_db::{
@@ -16,8 +16,8 @@ use syntax::{ast, match_ast, AstNode, AstToken, SyntaxKind::*, SyntaxToken, Toke
 use crate::{
     display::{macro_label, TryToNav},
     doc_links::{
-        doc_owner_to_def, extract_positioned_link_from_comment, remove_links,
-        resolve_doc_path_for_def, rewrite_links,
+        doc_attributes, extract_definitions_from_markdown, remove_links, resolve_doc_path_for_def,
+        rewrite_links,
     },
     markdown_remove::remove_markdown,
     markup::Markup,
@@ -82,6 +82,8 @@ pub struct HoverResult {
 //
 // Shows additional information, like type of an expression or documentation for definition when "focusing" code.
 // Focusing is usually hovering with a mouse, but can also be triggered with a shortcut.
+//
+// image::https://user-images.githubusercontent.com/48062697/113020658-b5f98b80-917a-11eb-9f88-3dbc27320c95.gif[]
 pub(crate) fn hover(
     db: &RootDatabase,
     position: FilePosition,
@@ -114,11 +116,19 @@ pub(crate) fn hover(
             ),
 
             _ => ast::Comment::cast(token.clone())
-                .and_then(|comment| {
+                .and_then(|_| {
+                    let (attributes, def) = doc_attributes(&sema, &node)?;
+                    let (docs, doc_mapping) = attributes.docs_with_rangemap(db)?;
                     let (idl_range, link, ns) =
-                        extract_positioned_link_from_comment(position.offset, &comment)?;
+                        extract_definitions_from_markdown(docs.as_str()).into_iter().find_map(|(range, link, ns)| {
+                            let InFile { file_id, value: range } = doc_mapping.map(range.clone())?;
+                            if file_id == position.file_id.into() && range.contains(position.offset) {
+                                Some((range, link, ns))
+                            } else {
+                                None
+                            }
+                        })?;
                     range = Some(idl_range);
-                    let def = doc_owner_to_def(&sema, &node)?;
                     resolve_doc_path_for_def(db, def, &link, ns)
                 })
                 .map(Definition::ModuleDef),
@@ -195,7 +205,7 @@ fn show_implementations_action(db: &RootDatabase, def: Definition) -> Option<Hov
     let adt = match def {
         Definition::ModuleDef(ModuleDef::Trait(it)) => return it.try_to_nav(db).map(to_action),
         Definition::ModuleDef(ModuleDef::Adt(it)) => Some(it),
-        Definition::SelfType(it) => it.target_ty(db).as_adt(),
+        Definition::SelfType(it) => it.self_ty(db).as_adt(),
         _ => None,
     }?;
     adt.try_to_nav(db).map(to_action)
@@ -318,7 +328,7 @@ fn definition_owner_name(db: &RootDatabase, def: &Definition) -> Option<String> 
         Definition::ModuleDef(md) => match md {
             ModuleDef::Function(f) => match f.as_assoc_item(db)?.container(db) {
                 AssocItemContainer::Trait(t) => Some(t.name(db)),
-                AssocItemContainer::Impl(i) => i.target_ty(db).as_adt().map(|adt| adt.name(db)),
+                AssocItemContainer::Impl(i) => i.self_ty(db).as_adt().map(|adt| adt.name(db)),
             },
             ModuleDef::Variant(e) => Some(e.parent_enum(db).name(db)),
             _ => None,
@@ -376,7 +386,7 @@ fn hover_for_definition(
         },
         Definition::Local(it) => hover_for_local(it, db),
         Definition::SelfType(impl_def) => {
-            impl_def.target_ty(db).as_adt().and_then(|adt| from_hir_fmt(db, adt, mod_path))
+            impl_def.self_ty(db).as_adt().and_then(|adt| from_hir_fmt(db, adt, mod_path))
         }
         Definition::GenericParam(it) => from_hir_fmt(db, it, None),
         Definition::Label(it) => Some(Markup::fenced_block(&it.name(db))),
@@ -470,6 +480,7 @@ fn find_std_module(famous_defs: &FamousDefs, name: &str) -> Option<hir::Module> 
 
 fn pick_best(tokens: TokenAtOffset<SyntaxToken>) -> Option<SyntaxToken> {
     return tokens.max_by_key(priority);
+
     fn priority(n: &SyntaxToken) -> usize {
         match n.kind() {
             IDENT | INT_NUMBER | LIFETIME_IDENT | T![self] | T![super] | T![crate] => 3,
@@ -3811,24 +3822,139 @@ fn main() {
     fn hover_intra_doc_links() {
         check(
             r#"
-/// This is the [`foo`](foo$0) function.
-fn foo() {}
+
+pub mod theitem {
+    /// This is the item. Cool!
+    pub struct TheItem;
+}
+
+/// Gives you a [`TheItem$0`].
+///
+/// [`TheItem`]: theitem::TheItem
+pub fn gimme() -> theitem::TheItem {
+    theitem::TheItem
+}
 "#,
             expect![[r#"
-                *[`foo`](foo)*
+                *[`TheItem`]*
+
+                ```rust
+                test::theitem
+                ```
+
+                ```rust
+                pub struct TheItem
+                ```
+
+                ---
+
+                This is the item. Cool!
+            "#]],
+        );
+    }
+
+    #[test]
+    fn hover_generic_assoc() {
+        check(
+            r#"
+fn foo<T: A>() where T::Assoc$0: {}
+
+trait A {
+    type Assoc;
+}"#,
+            expect![[r#"
+                *Assoc*
 
                 ```rust
                 test
                 ```
 
                 ```rust
-                fn foo()
+                type Assoc
+                ```
+            "#]],
+        );
+        check(
+            r#"
+fn foo<T: A>() {
+    let _: <T>::Assoc$0;
+}
+
+trait A {
+    type Assoc;
+}"#,
+            expect![[r#"
+                *Assoc*
+
+                ```rust
+                test
+                ```
+
+                ```rust
+                type Assoc
+                ```
+            "#]],
+        );
+        check(
+            r#"
+trait A where
+    Self::Assoc$0: ,
+{
+    type Assoc;
+}"#,
+            expect![[r#"
+                *Assoc*
+
+                ```rust
+                test
+                ```
+
+                ```rust
+                type Assoc
+                ```
+            "#]],
+        );
+    }
+
+    #[test]
+    fn string_shadowed_with_inner_items() {
+        check(
+            r#"
+//- /main.rs crate:main deps:alloc
+
+/// Custom `String` type.
+struct String;
+
+fn f() {
+    let _: String$0;
+
+    fn inner() {}
+}
+
+//- /alloc.rs crate:alloc
+#[prelude_import]
+pub use string::*;
+
+mod string {
+    /// This is `alloc::String`.
+    pub struct String;
+}
+            "#,
+            expect![[r#"
+                *String*
+
+                ```rust
+                main
+                ```
+
+                ```rust
+                struct String
                 ```
 
                 ---
 
-                This is the [`foo`](https://docs.rs/test/*/test/fn.foo.html) function.
+                Custom `String` type.
             "#]],
-        );
+        )
     }
 }

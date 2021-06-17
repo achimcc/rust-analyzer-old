@@ -1,62 +1,4 @@
-//! Fixtures are strings containing rust source code with optional metadata.
-//! A fixture without metadata is parsed into a single source file.
-//! Use this to test functionality local to one file.
-//!
-//! Simple Example:
-//! ```
-//! r#"
-//! fn main() {
-//!     println!("Hello World")
-//! }
-//! "#
-//! ```
-//!
-//! Metadata can be added to a fixture after a `//-` comment.
-//! The basic form is specifying filenames,
-//! which is also how to define multiple files in a single test fixture
-//!
-//! Example using two files in the same crate:
-//! ```
-//! "
-//! //- /main.rs
-//! mod foo;
-//! fn main() {
-//!     foo::bar();
-//! }
-//!
-//! //- /foo.rs
-//! pub fn bar() {}
-//! "
-//! ```
-//!
-//! Example using two crates with one file each, with one crate depending on the other:
-//! ```
-//! r#"
-//! //- /main.rs crate:a deps:b
-//! fn main() {
-//!     b::foo();
-//! }
-//! //- /lib.rs crate:b
-//! pub fn b() {
-//!     println!("Hello World")
-//! }
-//! "#
-//! ```
-//!
-//! Metadata allows specifying all settings and variables
-//! that are available in a real rust project:
-//! - crate names via `crate:cratename`
-//! - dependencies via `deps:dep1,dep2`
-//! - configuration settings via `cfg:dbg=false,opt_level=2`
-//! - environment variables via `env:PATH=/bin,RUST_LOG=debug`
-//!
-//! Example using all available metadata:
-//! ```
-//! "
-//! //- /lib.rs crate:foo deps:bar,baz cfg:foo=a,bar=b env:OUTDIR=path/to,OTHER=foo
-//! fn insert_source_code_here() {}
-//! "
-//! ```
+//! A set of high-level utility fixture methods to use in tests.
 use std::{mem, str::FromStr, sync::Arc};
 
 use cfg::CfgOptions;
@@ -93,7 +35,7 @@ pub trait WithFixture: Default + SourceDatabaseExt + 'static {
     fn with_position(ra_fixture: &str) -> (Self, FilePosition) {
         let (db, file_id, range_or_offset) = Self::with_range_or_offset(ra_fixture);
         let offset = match range_or_offset {
-            RangeOrOffset::Range(_) => panic!(),
+            RangeOrOffset::Range(_) => panic!("Expected a cursor position, got a range instead"),
             RangeOrOffset::Offset(it) => it,
         };
         (db, FilePosition { file_id, offset })
@@ -103,7 +45,7 @@ pub trait WithFixture: Default + SourceDatabaseExt + 'static {
         let (db, file_id, range_or_offset) = Self::with_range_or_offset(ra_fixture);
         let range = match range_or_offset {
             RangeOrOffset::Range(it) => it,
-            RangeOrOffset::Offset(_) => panic!(),
+            RangeOrOffset::Offset(_) => panic!("Expected a cursor range, got a position instead"),
         };
         (db, FileRange { file_id, range })
     }
@@ -112,7 +54,9 @@ pub trait WithFixture: Default + SourceDatabaseExt + 'static {
         let fixture = ChangeFixture::parse(ra_fixture);
         let mut db = Self::default();
         fixture.change.apply(&mut db);
-        let (file_id, range_or_offset) = fixture.file_position.unwrap();
+        let (file_id, range_or_offset) = fixture
+            .file_position
+            .expect("Could not find file position in fixture. Did you forget to add an `$0`?");
         (db, file_id, range_or_offset)
     }
 

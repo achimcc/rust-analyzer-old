@@ -1,4 +1,4 @@
-use std::fmt::Write;
+mod changelog;
 
 use xshell::{cmd, cp, pushd, read_dir, write_file};
 
@@ -10,7 +10,16 @@ impl flags::Release {
             cmd!("git switch release").run()?;
             cmd!("git fetch upstream --tags --force").run()?;
             cmd!("git reset --hard tags/nightly").run()?;
-            cmd!("git push").run()?;
+            // The `release` branch sometimes has a couple of cherry-picked
+            // commits for patch releases. If that's the case, just overwrite
+            // it. As we are setting `release` branch to an up-to-date `nightly`
+            // tag, this shouldn't be problematic in general.
+            //
+            // Note that, as we tag releases, we don't worry about "losing"
+            // commits -- they'll be kept alive by the tag. More generally, we
+            // don't care about historic releases all that much, it's fine even
+            // to delete old tags.
+            cmd!("git push --force").run()?;
         }
         codegen::docs()?;
 
@@ -38,42 +47,7 @@ impl flags::Release {
         let tags = cmd!("git tag --list").read()?;
         let prev_tag = tags.lines().filter(|line| is_release_tag(line)).last().unwrap();
 
-        let git_log = cmd!("git log {prev_tag}..HEAD --merges --reverse").read()?;
-        let mut git_log_summary = String::new();
-        for line in git_log.lines() {
-            let line = line.trim_start();
-            if let Some(p) = line.find(':') {
-                if let Ok(pr) = line[..p].parse::<u32>() {
-                    writeln!(git_log_summary, "* pr:{}[]{}", pr, &line[p + 1..]).unwrap();
-                }
-            }
-        }
-
-        let contents = format!(
-            "\
-= Changelog #{}
-:sectanchors:
-:page-layout: post
-
-Commit: commit:{}[] +
-Release: release:{}[]
-
-== Sponsors
-
-**Become a sponsor:** On https://opencollective.com/rust-analyzer/[OpenCollective] or
-https://github.com/sponsors/rust-analyzer[GitHub Sponsors].
-
-== New Features
-
-{}
-
-== Fixes
-
-== Internal Improvements
-",
-            changelog_n, commit, today, git_log_summary
-        );
-
+        let contents = changelog::get_changelog(changelog_n, &commit, prev_tag, &today)?;
         let path = changelog_dir.join(format!("{}-changelog-{}.adoc", today, changelog_n));
         write_file(&path, &contents)?;
 

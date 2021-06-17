@@ -3,6 +3,7 @@
 //! Based on cli flags, either spawns an LSP server, or runs a batch analysis
 mod flags;
 mod logger;
+mod rustc_wrapper;
 
 use std::{convert::TryFrom, env, fs, path::Path, process};
 
@@ -26,6 +27,20 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 fn main() {
+    if std::env::var("RA_RUSTC_WRAPPER").is_ok() {
+        let mut args = std::env::args_os();
+        let _me = args.next().unwrap();
+        let rustc = args.next().unwrap();
+        let code = match rustc_wrapper::run_rustc_skipping_cargo_checking(rustc, args.collect()) {
+            Ok(rustc_wrapper::ExitCode(code)) => code.unwrap_or(102),
+            Err(err) => {
+                eprintln!("{}", err);
+                101
+            }
+        };
+        process::exit(code);
+    }
+
     if let Err(err) = try_main() {
         log::error!("Unexpected error: {}", err);
         eprintln!("{}", err);
@@ -78,19 +93,9 @@ fn try_main() -> Result<()> {
             path: cmd.path,
             load_output_dirs: cmd.load_output_dirs,
             with_proc_macro: cmd.with_proc_macro,
+            skip_inference: cmd.skip_inference,
         }
         .run(verbosity)?,
-        flags::RustAnalyzerCmd::AnalysisBench(cmd) => {
-            let what = cmd.what();
-            BenchCmd {
-                memory_usage: cmd.memory_usage,
-                path: cmd.path,
-                load_output_dirs: cmd.load_output_dirs,
-                with_proc_macro: cmd.with_proc_macro,
-                what,
-            }
-            .run(verbosity)?
-        }
 
         flags::RustAnalyzerCmd::Diagnostics(cmd) => {
             cli::diagnostics(&cmd.path, cmd.load_output_dirs, cmd.with_proc_macro)?
@@ -145,7 +150,7 @@ mod tracing_setup {
 }
 
 fn run_server() -> Result<()> {
-    log::info!("server will start");
+    log::info!("server version {} will start", env!("REV"));
 
     let (connection, io_threads) = Connection::stdio();
 

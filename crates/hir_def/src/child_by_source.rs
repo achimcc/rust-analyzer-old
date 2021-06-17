@@ -80,6 +80,10 @@ impl ChildBySource for ModuleId {
 impl ChildBySource for ItemScope {
     fn child_by_source_to(&self, db: &dyn DefDatabase, res: &mut DynMap) {
         self.declarations().for_each(|item| add_module_def(db, res, item));
+        self.unnamed_consts().for_each(|konst| {
+            let src = konst.lookup(db).source(db);
+            res[keys::CONST].insert(src, konst);
+        });
         self.impls().for_each(|imp| add_impl(db, res, imp));
 
         fn add_module_def(db: &dyn DefDatabase, map: &mut DynMap, item: ModuleDefId) {
@@ -160,7 +164,7 @@ impl ChildBySource for EnumId {
 impl ChildBySource for DefWithBodyId {
     fn child_by_source_to(&self, db: &dyn DefDatabase, res: &mut DynMap) {
         let body = db.body(*self);
-        for def_map in body.block_scopes.iter().filter_map(|block| db.block_def_map(*block)) {
+        for (_, def_map) in body.blocks(db) {
             // All block expressions are merged into the same map, because they logically all add
             // inner items to the containing `DefWithBodyId`.
             def_map[def_map.root()].scope.child_by_source_to(db, res);

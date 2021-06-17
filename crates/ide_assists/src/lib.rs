@@ -28,7 +28,9 @@ pub use assist_config::AssistConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssistKind {
+    // FIXME: does the None variant make sense? Probably not.
     None,
+
     QuickFix,
     Generate,
     Refactor,
@@ -117,10 +119,13 @@ mod handlers {
     mod convert_integer_literal;
     mod convert_comment_block;
     mod convert_iter_for_each_to_for;
+    mod convert_into_to_from;
+    mod convert_tuple_struct_to_named_struct;
     mod early_return;
     mod expand_glob_import;
     mod extract_function;
     mod extract_struct_from_enum_variant;
+    mod extract_type_alias;
     mod extract_variable;
     mod fill_match_arms;
     mod fix_visibility;
@@ -130,6 +135,7 @@ mod handlers {
     mod generate_default_from_enum_variant;
     mod generate_default_from_new;
     mod generate_is_empty_from_len;
+    mod generate_deref;
     mod generate_derive;
     mod generate_enum_is_method;
     mod generate_enum_projection_method;
@@ -184,9 +190,12 @@ mod handlers {
             convert_integer_literal::convert_integer_literal,
             convert_comment_block::convert_comment_block,
             convert_iter_for_each_to_for::convert_iter_for_each_to_for,
+            convert_into_to_from::convert_into_to_from,
+            convert_tuple_struct_to_named_struct::convert_tuple_struct_to_named_struct,
             early_return::convert_to_guarded_return,
             expand_glob_import::expand_glob_import,
             extract_struct_from_enum_variant::extract_struct_from_enum_variant,
+            extract_type_alias::extract_type_alias,
             fill_match_arms::fill_match_arms,
             fix_visibility::fix_visibility,
             flip_binexpr::flip_binexpr,
@@ -195,6 +204,7 @@ mod handlers {
             generate_default_from_enum_variant::generate_default_from_enum_variant,
             generate_default_from_new::generate_default_from_new,
             generate_is_empty_from_len::generate_is_empty_from_len,
+            generate_deref::generate_deref,
             generate_derive::generate_derive,
             generate_enum_is_method::generate_enum_is_method,
             generate_enum_projection_method::generate_enum_as_method,

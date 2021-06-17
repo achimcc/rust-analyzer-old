@@ -1,7 +1,8 @@
 //! Missing batteries for standard libraries.
-use std::{cmp::Ordering, ops, process, time::Instant};
+use std::{cmp::Ordering, ops, time::Instant};
 
 mod macros;
+pub mod process;
 pub mod panic_context;
 
 pub use always_assert::{always, never};
@@ -13,18 +14,8 @@ pub fn is_ci() -> bool {
 
 #[must_use]
 pub fn timeit(label: &'static str) -> impl Drop {
-    struct Guard {
-        label: &'static str,
-        start: Instant,
-    }
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            eprintln!("{}: {:.2?}", self.label, self.start.elapsed())
-        }
-    }
-
-    Guard { label, start: Instant::now() }
+    let start = Instant::now();
+    defer(move || eprintln!("{}: {:.2?}", label, start.elapsed()))
 }
 
 /// Prints backtrace to stderr, useful for debugging.
@@ -178,17 +169,31 @@ where
     start..start + len
 }
 
-pub struct JodChild(pub process::Child);
+#[must_use]
+pub fn defer<F: FnOnce()>(f: F) -> impl Drop {
+    struct D<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Drop for D<F> {
+        fn drop(&mut self) {
+            if let Some(f) = self.0.take() {
+                f()
+            }
+        }
+    }
+    D(Some(f))
+}
+
+#[repr(transparent)]
+pub struct JodChild(pub std::process::Child);
 
 impl ops::Deref for JodChild {
-    type Target = process::Child;
-    fn deref(&self) -> &process::Child {
+    type Target = std::process::Child;
+    fn deref(&self) -> &std::process::Child {
         &self.0
     }
 }
 
 impl ops::DerefMut for JodChild {
-    fn deref_mut(&mut self) -> &mut process::Child {
+    fn deref_mut(&mut self) -> &mut std::process::Child {
         &mut self.0
     }
 }
@@ -197,6 +202,13 @@ impl Drop for JodChild {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+impl JodChild {
+    pub fn into_inner(self) -> std::process::Child {
+        // SAFETY: repr transparent
+        unsafe { std::mem::transmute::<JodChild, std::process::Child>(self) }
     }
 }
 

@@ -20,12 +20,12 @@ use itertools::Itertools;
 use rustc_hash::FxHashSet;
 use syntax::{
     ast::{self, AstNode},
-    SyntaxNode, SyntaxNodePtr, TextRange,
+    SyntaxNode, SyntaxNodePtr, TextRange, TextSize,
 };
 use text_edit::TextEdit;
 use unlinked_file::UnlinkedFile;
 
-use crate::{FileId, Label, SourceChange};
+use crate::{Assist, AssistId, AssistKind, FileId, Label, SourceChange};
 
 use self::fixes::DiagnosticWithFix;
 
@@ -35,7 +35,7 @@ pub struct Diagnostic {
     pub message: String,
     pub range: TextRange,
     pub severity: Severity,
-    pub fix: Option<Fix>,
+    pub fix: Option<Assist>,
     pub unused: bool,
     pub code: Option<DiagnosticCode>,
 }
@@ -56,7 +56,7 @@ impl Diagnostic {
         }
     }
 
-    fn with_fix(self, fix: Option<Fix>) -> Self {
+    fn with_fix(self, fix: Option<Assist>) -> Self {
         Self { fix, ..self }
     }
 
@@ -66,21 +66,6 @@ impl Diagnostic {
 
     fn with_code(self, code: Option<DiagnosticCode>) -> Self {
         Self { code, ..self }
-    }
-}
-
-#[derive(Debug)]
-pub struct Fix {
-    pub label: Label,
-    pub source_change: SourceChange,
-    /// Allows to trigger the fix only when the caret is in the range given
-    pub fix_trigger_range: TextRange,
-}
-
-impl Fix {
-    fn new(label: &str, source_change: SourceChange, fix_trigger_range: TextRange) -> Self {
-        let label = Label::new(label);
-        Self { label, source_change, fix_trigger_range }
     }
 }
 
@@ -99,6 +84,7 @@ pub struct DiagnosticsConfig {
 pub(crate) fn diagnostics(
     db: &RootDatabase,
     config: &DiagnosticsConfig,
+    resolve: bool,
     file_id: FileId,
 ) -> Vec<Diagnostic> {
     let _p = profile::span("diagnostics");
@@ -122,25 +108,25 @@ pub(crate) fn diagnostics(
     let res = RefCell::new(res);
     let sink_builder = DiagnosticSinkBuilder::new()
         .on::<hir::diagnostics::UnresolvedModule, _>(|d| {
-            res.borrow_mut().push(diagnostic_with_fix(d, &sema));
+            res.borrow_mut().push(diagnostic_with_fix(d, &sema, resolve));
         })
         .on::<hir::diagnostics::MissingFields, _>(|d| {
-            res.borrow_mut().push(diagnostic_with_fix(d, &sema));
+            res.borrow_mut().push(diagnostic_with_fix(d, &sema, resolve));
         })
         .on::<hir::diagnostics::MissingOkOrSomeInTailExpr, _>(|d| {
-            res.borrow_mut().push(diagnostic_with_fix(d, &sema));
+            res.borrow_mut().push(diagnostic_with_fix(d, &sema, resolve));
         })
         .on::<hir::diagnostics::NoSuchField, _>(|d| {
-            res.borrow_mut().push(diagnostic_with_fix(d, &sema));
+            res.borrow_mut().push(diagnostic_with_fix(d, &sema, resolve));
         })
         .on::<hir::diagnostics::RemoveThisSemicolon, _>(|d| {
-            res.borrow_mut().push(diagnostic_with_fix(d, &sema));
+            res.borrow_mut().push(diagnostic_with_fix(d, &sema, resolve));
         })
         .on::<hir::diagnostics::IncorrectCase, _>(|d| {
-            res.borrow_mut().push(warning_with_fix(d, &sema));
+            res.borrow_mut().push(warning_with_fix(d, &sema, resolve));
         })
         .on::<hir::diagnostics::ReplaceFilterMapNextWithFindMap, _>(|d| {
-            res.borrow_mut().push(warning_with_fix(d, &sema));
+            res.borrow_mut().push(warning_with_fix(d, &sema, resolve));
         })
         .on::<hir::diagnostics::InactiveCode, _>(|d| {
             // If there's inactive code somewhere in a macro, don't propagate to the call-site.
@@ -159,15 +145,16 @@ pub(crate) fn diagnostics(
             );
         })
         .on::<UnlinkedFile, _>(|d| {
+            // Limit diagnostic to the first few characters in the file. This matches how VS Code
+            // renders it with the full span, but on other editors, and is less invasive.
+            let range = sema.diagnostics_display_range(d.display_source()).range;
+            let range = range.intersect(TextRange::up_to(TextSize::of("..."))).unwrap_or(range);
+
             // Override severity and mark as unused.
             res.borrow_mut().push(
-                Diagnostic::hint(
-                    sema.diagnostics_display_range(d.display_source()).range,
-                    d.message(),
-                )
-                .with_unused(true)
-                .with_fix(d.fix(&sema))
-                .with_code(Some(d.code())),
+                Diagnostic::hint(range, d.message())
+                    .with_fix(d.fix(&sema, resolve))
+                    .with_code(Some(d.code())),
             );
         })
         .on::<hir::diagnostics::UnresolvedProcMacro, _>(|d| {
@@ -222,15 +209,23 @@ pub(crate) fn diagnostics(
     res.into_inner()
 }
 
-fn diagnostic_with_fix<D: DiagnosticWithFix>(d: &D, sema: &Semantics<RootDatabase>) -> Diagnostic {
+fn diagnostic_with_fix<D: DiagnosticWithFix>(
+    d: &D,
+    sema: &Semantics<RootDatabase>,
+    resolve: bool,
+) -> Diagnostic {
     Diagnostic::error(sema.diagnostics_display_range(d.display_source()).range, d.message())
-        .with_fix(d.fix(&sema))
+        .with_fix(d.fix(&sema, resolve))
         .with_code(Some(d.code()))
 }
 
-fn warning_with_fix<D: DiagnosticWithFix>(d: &D, sema: &Semantics<RootDatabase>) -> Diagnostic {
+fn warning_with_fix<D: DiagnosticWithFix>(
+    d: &D,
+    sema: &Semantics<RootDatabase>,
+    resolve: bool,
+) -> Diagnostic {
     Diagnostic::hint(sema.diagnostics_display_range(d.display_source()).range, d.message())
-        .with_fix(d.fix(&sema))
+        .with_fix(d.fix(&sema, resolve))
         .with_code(Some(d.code()))
 }
 
@@ -260,7 +255,8 @@ fn check_unnecessary_braces_in_use_statement(
 
         acc.push(
             Diagnostic::hint(use_range, "Unnecessary braces in use statement".to_string())
-                .with_fix(Some(Fix::new(
+                .with_fix(Some(fix(
+                    "remove_braces",
                     "Remove unnecessary braces",
                     SourceChange::from_text_edit(file_id, edit),
                     use_range,
@@ -283,6 +279,23 @@ fn text_edit_for_remove_unnecessary_braces_with_self_in_use_statement(
     None
 }
 
+fn fix(id: &'static str, label: &str, source_change: SourceChange, target: TextRange) -> Assist {
+    let mut res = unresolved_fix(id, label, target);
+    res.source_change = Some(source_change);
+    res
+}
+
+fn unresolved_fix(id: &'static str, label: &str, target: TextRange) -> Assist {
+    assert!(!id.contains(' '));
+    Assist {
+        id: AssistId(id, AssistKind::QuickFix),
+        label: Label::new(label),
+        group: None,
+        target,
+        source_change: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use expect_test::{expect, Expect};
@@ -301,16 +314,17 @@ mod tests {
 
         let (analysis, file_position) = fixture::position(ra_fixture_before);
         let diagnostic = analysis
-            .diagnostics(&DiagnosticsConfig::default(), file_position.file_id)
+            .diagnostics(&DiagnosticsConfig::default(), true, file_position.file_id)
             .unwrap()
             .pop()
             .unwrap();
         let fix = diagnostic.fix.unwrap();
         let actual = {
-            let file_id = *fix.source_change.source_file_edits.keys().next().unwrap();
+            let source_change = fix.source_change.unwrap();
+            let file_id = *source_change.source_file_edits.keys().next().unwrap();
             let mut actual = analysis.file_text(file_id).unwrap().to_string();
 
-            for edit in fix.source_change.source_file_edits.values() {
+            for edit in source_change.source_file_edits.values() {
                 edit.apply(&mut actual);
             }
             actual
@@ -318,9 +332,9 @@ mod tests {
 
         assert_eq_text!(&after, &actual);
         assert!(
-            fix.fix_trigger_range.contains_inclusive(file_position.offset),
+            fix.target.contains_inclusive(file_position.offset),
             "diagnostic fix range {:?} does not touch cursor position {:?}",
-            fix.fix_trigger_range,
+            fix.target,
             file_position.offset
         );
     }
@@ -329,7 +343,7 @@ mod tests {
     fn check_no_fix(ra_fixture: &str) {
         let (analysis, file_position) = fixture::position(ra_fixture);
         let diagnostic = analysis
-            .diagnostics(&DiagnosticsConfig::default(), file_position.file_id)
+            .diagnostics(&DiagnosticsConfig::default(), true, file_position.file_id)
             .unwrap()
             .pop()
             .unwrap();
@@ -343,7 +357,7 @@ mod tests {
         let diagnostics = files
             .into_iter()
             .flat_map(|file_id| {
-                analysis.diagnostics(&DiagnosticsConfig::default(), file_id).unwrap()
+                analysis.diagnostics(&DiagnosticsConfig::default(), true, file_id).unwrap()
             })
             .collect::<Vec<_>>();
         assert_eq!(diagnostics.len(), 0, "unexpected diagnostics:\n{:#?}", diagnostics);
@@ -351,7 +365,8 @@ mod tests {
 
     fn check_expect(ra_fixture: &str, expect: Expect) {
         let (analysis, file_id) = fixture::file(ra_fixture);
-        let diagnostics = analysis.diagnostics(&DiagnosticsConfig::default(), file_id).unwrap();
+        let diagnostics =
+            analysis.diagnostics(&DiagnosticsConfig::default(), true, file_id).unwrap();
         expect.assert_debug_eq(&diagnostics)
     }
 
@@ -664,24 +679,31 @@ fn test_fn() {
                         range: 0..8,
                         severity: Error,
                         fix: Some(
-                            Fix {
+                            Assist {
+                                id: AssistId(
+                                    "create_module",
+                                    QuickFix,
+                                ),
                                 label: "Create module",
-                                source_change: SourceChange {
-                                    source_file_edits: {},
-                                    file_system_edits: [
-                                        CreateFile {
-                                            dst: AnchoredPathBuf {
-                                                anchor: FileId(
-                                                    0,
-                                                ),
-                                                path: "foo.rs",
+                                group: None,
+                                target: 0..8,
+                                source_change: Some(
+                                    SourceChange {
+                                        source_file_edits: {},
+                                        file_system_edits: [
+                                            CreateFile {
+                                                dst: AnchoredPathBuf {
+                                                    anchor: FileId(
+                                                        0,
+                                                    ),
+                                                    path: "foo.rs",
+                                                },
+                                                initial_contents: "",
                                             },
-                                            initial_contents: "",
-                                        },
-                                    ],
-                                    is_snippet: false,
-                                },
-                                fix_trigger_range: 0..8,
+                                        ],
+                                        is_snippet: false,
+                                    },
+                                ),
                             },
                         ),
                         unused: false,
@@ -703,7 +725,7 @@ fn test_fn() {
             expect![[r#"
                 [
                     Diagnostic {
-                        message: "unresolved macro call",
+                        message: "unresolved macro `foo::bar!`",
                         range: 5..8,
                         severity: Error,
                         fix: None,
@@ -889,10 +911,11 @@ struct Foo {
 
         let (analysis, file_id) = fixture::file(r#"mod foo;"#);
 
-        let diagnostics = analysis.diagnostics(&config, file_id).unwrap();
+        let diagnostics = analysis.diagnostics(&config, true, file_id).unwrap();
         assert!(diagnostics.is_empty());
 
-        let diagnostics = analysis.diagnostics(&DiagnosticsConfig::default(), file_id).unwrap();
+        let diagnostics =
+            analysis.diagnostics(&DiagnosticsConfig::default(), true, file_id).unwrap();
         assert!(!diagnostics.is_empty());
     }
 
@@ -998,8 +1021,9 @@ impl TestStruct {
         let expected = r#"fn foo() {}"#;
 
         let (analysis, file_position) = fixture::position(input);
-        let diagnostics =
-            analysis.diagnostics(&DiagnosticsConfig::default(), file_position.file_id).unwrap();
+        let diagnostics = analysis
+            .diagnostics(&DiagnosticsConfig::default(), true, file_position.file_id)
+            .unwrap();
         assert_eq!(diagnostics.len(), 1);
 
         check_fix(input, expected);

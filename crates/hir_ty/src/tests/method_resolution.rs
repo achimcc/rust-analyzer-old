@@ -1292,3 +1292,60 @@ mod b {
         "#]],
     )
 }
+
+#[test]
+fn trait_impl_in_unnamed_const() {
+    check_types(
+        r#"
+struct S;
+
+trait Tr {
+    fn method(&self) -> u16;
+}
+
+const _: () = {
+    impl Tr for S {}
+};
+
+fn f() {
+    S.method();
+  //^^^^^^^^^^ u16
+}
+    "#,
+    );
+}
+
+#[test]
+fn inherent_impl_in_unnamed_const() {
+    check_types(
+        r#"
+struct S;
+
+const _: () = {
+    impl S {
+        fn method(&self) -> u16 { 0 }
+
+        pub(super) fn super_method(&self) -> u16 { 0 }
+
+        pub(crate) fn crate_method(&self) -> u16 { 0 }
+
+        pub fn pub_method(&self) -> u16 { 0 }
+    }
+};
+
+fn f() {
+    S.method();
+  //^^^^^^^^^^ u16
+
+    S.super_method();
+  //^^^^^^^^^^^^^^^^ u16
+
+    S.crate_method();
+  //^^^^^^^^^^^^^^^^ u16
+
+    S.pub_method();
+  //^^^^^^^^^^^^^^ u16
+}
+    "#,
+    );
+}

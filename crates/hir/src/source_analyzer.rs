@@ -9,6 +9,7 @@ use std::{iter::once, sync::Arc};
 
 use hir_def::{
     body::{
+        self,
         scope::{ExprScopes, ScopeId},
         Body, BodySourceMap,
     },
@@ -20,7 +21,7 @@ use hir_def::{
 use hir_expand::{hygiene::Hygiene, name::AsName, HirFileId, InFile};
 use hir_ty::{
     diagnostics::{record_literal_missing_fields, record_pattern_missing_fields},
-    InferenceResult, Substitution,
+    InferenceResult, Interner, Substitution, TyExt, TyLoweringContext,
 };
 use syntax::{
     ast::{self, AstNode},
@@ -161,14 +162,15 @@ impl SourceAnalyzer {
         db: &dyn HirDatabase,
         field: &ast::RecordExprField,
     ) -> Option<(Field, Option<Local>)> {
-        let expr_id =
-            self.body_source_map.as_ref()?.node_field(InFile::new(self.file_id, field))?;
+        let record_expr = ast::RecordExpr::cast(field.syntax().parent().and_then(|p| p.parent())?)?;
+        let expr = ast::Expr::from(record_expr);
+        let expr_id = self.body_source_map.as_ref()?.node_expr(InFile::new(self.file_id, &expr))?;
 
+        let local_name = field.field_name()?.as_name();
         let local = if field.name_ref().is_some() {
             None
         } else {
-            let local_name = field.field_name()?.as_name();
-            let path = ModPath::from_segments(PathKind::Plain, once(local_name));
+            let path = ModPath::from_segments(PathKind::Plain, once(local_name.clone()));
             match self.resolver.resolve_path_in_value_ns_fully(db.upcast(), &path) {
                 Some(ValueNs::LocalBinding(pat_id)) => {
                     Some(Local { pat_id, parent: self.resolver.body_owner()? })
@@ -176,18 +178,24 @@ impl SourceAnalyzer {
                 _ => None,
             }
         };
-        let struct_field = self.infer.as_ref()?.record_field_resolution(expr_id)?;
-        Some((struct_field.into(), local))
+        let variant = self.infer.as_ref()?.variant_resolution_for_expr(expr_id)?;
+        let variant_data = variant.variant_data(db.upcast());
+        let field = FieldId { parent: variant, local_id: variant_data.field(&local_name)? };
+        Some((field.into(), local))
     }
 
     pub(crate) fn resolve_record_pat_field(
         &self,
-        _db: &dyn HirDatabase,
+        db: &dyn HirDatabase,
         field: &ast::RecordPatField,
     ) -> Option<Field> {
-        let pat_id = self.pat_id(&field.pat()?)?;
-        let struct_field = self.infer.as_ref()?.record_pat_field_resolution(pat_id)?;
-        Some(struct_field.into())
+        let field_name = field.field_name()?.as_name();
+        let record_pat = ast::RecordPat::cast(field.syntax().parent().and_then(|p| p.parent())?)?;
+        let pat_id = self.pat_id(&record_pat.into())?;
+        let variant = self.infer.as_ref()?.variant_resolution_for_pat(pat_id)?;
+        let variant_data = variant.variant_data(db.upcast());
+        let field = FieldId { parent: variant, local_id: variant_data.field(&field_name)? };
+        Some(field.into())
     }
 
     pub(crate) fn resolve_macro_call(
@@ -195,8 +203,8 @@ impl SourceAnalyzer {
         db: &dyn HirDatabase,
         macro_call: InFile<&ast::MacroCall>,
     ) -> Option<MacroDef> {
-        let hygiene = Hygiene::new(db.upcast(), macro_call.file_id);
-        let path = macro_call.value.path().and_then(|ast| Path::from_src(ast, &hygiene))?;
+        let ctx = body::LowerCtx::new(db.upcast(), macro_call.file_id);
+        let path = macro_call.value.path().and_then(|ast| Path::from_src(ast, &ctx))?;
         self.resolver.resolve_path_as_macro(db.upcast(), path.mod_path()).map(|it| it.into())
     }
 
@@ -274,7 +282,9 @@ impl SourceAnalyzer {
         }
 
         // This must be a normal source file rather than macro file.
-        let hir_path = Path::from_src(path.clone(), &Hygiene::new(db.upcast(), self.file_id))?;
+        let hygiene = Hygiene::new(db.upcast(), self.file_id);
+        let ctx = body::LowerCtx::with_hygiene(&hygiene);
+        let hir_path = Path::from_src(path.clone(), &ctx)?;
 
         // Case where path is a qualifier of another path, e.g. foo::bar::Baz where we
         // trying to resolve foo::bar.
@@ -299,7 +309,7 @@ impl SourceAnalyzer {
         let infer = self.infer.as_ref()?;
 
         let expr_id = self.expr_id(db, &literal.clone().into())?;
-        let substs = infer.type_of_expr[expr_id].substs()?;
+        let substs = infer.type_of_expr[expr_id].as_adt()?.1;
 
         let (variant, missing_fields, _exhaustive) =
             record_literal_missing_fields(db, infer, expr_id, &body[expr_id])?;
@@ -317,7 +327,7 @@ impl SourceAnalyzer {
         let infer = self.infer.as_ref()?;
 
         let pat_id = self.pat_id(&pattern.clone().into())?;
-        let substs = infer.type_of_pat[pat_id].substs()?;
+        let substs = infer.type_of_pat[pat_id].as_adt()?.1;
 
         let (variant, missing_fields, _exhaustive) =
             record_pattern_missing_fields(db, infer, pat_id, &body[pat_id])?;
@@ -339,7 +349,7 @@ impl SourceAnalyzer {
             .into_iter()
             .map(|local_id| {
                 let field = FieldId { parent: variant, local_id };
-                let ty = field_types[local_id].clone().subst(substs);
+                let ty = field_types[local_id].clone().substitute(&Interner, substs);
                 (field.into(), Type::new_with_resolver_inner(db, krate, &self.resolver, ty))
             })
             .collect()
@@ -466,7 +476,21 @@ fn resolve_hir_path_(
     prefer_value_ns: bool,
 ) -> Option<PathResolution> {
     let types = || {
-        resolver.resolve_path_in_type_ns_fully(db.upcast(), path.mod_path()).map(|ty| match ty {
+        let (ty, unresolved) = match path.type_anchor() {
+            Some(type_ref) => {
+                let (_, res) = TyLoweringContext::new(db, resolver).lower_ty_ext(type_ref);
+                res.map(|ty_ns| (ty_ns, path.segments().first()))
+            }
+            None => {
+                let (ty, remaining) =
+                    resolver.resolve_path_in_type_ns(db.upcast(), path.mod_path())?;
+                match remaining {
+                    Some(remaining) if remaining > 1 => None,
+                    _ => Some((ty, path.segments().get(1))),
+                }
+            }
+        }?;
+        let res = match ty {
             TypeNs::SelfType(it) => PathResolution::SelfType(it.into()),
             TypeNs::GenericParam(id) => PathResolution::TypeParam(TypeParam { id }),
             TypeNs::AdtSelfType(it) | TypeNs::AdtId(it) => {
@@ -476,7 +500,17 @@ fn resolve_hir_path_(
             TypeNs::TypeAliasId(it) => PathResolution::Def(TypeAlias::from(it).into()),
             TypeNs::BuiltinType(it) => PathResolution::Def(BuiltinType::from(it).into()),
             TypeNs::TraitId(it) => PathResolution::Def(Trait::from(it).into()),
-        })
+        };
+        match unresolved {
+            Some(unresolved) => res
+                .assoc_type_shorthand_candidates(db, |name, alias| {
+                    (name == unresolved.name).then(|| alias)
+                })
+                .map(TypeAlias::from)
+                .map(Into::into)
+                .map(PathResolution::Def),
+            None => Some(res),
+        }
     };
 
     let body_owner = resolver.body_owner();

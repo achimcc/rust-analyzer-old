@@ -69,7 +69,7 @@ use crate::display::ToNav;
 pub use crate::{
     annotations::{Annotation, AnnotationConfig, AnnotationKind},
     call_hierarchy::CallItem,
-    diagnostics::{Diagnostic, DiagnosticsConfig, Fix, Severity},
+    diagnostics::{Diagnostic, DiagnosticsConfig, Severity},
     display::navigation_target::NavigationTarget,
     expand_macro::ExpandedMacro,
     file_structure::{StructureNode, StructureNodeKind},
@@ -82,7 +82,7 @@ pub use crate::{
     references::{rename::RenameError, ReferenceSearchResult},
     runnables::{Runnable, RunnableKind, TestId},
     syntax_highlighting::{
-        tags::{Highlight, HlMod, HlMods, HlPunct, HlTag},
+        tags::{Highlight, HlMod, HlMods, HlOperator, HlPunct, HlTag},
         HlRange,
     },
 };
@@ -242,6 +242,12 @@ impl Analysis {
     /// Gets the syntax tree of the file.
     pub fn parse(&self, file_id: FileId) -> Cancelable<SourceFile> {
         self.with_db(|db| db.parse(file_id).tree())
+    }
+
+    /// Returns true if this file belongs to an immutable library.
+    pub fn is_library_file(&self, file_id: FileId) -> Cancelable<bool> {
+        use ide_db::base_db::SourceDatabaseExt;
+        self.with_db(|db| db.source_root(db.file_source_root(file_id)).is_library)
     }
 
     /// Gets the file's `LineIndex`: data structure to convert between absolute
@@ -526,9 +532,39 @@ impl Analysis {
     pub fn diagnostics(
         &self,
         config: &DiagnosticsConfig,
+        resolve: bool,
         file_id: FileId,
     ) -> Cancelable<Vec<Diagnostic>> {
-        self.with_db(|db| diagnostics::diagnostics(db, config, file_id))
+        self.with_db(|db| diagnostics::diagnostics(db, config, resolve, file_id))
+    }
+
+    /// Convenience function to return assists + quick fixes for diagnostics
+    pub fn assists_with_fixes(
+        &self,
+        assist_config: &AssistConfig,
+        diagnostics_config: &DiagnosticsConfig,
+        resolve: bool,
+        frange: FileRange,
+    ) -> Cancelable<Vec<Assist>> {
+        let include_fixes = match &assist_config.allowed {
+            Some(it) => it.iter().any(|&it| it == AssistKind::None || it == AssistKind::QuickFix),
+            None => true,
+        };
+
+        self.with_db(|db| {
+            let mut res = Assist::get(db, assist_config, resolve, frange);
+            ssr::add_ssr_assist(db, &mut res, resolve, frange);
+
+            if include_fixes {
+                res.extend(
+                    diagnostics::diagnostics(db, diagnostics_config, resolve, frange.file_id)
+                        .into_iter()
+                        .filter_map(|it| it.fix)
+                        .filter(|it| it.target.intersect(frange.range).is_some()),
+                );
+            }
+            res
+        })
     }
 
     /// Returns the edit required to rename reference at the position to the new

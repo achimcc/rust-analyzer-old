@@ -1,8 +1,8 @@
 <!---
-lsp_ext.rs hash: e8a7502bd2b2c2f5
+lsp_ext.rs hash: 28a9d5a24b7ca396
 
 If you need to change the above hash to make the test pass, please check if you
-need to adjust this doc as well and ping this  issue:
+need to adjust this doc as well and ping this issue:
 
   https://github.com/rust-analyzer/rust-analyzer/issues/4604
 
@@ -46,13 +46,14 @@ If this capability is set, `WorkspaceEdit`s returned from `codeAction` requests 
 ```typescript
 interface SnippetTextEdit extends TextEdit {
     insertTextFormat?: InsertTextFormat;
+    annotationId?: ChangeAnnotationIdentifier;
 }
 ```
 
 ```typescript
 export interface TextDocumentEdit {
-	textDocument: OptionalVersionedTextDocumentIdentifier;
-	edits: (TextEdit | SnippetTextEdit)[];
+    textDocument: OptionalVersionedTextDocumentIdentifier;
+    edits: (TextEdit | SnippetTextEdit)[];
 }
 ```
 
@@ -145,9 +146,9 @@ mod foo;
 ### Unresolved Question
 
 * An alternative would be to use a more general "gotoSuper" request, which would work for super methods, super classes and super modules.
-  This is the approach IntelliJ Rust is takeing.
+  This is the approach IntelliJ Rust is taking.
   However, experience shows that super module (which generally has a feeling of navigation between files) should be separate.
-  If you want super module, but the cursor happens to be inside an overriden function, the behavior with single "gotoSuper" request is surprising.
+  If you want super module, but the cursor happens to be inside an overridden function, the behavior with single "gotoSuper" request is surprising.
 
 ## Join Lines
 
@@ -193,7 +194,7 @@ fn main() {
 ### Unresolved Question
 
 * What is the position of the cursor after `joinLines`?
-  Currently this is left to editor's discretion, but it might be useful to specify on the server via snippets.
+  Currently, this is left to editor's discretion, but it might be useful to specify on the server via snippets.
   However, it then becomes unclear how it works with multi cursor.
 
 ## On Enter
@@ -330,7 +331,7 @@ Moreover, it would be cool if editors didn't need to implement even basic langua
 
 ### Unresolved Question
 
-* Should we return a a nested brace structure, to allow paredit-like actions of jump *out* of the current brace pair?
+* Should we return a nested brace structure, to allow paredit-like actions of jump *out* of the current brace pair?
   This is how `SelectionRange` request works.
 * Alternatively, should we perhaps flag certain `SelectionRange`s as being brace pairs?
 
@@ -419,23 +420,42 @@ Returns internal status message, mostly for debugging purposes.
 
 Reloads project information (that is, re-executes `cargo metadata`).
 
-## Status Notification
+## Server Status
 
-**Experimental Client Capability:** `{ "statusNotification": boolean }`
+**Experimental Client Capability:** `{ "serverStatusNotification": boolean }`
 
-**Method:** `rust-analyzer/status`
+**Method:** `experimental/serverStatus`
 
 **Notification:**
 
 ```typescript
-interface StatusParams {
-    status: "loading" | "readyPartial" | "ready" | "invalid" | "needsReload",
+interface ServerStatusParams {
+    /// `ok` means that the server is completely functional.
+    ///
+    /// `warning` means that the server is partially functional.
+    /// It can answer correctly to most requests, but some results
+    /// might be wrong due to, for example, some missing dependencies.
+    ///
+    /// `error` means that the server is not functional. For example,
+    /// there's a fatal build configuration problem. The server might
+    /// still give correct answers to simple requests, but most results
+    /// will be incomplete or wrong.
+    health: "ok" | "warning" | "error",
+    /// Is there any pending background work which might change the status?
+    /// For example, are dependencies being downloaded?
+    quiescent: bool,
+    /// Explanatory message to show on hover.
+    message?: string,
 }
 ```
 
 This notification is sent from server to client.
-The client can use it to display persistent status to the user (in modline).
-For `needsReload` state, the client can provide a context-menu action to run `rust-analyzer/reloadWorkspace` request.
+The client can use it to display *persistent* status to the user (in modline).
+It is similar to the `showMessage`, but is intended for stares rather than point-in-time events.
+
+Note that this functionality is intended primarily to inform the end user about the state of the server.
+In particular, it's valid for the client to completely ignore this extension.
+Clients are discouraged from but are allowed to use the `health` status to decide if it's worth sending a request to the server.
 
 ## Syntax Tree
 
@@ -497,7 +517,7 @@ Expands macro call at a given position.
 This request is sent from client to server to render "inlay hints" -- virtual text inserted into editor to show things like inferred types.
 Generally, the client should re-query inlay hints after every modification.
 Note that we plan to move this request to `experimental/inlayHints`, as it is not really Rust-specific, but the current API is not necessary the right one.
-Upstream issue: https://github.com/microsoft/language-server-protocol/issues/956
+Upstream issues: https://github.com/microsoft/language-server-protocol/issues/956 , https://github.com/rust-analyzer/rust-analyzer/issues/2797
 
 **Request:**
 
@@ -602,12 +622,11 @@ interface TestInfo {
 
 This request is sent from client to server to move item under cursor or selection in some direction.
 
-**Method:** `experimental/moveItemUp`
-**Method:** `experimental/moveItemDown`
+**Method:** `experimental/moveItem`
 
 **Request:** `MoveItemParams`
 
-**Response:** `TextDocumentEdit | null`
+**Response:** `SnippetTextEdit[]`
 
 ```typescript
 export interface MoveItemParams {

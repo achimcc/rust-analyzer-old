@@ -6,18 +6,15 @@
 use std::iter::successors;
 
 use base_db::CrateId;
-use chalk_ir::cast::Cast;
+use chalk_ir::{cast::Cast, fold::Fold, interner::HasInterner, VariableKind};
 use hir_def::lang_item::LangItemTarget;
 use hir_expand::name::name;
 use log::{info, warn};
 
 use crate::{
-    db::HirDatabase,
-    to_assoc_type_id, to_chalk_trait_id,
-    traits::{InEnvironment, Solution},
-    utils::generics,
-    AliasEq, AliasTy, BoundVar, Canonical, CanonicalVarKinds, DebruijnIndex, Interner,
-    ProjectionTy, Substitution, TraitRef, Ty, TyKind,
+    db::HirDatabase, static_lifetime, AliasEq, AliasTy, BoundVar, Canonical, CanonicalVarKinds,
+    DebruijnIndex, InEnvironment, Interner, ProjectionTyExt, Solution, Substitution, Ty, TyBuilder,
+    TyKind,
 };
 
 const AUTODEREF_RECURSION_LIMIT: usize = 10;
@@ -39,10 +36,19 @@ pub(crate) fn deref(
     krate: CrateId,
     ty: InEnvironment<&Canonical<Ty>>,
 ) -> Option<Canonical<Ty>> {
-    if let Some(derefed) = ty.goal.value.builtin_deref() {
+    let _p = profile::span("deref");
+    if let Some(derefed) = builtin_deref(&ty.goal.value) {
         Some(Canonical { value: derefed, binders: ty.goal.binders.clone() })
     } else {
         deref_by_trait(db, krate, ty)
+    }
+}
+
+fn builtin_deref(ty: &Ty) -> Option<Ty> {
+    match ty.kind(&Interner) {
+        TyKind::Ref(.., ty) => Some(ty.clone()),
+        TyKind::Raw(.., ty) => Some(ty.clone()),
+        _ => None,
     }
 }
 
@@ -51,27 +57,27 @@ fn deref_by_trait(
     krate: CrateId,
     ty: InEnvironment<&Canonical<Ty>>,
 ) -> Option<Canonical<Ty>> {
+    let _p = profile::span("deref_by_trait");
     let deref_trait = match db.lang_item(krate, "deref".into())? {
         LangItemTarget::TraitId(it) => it,
         _ => return None,
     };
     let target = db.trait_data(deref_trait).associated_type_by_name(&name![Target])?;
 
-    let generic_params = generics(db.upcast(), target.into());
-    if generic_params.len() != 1 {
-        // the Target type + Deref trait should only have one generic parameter,
-        // namely Deref's Self type
-        return None;
-    }
+    let projection = {
+        let b = TyBuilder::assoc_type_projection(db, target);
+        if b.remaining() != 1 {
+            // the Target type + Deref trait should only have one generic parameter,
+            // namely Deref's Self type
+            return None;
+        }
+        b.push(ty.goal.value.clone()).build()
+    };
 
     // FIXME make the Canonical / bound var handling nicer
 
-    let parameters =
-        Substitution::build_for_generics(&generic_params).push(ty.goal.value.clone()).build();
-
     // Check that the type implements Deref at all
-    let trait_ref =
-        TraitRef { trait_id: to_chalk_trait_id(deref_trait), substitution: parameters.clone() };
+    let trait_ref = projection.trait_ref(db);
     let implements_goal = Canonical {
         binders: ty.goal.binders.clone(),
         value: InEnvironment {
@@ -84,11 +90,8 @@ fn deref_by_trait(
     }
 
     // Now do the assoc type projection
-    let projection = AliasEq {
-        alias: AliasTy::Projection(ProjectionTy {
-            associated_ty_id: to_assoc_type_id(target),
-            substitution: parameters,
-        }),
+    let alias_eq = AliasEq {
+        alias: AliasTy::Projection(projection),
         ty: TyKind::BoundVar(BoundVar::new(
             DebruijnIndex::INNERMOST,
             ty.goal.binders.len(&Interner),
@@ -96,16 +99,14 @@ fn deref_by_trait(
         .intern(&Interner),
     };
 
-    let obligation = projection.cast(&Interner);
-
-    let in_env = InEnvironment { goal: obligation, environment: ty.environment };
+    let in_env = InEnvironment { goal: alias_eq.cast(&Interner), environment: ty.environment };
 
     let canonical = Canonical {
         value: in_env,
         binders: CanonicalVarKinds::from_iter(
             &Interner,
             ty.goal.binders.iter(&Interner).cloned().chain(Some(chalk_ir::WithKind::new(
-                chalk_ir::VariableKind::Ty(chalk_ir::TyVariableKind::General),
+                VariableKind::Ty(chalk_ir::TyVariableKind::General),
                 chalk_ir::UniverseIndex::ROOT,
             ))),
         ),
@@ -130,22 +131,58 @@ fn deref_by_trait(
             // assumptions will be broken. We would need to properly introduce
             // new variables in that case
 
-            for i in 1..vars.0.binders.len(&Interner) {
-                if vars.0.value[i - 1].interned(&Interner)
+            for i in 1..vars.binders.len(&Interner) {
+                if vars.value.subst.at(&Interner, i - 1).assert_ty_ref(&Interner).kind(&Interner)
                     != &TyKind::BoundVar(BoundVar::new(DebruijnIndex::INNERMOST, i - 1))
                 {
                     warn!("complex solution for derefing {:?}: {:?}, ignoring", ty.goal, solution);
                     return None;
                 }
             }
-            Some(Canonical {
-                value: vars.0.value[vars.0.value.len() - 1].clone(),
-                binders: vars.0.binders.clone(),
-            })
+            // FIXME: we remove lifetime variables here since they can confuse
+            // the method resolution code later
+            Some(fixup_lifetime_variables(Canonical {
+                value: vars
+                    .value
+                    .subst
+                    .at(&Interner, vars.value.subst.len(&Interner) - 1)
+                    .assert_ty_ref(&Interner)
+                    .clone(),
+                binders: vars.binders.clone(),
+            }))
         }
         Solution::Ambig(_) => {
             info!("Ambiguous solution for derefing {:?}: {:?}", ty.goal, solution);
             None
         }
     }
+}
+
+fn fixup_lifetime_variables<T: Fold<Interner, Result = T> + HasInterner<Interner = Interner>>(
+    c: Canonical<T>,
+) -> Canonical<T> {
+    // Removes lifetime variables from the Canonical, replacing them by static lifetimes.
+    let mut i = 0;
+    let subst = Substitution::from_iter(
+        &Interner,
+        c.binders.iter(&Interner).map(|vk| match vk.kind {
+            VariableKind::Ty(_) => {
+                let index = i;
+                i += 1;
+                BoundVar::new(DebruijnIndex::INNERMOST, index).to_ty(&Interner).cast(&Interner)
+            }
+            VariableKind::Lifetime => static_lifetime().cast(&Interner),
+            VariableKind::Const(_) => unimplemented!(),
+        }),
+    );
+    let binders = CanonicalVarKinds::from_iter(
+        &Interner,
+        c.binders.iter(&Interner).filter(|vk| match vk.kind {
+            VariableKind::Ty(_) => true,
+            VariableKind::Lifetime => false,
+            VariableKind::Const(_) => true,
+        }),
+    );
+    let value = subst.apply(c.value, &Interner);
+    Canonical { binders, value }
 }

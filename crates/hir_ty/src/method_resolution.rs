@@ -8,8 +8,8 @@ use arrayvec::ArrayVec;
 use base_db::CrateId;
 use chalk_ir::{cast::Cast, Mutability, UniverseIndex};
 use hir_def::{
-    lang_item::LangItemTarget, AssocContainerId, AssocItemId, FunctionId, GenericDefId, HasModule,
-    ImplId, Lookup, ModuleId, TraitId,
+    lang_item::LangItemTarget, nameres::DefMap, AssocContainerId, AssocItemId, FunctionId,
+    GenericDefId, HasModule, ImplId, Lookup, ModuleId, TraitId,
 };
 use hir_expand::name::Name;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -19,49 +19,88 @@ use crate::{
     db::HirDatabase,
     from_foreign_def_id,
     primitive::{self, FloatTy, IntTy, UintTy},
-    to_chalk_trait_id,
+    static_lifetime,
     utils::all_super_traits,
-    AdtId, Canonical, CanonicalVarKinds, DebruijnIndex, FnPointer, FnSig, ForeignDefId,
-    InEnvironment, Interner, Scalar, Substitution, TraitEnvironment, TraitRef, Ty, TyKind,
-    TypeWalk,
+    AdtId, Canonical, CanonicalVarKinds, DebruijnIndex, ForeignDefId, InEnvironment, Interner,
+    Scalar, Substitution, TraitEnvironment, TraitRefExt, Ty, TyBuilder, TyExt, TyKind,
 };
 
 /// This is used as a key for indexing impls.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum TyFingerprint {
+    // These are lang item impls:
     Str,
     Slice,
     Array,
     Never,
     RawPtr(Mutability),
     Scalar(Scalar),
+    // These can have user-defined impls:
     Adt(hir_def::AdtId),
     Dyn(TraitId),
-    Tuple(usize),
     ForeignType(ForeignDefId),
-    FnPtr(usize, FnSig),
+    // These only exist for trait impls
+    Unit,
+    Unnameable,
+    Function(u32),
 }
 
 impl TyFingerprint {
-    /// Creates a TyFingerprint for looking up an impl. Only certain types can
-    /// have impls: if we have some `struct S`, we can have an `impl S`, but not
-    /// `impl &S`. Hence, this will return `None` for reference types and such.
-    pub fn for_impl(ty: &Ty) -> Option<TyFingerprint> {
-        let fp = match *ty.interned(&Interner) {
+    /// Creates a TyFingerprint for looking up an inherent impl. Only certain
+    /// types can have inherent impls: if we have some `struct S`, we can have
+    /// an `impl S`, but not `impl &S`. Hence, this will return `None` for
+    /// reference types and such.
+    pub fn for_inherent_impl(ty: &Ty) -> Option<TyFingerprint> {
+        let fp = match ty.kind(&Interner) {
             TyKind::Str => TyFingerprint::Str,
             TyKind::Never => TyFingerprint::Never,
             TyKind::Slice(..) => TyFingerprint::Slice,
             TyKind::Array(..) => TyFingerprint::Array,
-            TyKind::Scalar(scalar) => TyFingerprint::Scalar(scalar),
-            TyKind::Adt(AdtId(adt), _) => TyFingerprint::Adt(adt),
-            TyKind::Tuple(cardinality, _) => TyFingerprint::Tuple(cardinality),
-            TyKind::Raw(mutability, ..) => TyFingerprint::RawPtr(mutability),
-            TyKind::ForeignType(alias_id, ..) => TyFingerprint::ForeignType(alias_id),
-            TyKind::Function(FnPointer { num_args, sig, .. }) => {
-                TyFingerprint::FnPtr(num_args, sig)
-            }
+            TyKind::Scalar(scalar) => TyFingerprint::Scalar(*scalar),
+            TyKind::Adt(AdtId(adt), _) => TyFingerprint::Adt(*adt),
+            TyKind::Raw(mutability, ..) => TyFingerprint::RawPtr(*mutability),
+            TyKind::Foreign(alias_id, ..) => TyFingerprint::ForeignType(*alias_id),
             TyKind::Dyn(_) => ty.dyn_trait().map(|trait_| TyFingerprint::Dyn(trait_))?,
             _ => return None,
+        };
+        Some(fp)
+    }
+
+    /// Creates a TyFingerprint for looking up a trait impl.
+    pub fn for_trait_impl(ty: &Ty) -> Option<TyFingerprint> {
+        let fp = match ty.kind(&Interner) {
+            TyKind::Str => TyFingerprint::Str,
+            TyKind::Never => TyFingerprint::Never,
+            TyKind::Slice(..) => TyFingerprint::Slice,
+            TyKind::Array(..) => TyFingerprint::Array,
+            TyKind::Scalar(scalar) => TyFingerprint::Scalar(*scalar),
+            TyKind::Adt(AdtId(adt), _) => TyFingerprint::Adt(*adt),
+            TyKind::Raw(mutability, ..) => TyFingerprint::RawPtr(*mutability),
+            TyKind::Foreign(alias_id, ..) => TyFingerprint::ForeignType(*alias_id),
+            TyKind::Dyn(_) => ty.dyn_trait().map(|trait_| TyFingerprint::Dyn(trait_))?,
+            TyKind::Ref(_, _, ty) => return TyFingerprint::for_trait_impl(ty),
+            TyKind::Tuple(_, subst) => {
+                let first_ty = subst.interned().get(0).map(|arg| arg.assert_ty_ref(&Interner));
+                if let Some(ty) = first_ty {
+                    return TyFingerprint::for_trait_impl(ty);
+                } else {
+                    TyFingerprint::Unit
+                }
+            }
+            TyKind::AssociatedType(_, _)
+            | TyKind::OpaqueType(_, _)
+            | TyKind::FnDef(_, _)
+            | TyKind::Closure(_, _)
+            | TyKind::Generator(..)
+            | TyKind::GeneratorWitness(..) => TyFingerprint::Unnameable,
+            TyKind::Function(fn_ptr) => {
+                TyFingerprint::Function(fn_ptr.substitution.0.len(&Interner) as u32)
+            }
+            TyKind::Alias(_)
+            | TyKind::Placeholder(_)
+            | TyKind::BoundVar(_)
+            | TyKind::InferenceVar(_, _)
+            | TyKind::Error => return None,
         };
         Some(fp)
     }
@@ -100,25 +139,38 @@ impl TraitImpls {
         let mut impls = Self { map: FxHashMap::default() };
 
         let crate_def_map = db.crate_def_map(krate);
-        for (_module_id, module_data) in crate_def_map.modules() {
-            for impl_id in module_data.scope.impls() {
-                let target_trait = match db.impl_trait(impl_id) {
-                    Some(tr) => tr.value.hir_trait_id(),
-                    None => continue,
-                };
-                let self_ty = db.impl_self_ty(impl_id);
-                let self_ty_fp = TyFingerprint::for_impl(&self_ty.value);
-                impls
-                    .map
-                    .entry(target_trait)
-                    .or_default()
-                    .entry(self_ty_fp)
-                    .or_default()
-                    .push(impl_id);
+        collect_def_map(db, &crate_def_map, &mut impls);
+
+        return Arc::new(impls);
+
+        fn collect_def_map(db: &dyn HirDatabase, def_map: &DefMap, impls: &mut TraitImpls) {
+            for (_module_id, module_data) in def_map.modules() {
+                for impl_id in module_data.scope.impls() {
+                    let target_trait = match db.impl_trait(impl_id) {
+                        Some(tr) => tr.skip_binders().hir_trait_id(),
+                        None => continue,
+                    };
+                    let self_ty = db.impl_self_ty(impl_id);
+                    let self_ty_fp = TyFingerprint::for_trait_impl(self_ty.skip_binders());
+                    impls
+                        .map
+                        .entry(target_trait)
+                        .or_default()
+                        .entry(self_ty_fp)
+                        .or_default()
+                        .push(impl_id);
+                }
+
+                // To better support custom derives, collect impls in all unnamed const items.
+                // const _: () = { ... };
+                for konst in module_data.scope.unnamed_consts() {
+                    let body = db.body(konst.into());
+                    for (_, block_def_map) in body.blocks(db.upcast()) {
+                        collect_def_map(db, &block_def_map, impls);
+                    }
+                }
             }
         }
-
-        Arc::new(impls)
     }
 
     pub(crate) fn trait_impls_in_deps_query(db: &dyn HirDatabase, krate: CrateId) -> Arc<Self> {
@@ -144,10 +196,13 @@ impl TraitImpls {
     }
 
     /// Queries all trait impls for the given type.
-    pub fn for_self_ty(&self, fp: TyFingerprint) -> impl Iterator<Item = ImplId> + '_ {
+    pub fn for_self_ty_without_blanket_impls(
+        &self,
+        fp: TyFingerprint,
+    ) -> impl Iterator<Item = ImplId> + '_ {
         self.map
             .values()
-            .flat_map(move |impls| impls.get(&None).into_iter().chain(impls.get(&Some(fp))))
+            .flat_map(move |impls| impls.get(&Some(fp)).into_iter())
             .flat_map(|it| it.iter().copied())
     }
 
@@ -191,28 +246,43 @@ pub struct InherentImpls {
 
 impl InherentImpls {
     pub(crate) fn inherent_impls_in_crate_query(db: &dyn HirDatabase, krate: CrateId) -> Arc<Self> {
-        let mut map: FxHashMap<_, Vec<_>> = FxHashMap::default();
+        let mut impls = Self { map: FxHashMap::default() };
 
         let crate_def_map = db.crate_def_map(krate);
-        for (_module_id, module_data) in crate_def_map.modules() {
-            for impl_id in module_data.scope.impls() {
-                let data = db.impl_data(impl_id);
-                if data.target_trait.is_some() {
-                    continue;
+        collect_def_map(db, &crate_def_map, &mut impls);
+
+        return Arc::new(impls);
+
+        fn collect_def_map(db: &dyn HirDatabase, def_map: &DefMap, impls: &mut InherentImpls) {
+            for (_module_id, module_data) in def_map.modules() {
+                for impl_id in module_data.scope.impls() {
+                    let data = db.impl_data(impl_id);
+                    if data.target_trait.is_some() {
+                        continue;
+                    }
+
+                    let self_ty = db.impl_self_ty(impl_id);
+                    let fp = TyFingerprint::for_inherent_impl(self_ty.skip_binders());
+                    if let Some(fp) = fp {
+                        impls.map.entry(fp).or_default().push(impl_id);
+                    }
+                    // `fp` should only be `None` in error cases (either erroneous code or incomplete name resolution)
                 }
 
-                let self_ty = db.impl_self_ty(impl_id);
-                if let Some(fp) = TyFingerprint::for_impl(&self_ty.value) {
-                    map.entry(fp).or_default().push(impl_id);
+                // To better support custom derives, collect impls in all unnamed const items.
+                // const _: () = { ... };
+                for konst in module_data.scope.unnamed_consts() {
+                    let body = db.body(konst.into());
+                    for (_, block_def_map) in body.blocks(db.upcast()) {
+                        collect_def_map(db, &block_def_map, impls);
+                    }
                 }
             }
         }
-
-        Arc::new(Self { map })
     }
 
     pub fn for_self_ty(&self, self_ty: &Ty) -> &[ImplId] {
-        match TyFingerprint::for_impl(self_ty) {
+        match TyFingerprint::for_inherent_impl(self_ty) {
             Some(fp) => self.map.get(&fp).map(|vec| vec.as_ref()).unwrap_or(&[]),
             None => &[],
         }
@@ -223,15 +293,14 @@ impl InherentImpls {
     }
 }
 
-impl Ty {
-    pub fn def_crates(
-        &self,
-        db: &dyn HirDatabase,
-        cur_crate: CrateId,
-    ) -> Option<ArrayVec<CrateId, 2>> {
-        // Types like slice can have inherent impls in several crates, (core and alloc).
-        // The corresponding impls are marked with lang items, so we can use them to find the required crates.
-        macro_rules! lang_item_crate {
+pub fn def_crates(
+    db: &dyn HirDatabase,
+    ty: &Ty,
+    cur_crate: CrateId,
+) -> Option<ArrayVec<CrateId, 2>> {
+    // Types like slice can have inherent impls in several crates, (core and alloc).
+    // The corresponding impls are marked with lang items, so we can use them to find the required crates.
+    macro_rules! lang_item_crate {
             ($($name:expr),+ $(,)?) => {{
                 let mut v = ArrayVec::<LangItemTarget, 2>::new();
                 $(
@@ -241,51 +310,50 @@ impl Ty {
             }};
         }
 
-        let mod_to_crate_ids = |module: ModuleId| Some(std::iter::once(module.krate()).collect());
+    let mod_to_crate_ids = |module: ModuleId| Some(std::iter::once(module.krate()).collect());
 
-        let lang_item_targets = match self.interned(&Interner) {
-            TyKind::Adt(AdtId(def_id), _) => {
-                return mod_to_crate_ids(def_id.module(db.upcast()));
-            }
-            TyKind::ForeignType(id) => {
-                return mod_to_crate_ids(
-                    from_foreign_def_id(*id).lookup(db.upcast()).module(db.upcast()),
-                );
-            }
-            TyKind::Scalar(Scalar::Bool) => lang_item_crate!("bool"),
-            TyKind::Scalar(Scalar::Char) => lang_item_crate!("char"),
-            TyKind::Scalar(Scalar::Float(f)) => match f {
-                // There are two lang items: one in libcore (fXX) and one in libstd (fXX_runtime)
-                FloatTy::F32 => lang_item_crate!("f32", "f32_runtime"),
-                FloatTy::F64 => lang_item_crate!("f64", "f64_runtime"),
-            },
-            &TyKind::Scalar(Scalar::Int(t)) => {
-                lang_item_crate!(primitive::int_ty_to_string(t))
-            }
-            &TyKind::Scalar(Scalar::Uint(t)) => {
-                lang_item_crate!(primitive::uint_ty_to_string(t))
-            }
-            TyKind::Str => lang_item_crate!("str_alloc", "str"),
-            TyKind::Slice(_) => lang_item_crate!("slice_alloc", "slice"),
-            TyKind::Raw(Mutability::Not, _) => lang_item_crate!("const_ptr"),
-            TyKind::Raw(Mutability::Mut, _) => lang_item_crate!("mut_ptr"),
-            TyKind::Dyn(_) => {
-                return self.dyn_trait().and_then(|trait_| {
-                    mod_to_crate_ids(GenericDefId::TraitId(trait_).module(db.upcast()))
-                });
-            }
-            _ => return None,
-        };
-        let res = lang_item_targets
-            .into_iter()
-            .filter_map(|it| match it {
-                LangItemTarget::ImplDefId(it) => Some(it),
-                _ => None,
-            })
-            .map(|it| it.lookup(db.upcast()).container.krate())
-            .collect();
-        Some(res)
-    }
+    let lang_item_targets = match ty.kind(&Interner) {
+        TyKind::Adt(AdtId(def_id), _) => {
+            return mod_to_crate_ids(def_id.module(db.upcast()));
+        }
+        TyKind::Foreign(id) => {
+            return mod_to_crate_ids(
+                from_foreign_def_id(*id).lookup(db.upcast()).module(db.upcast()),
+            );
+        }
+        TyKind::Scalar(Scalar::Bool) => lang_item_crate!("bool"),
+        TyKind::Scalar(Scalar::Char) => lang_item_crate!("char"),
+        TyKind::Scalar(Scalar::Float(f)) => match f {
+            // There are two lang items: one in libcore (fXX) and one in libstd (fXX_runtime)
+            FloatTy::F32 => lang_item_crate!("f32", "f32_runtime"),
+            FloatTy::F64 => lang_item_crate!("f64", "f64_runtime"),
+        },
+        &TyKind::Scalar(Scalar::Int(t)) => {
+            lang_item_crate!(primitive::int_ty_to_string(t))
+        }
+        &TyKind::Scalar(Scalar::Uint(t)) => {
+            lang_item_crate!(primitive::uint_ty_to_string(t))
+        }
+        TyKind::Str => lang_item_crate!("str_alloc", "str"),
+        TyKind::Slice(_) => lang_item_crate!("slice_alloc", "slice"),
+        TyKind::Raw(Mutability::Not, _) => lang_item_crate!("const_ptr"),
+        TyKind::Raw(Mutability::Mut, _) => lang_item_crate!("mut_ptr"),
+        TyKind::Dyn(_) => {
+            return ty.dyn_trait().and_then(|trait_| {
+                mod_to_crate_ids(GenericDefId::TraitId(trait_).module(db.upcast()))
+            });
+        }
+        _ => return None,
+    };
+    let res = lang_item_targets
+        .into_iter()
+        .filter_map(|it| match it {
+            LangItemTarget::ImplDefId(it) => Some(it),
+            _ => None,
+        })
+        .map(|it| it.lookup(db.upcast()).container.krate())
+        .collect();
+    Some(res)
 }
 
 /// Look up the method with the given name, returning the actual autoderefed
@@ -454,7 +522,8 @@ fn iterate_method_candidates_with_autoref(
     }
     let refed = Canonical {
         binders: deref_chain[0].binders.clone(),
-        value: TyKind::Ref(Mutability::Not, deref_chain[0].value.clone()).intern(&Interner),
+        value: TyKind::Ref(Mutability::Not, static_lifetime(), deref_chain[0].value.clone())
+            .intern(&Interner),
     };
     if iterate_method_candidates_by_receiver(
         &refed,
@@ -471,7 +540,8 @@ fn iterate_method_candidates_with_autoref(
     }
     let ref_muted = Canonical {
         binders: deref_chain[0].binders.clone(),
-        value: TyKind::Ref(Mutability::Mut, deref_chain[0].value.clone()).intern(&Interner),
+        value: TyKind::Ref(Mutability::Mut, static_lifetime(), deref_chain[0].value.clone())
+            .intern(&Interner),
     };
     if iterate_method_candidates_by_receiver(
         &ref_muted,
@@ -563,7 +633,7 @@ fn iterate_trait_method_candidates(
     // if ty is `dyn Trait`, the trait doesn't need to be in scope
     let inherent_trait =
         self_ty.value.dyn_trait().into_iter().flat_map(|t| all_super_traits(db.upcast(), t));
-    let env_traits = if let TyKind::Placeholder(_) = self_ty.value.interned(&Interner) {
+    let env_traits = if let TyKind::Placeholder(_) = self_ty.value.kind(&Interner) {
         // if we have `T: Trait` in the param env, the trait doesn't need to be in scope
         env.traits_in_scope_from_clauses(&self_ty.value)
             .flat_map(|t| all_super_traits(db.upcast(), t))
@@ -593,6 +663,7 @@ fn iterate_trait_method_candidates(
                 }
             }
             known_implemented = true;
+            // FIXME: we shouldn't be ignoring the binders here
             if callback(&self_ty.value, *item) {
                 return true;
             }
@@ -610,7 +681,7 @@ fn iterate_inherent_methods(
     visible_from_module: Option<ModuleId>,
     callback: &mut dyn FnMut(&Ty, AssocItemId) -> bool,
 ) -> bool {
-    let def_crates = match self_ty.value.def_crates(db, krate) {
+    let def_crates = match def_crates(db, &self_ty.value, krate) {
         Some(k) => k,
         None => return false,
     };
@@ -675,7 +746,7 @@ fn is_valid_candidate(
                 }
             }
             if let Some(receiver_ty) = receiver_ty {
-                if !data.has_self_param {
+                if !data.has_self_param() {
                     return false;
                 }
                 let transformed_receiver_ty = match transform_receiver_ty(db, m, self_ty) {
@@ -710,48 +781,44 @@ pub(crate) fn inherent_impl_substs(
 ) -> Option<Substitution> {
     // we create a var for each type parameter of the impl; we need to keep in
     // mind here that `self_ty` might have vars of its own
-    let vars = Substitution::build_for_def(db, impl_id)
-        .fill_with_bound_vars(DebruijnIndex::INNERMOST, self_ty.binders.len(&Interner))
+    let self_ty_vars = self_ty.binders.len(&Interner);
+    let vars = TyBuilder::subst_for_def(db, impl_id)
+        .fill_with_bound_vars(DebruijnIndex::INNERMOST, self_ty_vars)
         .build();
-    let self_ty_with_vars = db.impl_self_ty(impl_id).subst(&vars);
+    let self_ty_with_vars = db.impl_self_ty(impl_id).substitute(&Interner, &vars);
     let mut kinds = self_ty.binders.interned().to_vec();
     kinds.extend(
         iter::repeat(chalk_ir::WithKind::new(
             chalk_ir::VariableKind::Ty(chalk_ir::TyVariableKind::General),
             UniverseIndex::ROOT,
         ))
-        .take(vars.len()),
+        .take(vars.len(&Interner)),
     );
     let tys = Canonical {
         binders: CanonicalVarKinds::from_iter(&Interner, kinds),
         value: (self_ty_with_vars, self_ty.value.clone()),
     };
-    let substs = super::infer::unify(&tys);
+    let substs = super::infer::unify(&tys)?;
     // We only want the substs for the vars we added, not the ones from self_ty.
     // Also, if any of the vars we added are still in there, we replace them by
     // Unknown. I think this can only really happen if self_ty contained
     // Unknown, and in that case we want the result to contain Unknown in those
     // places again.
-    substs.map(|s| fallback_bound_vars(s.suffix(vars.len()), self_ty.binders.len(&Interner)))
+    let suffix =
+        Substitution::from_iter(&Interner, substs.iter(&Interner).cloned().skip(self_ty_vars));
+    Some(fallback_bound_vars(suffix, self_ty_vars))
 }
 
 /// This replaces any 'free' Bound vars in `s` (i.e. those with indices past
 /// num_vars_to_keep) by `TyKind::Unknown`.
 fn fallback_bound_vars(s: Substitution, num_vars_to_keep: usize) -> Substitution {
-    s.fold_binders(
-        &mut |ty, binders| {
-            if let TyKind::BoundVar(bound) = ty.interned(&Interner) {
-                if bound.index >= num_vars_to_keep && bound.debruijn >= binders {
-                    TyKind::Unknown.intern(&Interner)
-                } else {
-                    ty
-                }
-            } else {
-                ty
-            }
-        },
-        DebruijnIndex::INNERMOST,
-    )
+    crate::fold_free_vars(s, |bound, binders| {
+        if bound.index >= num_vars_to_keep && bound.debruijn == DebruijnIndex::INNERMOST {
+            TyKind::Error.intern(&Interner)
+        } else {
+            bound.shifted_in_from(binders).to_ty(&Interner)
+        }
+    })
 }
 
 fn transform_receiver_ty(
@@ -760,13 +827,13 @@ fn transform_receiver_ty(
     self_ty: &Canonical<Ty>,
 ) -> Option<Ty> {
     let substs = match function_id.lookup(db.upcast()).container {
-        AssocContainerId::TraitId(_) => Substitution::build_for_def(db, function_id)
+        AssocContainerId::TraitId(_) => TyBuilder::subst_for_def(db, function_id)
             .push(self_ty.value.clone())
             .fill_with_unknown()
             .build(),
         AssocContainerId::ImplId(impl_id) => {
             let impl_substs = inherent_impl_substs(db, impl_id, &self_ty)?;
-            Substitution::build_for_def(db, function_id)
+            TyBuilder::subst_for_def(db, function_id)
                 .use_parent_substs(&impl_substs)
                 .fill_with_unknown()
                 .build()
@@ -774,7 +841,7 @@ fn transform_receiver_ty(
         AssocContainerId::ModuleId(_) => unreachable!(),
     };
     let sig = db.callable_item_signature(function_id.into());
-    Some(sig.value.params()[0].clone().subst_bound_vars(&substs))
+    Some(sig.map(|s| s.params()[0].clone()).substitute(&Interner, &substs))
 }
 
 pub fn implements_trait(
@@ -800,7 +867,7 @@ pub fn implements_trait_unique(
     let goal = generic_implements_goal(db, env, trait_, ty.clone());
     let solution = db.trait_solve(krate, goal);
 
-    matches!(solution, Some(crate::traits::Solution::Unique(_)))
+    matches!(solution, Some(crate::Solution::Unique(_)))
 }
 
 /// This creates Substs for a trait with the given Self type and type variables
@@ -812,7 +879,7 @@ fn generic_implements_goal(
     self_ty: Canonical<Ty>,
 ) -> Canonical<InEnvironment<super::DomainGoal>> {
     let mut kinds = self_ty.binders.interned().to_vec();
-    let substs = super::Substitution::build_for_def(db, trait_)
+    let trait_ref = TyBuilder::trait_ref(db, trait_)
         .push(self_ty.value)
         .fill_with_bound_vars(DebruijnIndex::INNERMOST, kinds.len())
         .build();
@@ -821,13 +888,12 @@ fn generic_implements_goal(
             chalk_ir::VariableKind::Ty(chalk_ir::TyVariableKind::General),
             UniverseIndex::ROOT,
         ))
-        .take(substs.len() - 1),
+        .take(trait_ref.substitution.len(&Interner) - 1),
     );
-    let trait_ref = TraitRef { trait_id: to_chalk_trait_id(trait_), substitution: substs };
     let obligation = trait_ref.cast(&Interner);
     Canonical {
         binders: CanonicalVarKinds::from_iter(&Interner, kinds),
-        value: InEnvironment::new(env.env.clone(), obligation),
+        value: InEnvironment::new(&env.env, obligation),
     }
 }
 
@@ -838,8 +904,8 @@ fn autoderef_method_receiver(
 ) -> Vec<Canonical<Ty>> {
     let mut deref_chain: Vec<_> = autoderef::autoderef(db, Some(krate), ty).collect();
     // As a last step, we can do array unsizing (that's the only unsizing that rustc does for method receivers!)
-    if let Some(TyKind::Array(parameters)) =
-        deref_chain.last().map(|ty| ty.value.interned(&Interner))
+    if let Some(TyKind::Array(parameters, _)) =
+        deref_chain.last().map(|ty| ty.value.kind(&Interner))
     {
         let kinds = deref_chain.last().unwrap().binders.clone();
         let unsized_ty = TyKind::Slice(parameters.clone()).intern(&Interner);

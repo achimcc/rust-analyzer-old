@@ -34,7 +34,8 @@ pub fn diagnostics(
     with_proc_macro: bool,
 ) -> Result<()> {
     let cargo_config = Default::default();
-    let load_cargo_config = LoadCargoConfig { load_out_dirs_from_check, with_proc_macro };
+    let load_cargo_config =
+        LoadCargoConfig { load_out_dirs_from_check, with_proc_macro, wrap_rustc: false };
     let (host, _vfs, _proc_macro) =
         load_workspace_at(path, &cargo_config, &load_cargo_config, &|_| {})?;
     let db = host.raw_database();
@@ -56,7 +57,8 @@ pub fn diagnostics(
             let crate_name =
                 module.krate().display_name(db).as_deref().unwrap_or("unknown").to_string();
             println!("processing crate: {}, module: {}", crate_name, _vfs.file_path(file_id));
-            for diagnostic in analysis.diagnostics(&DiagnosticsConfig::default(), file_id).unwrap()
+            for diagnostic in
+                analysis.diagnostics(&DiagnosticsConfig::default(), false, file_id).unwrap()
             {
                 if matches!(diagnostic.severity, Severity::Error) {
                     found_error = true;

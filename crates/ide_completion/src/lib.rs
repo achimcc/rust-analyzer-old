@@ -81,6 +81,8 @@ pub use crate::{
 // And the auto import completions, enabled with the `rust-analyzer.completion.autoimport.enable` setting and the corresponding LSP client capabilities.
 // Those are the additional completion options with automatic `use` import and options from all project importable items,
 // fuzzy matched agains the completion imput.
+//
+// image::https://user-images.githubusercontent.com/48062697/113020667-b72ab880-917a-11eb-8778-716cf26a0eb3.gif[]
 
 /// Main entry point for completion. We run completion as a two-phase process.
 ///
@@ -104,6 +106,34 @@ pub use crate::{
 /// `foo` *should* be present among the completion variants. Filtering by
 /// identifier prefix/fuzzy match should be done higher in the stack, together
 /// with ordering of completions (currently this is done by the client).
+///
+/// # Hypothetical Completion Problem
+///
+/// There's a curious unsolved problem in the current implementation. Often, you
+/// want to compute completions on a *slightly different* text document.
+///
+/// In the simplest case, when the code looks like `let x = `, you want to
+/// insert a fake identifier to get a better syntax tree: `let x = complete_me`.
+///
+/// We do this in `CompletionContext`, and it works OK-enough for *syntax*
+/// analysis. However, we might want to, eg, ask for the type of `complete_me`
+/// variable, and that's where our current infrastructure breaks down. salsa
+/// doesn't allow such "phantom" inputs.
+///
+/// Another case where this would be instrumental is macro expansion. We want to
+/// insert a fake ident and re-expand code. There's `expand_hypothetical` as a
+/// work-around for this.
+///
+/// A different use-case is completion of injection (examples and links in doc
+/// comments). When computing completion for a path in a doc-comment, you want
+/// to inject a fake path expression into the item being documented and complete
+/// that.
+///
+/// IntelliJ has CodeFragment/Context infrastructure for that. You can create a
+/// temporary PSI node, and say that the context ("parent") of this node is some
+/// existing node. Asking for, eg, type of this `CodeFragment` node works
+/// correctly, as the underlying infrastructure makes use of contexts to do
+/// analysis.
 pub fn completions(
     db: &RootDatabase,
     config: &CompletionConfig,
@@ -149,7 +179,7 @@ pub fn resolve_completion_edits(
 ) -> Option<Vec<TextEdit>> {
     let ctx = CompletionContext::new(db, position, config)?;
     let position_for_import = position_for_import(&ctx, None)?;
-    let scope = ImportScope::find_insert_use_container(position_for_import, &ctx.sema)?;
+    let scope = ImportScope::find_insert_use_container_with_macros(position_for_import, &ctx.sema)?;
 
     let current_module = ctx.sema.scope(position_for_import).module()?;
     let current_crate = current_module.krate();

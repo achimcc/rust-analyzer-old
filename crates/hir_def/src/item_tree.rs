@@ -24,14 +24,15 @@ use la_arena::{Arena, Idx, RawIdx};
 use profile::Count;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use syntax::{ast, match_ast, SmolStr, SyntaxKind};
+use syntax::{ast, match_ast, SyntaxKind};
 
 use crate::{
     attr::{Attrs, RawAttrs},
     db::DefDatabase,
     generics::GenericParams,
+    intern::Interned,
     path::{path, AssociatedTypeBinding, GenericArgs, ImportAlias, ModPath, Path, PathKind},
-    type_ref::{Mutability, TypeBound, TypeRef},
+    type_ref::{Mutability, TraitRef, TypeBound, TypeRef},
     visibility::RawVisibility,
 };
 
@@ -55,13 +56,6 @@ impl fmt::Debug for RawVisibilityId {
         };
         f.finish()
     }
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub struct GenericParamsId(u32);
-
-impl GenericParamsId {
-    pub const EMPTY: Self = GenericParamsId(u32::max_value());
 }
 
 /// The item tree of a source file.
@@ -105,6 +99,16 @@ impl ItemTree {
                     // items.
                     ctx.lower_macro_stmts(stmts)
                 },
+                ast::Pat(_pat) => {
+                    // FIXME: This occurs because macros in pattern position are treated as inner
+                    // items and expanded during block DefMap computation
+                    return Default::default();
+                },
+                ast::Type(ty) => {
+                    // Types can contain inner items. We return an empty item tree in this case, but
+                    // still need to collect inner items.
+                    ctx.lower_inner_items(ty.syntax())
+                },
                 ast::Expr(e) => {
                     // Macros can expand to expressions. We return an empty item tree in this case, but
                     // still need to collect inner items.
@@ -145,8 +149,6 @@ impl ItemTree {
                 macro_rules,
                 macro_defs,
                 vis,
-                generics,
-                type_refs,
                 inner_items,
             } = &mut **data;
 
@@ -170,9 +172,6 @@ impl ItemTree {
             macro_defs.shrink_to_fit();
 
             vis.arena.shrink_to_fit();
-            generics.arena.shrink_to_fit();
-            type_refs.arena.shrink_to_fit();
-            type_refs.map.shrink_to_fit();
 
             inner_items.shrink_to_fit();
         }
@@ -195,13 +194,6 @@ impl ItemTree {
 
     pub fn attrs(&self, db: &dyn DefDatabase, krate: CrateId, of: AttrOwner) -> Attrs {
         self.raw_attrs(of).clone().filter(db, krate)
-    }
-
-    pub fn all_inner_items(&self) -> impl Iterator<Item = ModItem> + '_ {
-        match &self.data {
-            Some(data) => Some(data.inner_items.values().flatten().copied()).into_iter().flatten(),
-            None => None.into_iter().flatten(),
-        }
     }
 
     pub fn inner_items_of_block(&self, block: FileAstId<ast::BlockExpr>) -> &[ModItem] {
@@ -244,58 +236,6 @@ static VIS_PRIV: RawVisibility = RawVisibility::Module(ModPath::from_kind(PathKi
 static VIS_PUB_CRATE: RawVisibility = RawVisibility::Module(ModPath::from_kind(PathKind::Crate));
 
 #[derive(Default, Debug, Eq, PartialEq)]
-struct GenericParamsStorage {
-    arena: Arena<GenericParams>,
-}
-
-impl GenericParamsStorage {
-    fn alloc(&mut self, params: GenericParams) -> GenericParamsId {
-        if params.types.is_empty()
-            && params.lifetimes.is_empty()
-            && params.consts.is_empty()
-            && params.where_predicates.is_empty()
-        {
-            return GenericParamsId::EMPTY;
-        }
-
-        GenericParamsId(self.arena.alloc(params).into_raw().into())
-    }
-}
-
-static EMPTY_GENERICS: GenericParams = GenericParams {
-    types: Arena::new(),
-    lifetimes: Arena::new(),
-    consts: Arena::new(),
-    where_predicates: Vec::new(),
-};
-
-/// `TypeRef` interner.
-#[derive(Default, Debug, Eq, PartialEq)]
-struct TypeRefStorage {
-    arena: Arena<Arc<TypeRef>>,
-    map: FxHashMap<Arc<TypeRef>, Idx<Arc<TypeRef>>>,
-}
-
-impl TypeRefStorage {
-    // Note: We lie about the `Idx<TypeRef>` to hide the interner details.
-
-    fn intern(&mut self, ty: TypeRef) -> Idx<TypeRef> {
-        if let Some(id) = self.map.get(&ty) {
-            return Idx::from_raw(id.into_raw());
-        }
-
-        let ty = Arc::new(ty);
-        let idx = self.arena.alloc(ty.clone());
-        self.map.insert(ty, idx);
-        Idx::from_raw(idx.into_raw())
-    }
-
-    fn lookup(&self, id: Idx<TypeRef>) -> &TypeRef {
-        &self.arena[Idx::from_raw(id.into_raw())]
-    }
-}
-
-#[derive(Default, Debug, Eq, PartialEq)]
 struct ItemTreeData {
     imports: Arena<Import>,
     extern_crates: Arena<ExternCrate>,
@@ -317,8 +257,6 @@ struct ItemTreeData {
     macro_defs: Arena<MacroDef>,
 
     vis: ItemVisibilities,
-    generics: GenericParamsStorage,
-    type_refs: TypeRefStorage,
 
     inner_items: FxHashMap<FileAstId<ast::BlockExpr>, SmallVec<[ModItem; 1]>>,
 }
@@ -537,25 +475,6 @@ impl Index<RawVisibilityId> for ItemTree {
     }
 }
 
-impl Index<GenericParamsId> for ItemTree {
-    type Output = GenericParams;
-
-    fn index(&self, index: GenericParamsId) -> &Self::Output {
-        match index {
-            GenericParamsId::EMPTY => &EMPTY_GENERICS,
-            _ => &self.data().generics.arena[Idx::from_raw(index.0.into())],
-        }
-    }
-}
-
-impl Index<Idx<TypeRef>> for ItemTree {
-    type Output = TypeRef;
-
-    fn index(&self, id: Idx<TypeRef>) -> &Self::Output {
-        self.data().type_refs.lookup(id)
-    }
-}
-
 impl<N: ItemTreeNode> Index<FileItemTreeId<N>> for ItemTree {
     type Output = N;
     fn index(&self, id: FileItemTreeId<N>) -> &N {
@@ -566,7 +485,7 @@ impl<N: ItemTreeNode> Index<FileItemTreeId<N>> for ItemTree {
 /// A desugared `use` import.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Import {
-    pub path: ModPath,
+    pub path: Interned<ModPath>,
     pub alias: Option<ImportAlias>,
     pub visibility: RawVisibilityId,
     pub is_glob: bool,
@@ -592,38 +511,42 @@ pub struct ExternCrate {
 pub struct Function {
     pub name: Name,
     pub visibility: RawVisibilityId,
-    pub generic_params: GenericParamsId,
-    pub has_self_param: bool,
-    pub has_body: bool,
-    pub qualifier: FunctionQualifier,
-    /// Whether the function is located in an `extern` block (*not* whether it is an
-    /// `extern "abi" fn`).
-    pub is_in_extern_block: bool,
+    pub generic_params: Interned<GenericParams>,
+    pub abi: Option<Interned<str>>,
     pub params: IdRange<Param>,
-    pub ret_type: Idx<TypeRef>,
+    pub ret_type: Interned<TypeRef>,
     pub ast_id: FileAstId<ast::Fn>,
+    pub(crate) flags: FnFlags,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Param {
-    Normal(Idx<TypeRef>),
+    Normal(Interned<TypeRef>),
     Varargs,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FunctionQualifier {
-    pub is_default: bool,
-    pub is_const: bool,
-    pub is_async: bool,
-    pub is_unsafe: bool,
-    pub abi: Option<SmolStr>,
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub(crate) struct FnFlags {
+    pub(crate) bits: u8,
+}
+impl FnFlags {
+    pub(crate) const HAS_SELF_PARAM: u8 = 1 << 0;
+    pub(crate) const HAS_BODY: u8 = 1 << 1;
+    pub(crate) const IS_DEFAULT: u8 = 1 << 2;
+    pub(crate) const IS_CONST: u8 = 1 << 3;
+    pub(crate) const IS_ASYNC: u8 = 1 << 4;
+    pub(crate) const IS_UNSAFE: u8 = 1 << 5;
+    /// Whether the function is located in an `extern` block (*not* whether it is an
+    /// `extern "abi" fn`).
+    pub(crate) const IS_IN_EXTERN_BLOCK: u8 = 1 << 6;
+    pub(crate) const IS_VARARGS: u8 = 1 << 7;
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Struct {
     pub name: Name,
     pub visibility: RawVisibilityId,
-    pub generic_params: GenericParamsId,
+    pub generic_params: Interned<GenericParams>,
     pub fields: Fields,
     pub ast_id: FileAstId<ast::Struct>,
     pub kind: StructDefKind,
@@ -643,7 +566,7 @@ pub enum StructDefKind {
 pub struct Union {
     pub name: Name,
     pub visibility: RawVisibilityId,
-    pub generic_params: GenericParamsId,
+    pub generic_params: Interned<GenericParams>,
     pub fields: Fields,
     pub ast_id: FileAstId<ast::Union>,
 }
@@ -652,7 +575,7 @@ pub struct Union {
 pub struct Enum {
     pub name: Name,
     pub visibility: RawVisibilityId,
-    pub generic_params: GenericParamsId,
+    pub generic_params: Interned<GenericParams>,
     pub variants: IdRange<Variant>,
     pub ast_id: FileAstId<ast::Enum>,
 }
@@ -662,7 +585,7 @@ pub struct Const {
     /// const _: () = ();
     pub name: Option<Name>,
     pub visibility: RawVisibilityId,
-    pub type_ref: Idx<TypeRef>,
+    pub type_ref: Interned<TypeRef>,
     pub ast_id: FileAstId<ast::Const>,
 }
 
@@ -673,7 +596,7 @@ pub struct Static {
     pub mutable: bool,
     /// Whether the static is in an `extern` block.
     pub is_extern: bool,
-    pub type_ref: Idx<TypeRef>,
+    pub type_ref: Interned<TypeRef>,
     pub ast_id: FileAstId<ast::Static>,
 }
 
@@ -681,7 +604,7 @@ pub struct Static {
 pub struct Trait {
     pub name: Name,
     pub visibility: RawVisibilityId,
-    pub generic_params: GenericParamsId,
+    pub generic_params: Interned<GenericParams>,
     pub is_auto: bool,
     pub is_unsafe: bool,
     pub bounds: Box<[TypeBound]>,
@@ -691,9 +614,9 @@ pub struct Trait {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Impl {
-    pub generic_params: GenericParamsId,
-    pub target_trait: Option<Idx<TypeRef>>,
-    pub target_type: Idx<TypeRef>,
+    pub generic_params: Interned<GenericParams>,
+    pub target_trait: Option<Interned<TraitRef>>,
+    pub self_ty: Interned<TypeRef>,
     pub is_negative: bool,
     pub items: Box<[AssocItem]>,
     pub ast_id: FileAstId<ast::Impl>,
@@ -705,8 +628,8 @@ pub struct TypeAlias {
     pub visibility: RawVisibilityId,
     /// Bounds on the type alias itself. Only valid in trait declarations, eg. `type Assoc: Copy;`.
     pub bounds: Box<[TypeBound]>,
-    pub generic_params: GenericParamsId,
-    pub type_ref: Option<Idx<TypeRef>>,
+    pub generic_params: Interned<GenericParams>,
+    pub type_ref: Option<Interned<TypeRef>>,
     pub is_extern: bool,
     pub ast_id: FileAstId<ast::TypeAlias>,
 }
@@ -731,7 +654,7 @@ pub enum ModKind {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MacroCall {
     /// Path to the called macro.
-    pub path: ModPath,
+    pub path: Interned<ModPath>,
     pub ast_id: FileAstId<ast::MacroCall>,
 }
 
@@ -896,6 +819,6 @@ pub enum Fields {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
     pub name: Name,
-    pub type_ref: Idx<TypeRef>,
+    pub type_ref: Interned<TypeRef>,
     pub visibility: RawVisibilityId,
 }

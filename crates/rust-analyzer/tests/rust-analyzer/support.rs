@@ -32,8 +32,12 @@ impl<'a> Project<'a> {
             tmp_dir: None,
             roots: vec![],
             config: serde_json::json!({
-                // Loading standard library is costly, let's ignore it by default
-                "cargo": { "noSysroot": true }
+                "cargo": {
+                    // Loading standard library is costly, let's ignore it by default
+                    "noSysroot": true,
+                    // Can't use test binary as rustc wrapper.
+                    "useRustcWrapperForBuildScripts": false,
+                }
             }),
         }
     }
@@ -49,7 +53,17 @@ impl<'a> Project<'a> {
     }
 
     pub(crate) fn with_config(mut self, config: serde_json::Value) -> Project<'a> {
-        self.config = config;
+        fn merge(dst: &mut serde_json::Value, src: serde_json::Value) {
+            match (dst, src) {
+                (Value::Object(dst), Value::Object(src)) => {
+                    for (k, v) in src {
+                        merge(dst.entry(k).or_insert(v.clone()), v)
+                    }
+                }
+                (dst, src) => *dst = src,
+            }
+        }
+        merge(&mut self.config, config);
         self
     }
 
@@ -103,7 +117,7 @@ impl<'a> Project<'a> {
                     ..Default::default()
                 }),
                 experimental: Some(json!({
-                    "statusNotification": true,
+                    "serverStatusNotification": true,
                 })),
                 ..Default::default()
             },
@@ -154,6 +168,7 @@ impl Server {
         self.send_notification(r)
     }
 
+    #[track_caller]
     pub(crate) fn request<R>(&self, params: R::Params, expected_resp: Value)
     where
         R: lsp_types::request::Request,
@@ -213,13 +228,12 @@ impl Server {
     }
     pub(crate) fn wait_until_workspace_is_loaded(self) -> Server {
         self.wait_for_message_cond(1, &|msg: &Message| match msg {
-            Message::Notification(n) if n.method == "rust-analyzer/status" => {
+            Message::Notification(n) if n.method == "experimental/serverStatus" => {
                 let status = n
                     .clone()
-                    .extract::<lsp_ext::StatusParams>("rust-analyzer/status")
-                    .unwrap()
-                    .status;
-                matches!(status, lsp_ext::Status::Ready)
+                    .extract::<lsp_ext::ServerStatusParams>("experimental/serverStatus")
+                    .unwrap();
+                status.quiescent
             }
             _ => false,
         })

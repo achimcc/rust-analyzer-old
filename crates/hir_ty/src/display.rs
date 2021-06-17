@@ -1,25 +1,33 @@
-//! FIXME: write short doc here
+//! The `HirDisplay` trait, which serves two purposes: Turning various bits from
+//! HIR back into source code, and just displaying them for debugging/testing
+//! purposes.
 
-use std::{array, fmt};
+use std::{
+    array,
+    fmt::{self, Debug},
+};
 
-use chalk_ir::Mutability;
+use chalk_ir::BoundVar;
 use hir_def::{
+    body,
     db::DefDatabase,
     find_path,
     generics::TypeParamProvenance,
     item_scope::ItemInNs,
-    path::{GenericArg, Path, PathKind},
+    path::{Path, PathKind},
     type_ref::{TypeBound, TypeRef},
     visibility::Visibility,
     AssocContainerId, Lookup, ModuleId, TraitId,
 };
-use hir_expand::name::Name;
+use hir_expand::{hygiene::Hygiene, name::Name};
 
 use crate::{
-    db::HirDatabase, from_assoc_type_id, from_foreign_def_id, from_placeholder_idx, primitive,
-    to_assoc_type_id, traits::chalk::from_chalk, utils::generics, AdtId, AliasEq, AliasTy,
-    CallableDefId, CallableSig, DomainGoal, ImplTraitId, Interner, Lifetime, OpaqueTy,
-    ProjectionTy, QuantifiedWhereClause, Scalar, Substitution, TraitRef, Ty, TyKind, WhereClause,
+    const_from_placeholder_idx, db::HirDatabase, from_assoc_type_id, from_foreign_def_id,
+    from_placeholder_idx, lt_from_placeholder_idx, mapping::from_chalk, primitive, subst_prefix,
+    to_assoc_type_id, utils::generics, AdtId, AliasEq, AliasTy, CallableDefId, CallableSig, Const,
+    ConstValue, DomainGoal, GenericArg, ImplTraitId, Interner, Lifetime, LifetimeData,
+    LifetimeOutlives, Mutability, OpaqueTy, ProjectionTy, ProjectionTyExt, QuantifiedWhereClause,
+    Scalar, TraitRef, TraitRefExt, Ty, TyExt, TyKind, WhereClause,
 };
 
 pub struct HirFormatter<'a> {
@@ -46,6 +54,10 @@ pub trait HirDisplay {
     where
         Self: Sized,
     {
+        assert!(
+            !matches!(display_target, DisplayTarget::SourceCode { .. }),
+            "HirDisplayWrapper cannot fail with DisplaySourceCodeError, use HirDisplay::hir_fmt directly instead"
+        );
         HirDisplayWrapper { db, t: self, max_size, omit_verbose_types, display_target }
     }
 
@@ -230,7 +242,7 @@ where
             Err(HirDisplayError::FmtError) => Err(fmt::Error),
             Err(HirDisplayError::DisplaySourceCodeError(_)) => {
                 // This should never happen
-                panic!("HirDisplay failed when calling Display::fmt!")
+                panic!("HirDisplay::hir_fmt failed with DisplaySourceCodeError when calling Display::fmt!")
             }
         }
     }
@@ -251,16 +263,12 @@ impl HirDisplay for ProjectionTy {
         }
 
         let trait_ = f.db.trait_data(self.trait_(f.db));
-        let first_parameter = self.substitution[0].into_displayable(
-            f.db,
-            f.max_size,
-            f.omit_verbose_types,
-            f.display_target,
-        );
-        write!(f, "<{} as {}", first_parameter, trait_.name)?;
-        if self.substitution.len() > 1 {
+        write!(f, "<")?;
+        self.self_type_parameter(&Interner).hir_fmt(f)?;
+        write!(f, " as {}", trait_.name)?;
+        if self.substitution.len(&Interner) > 1 {
             write!(f, "<")?;
-            f.write_joined(&self.substitution[1..], ", ")?;
+            f.write_joined(&self.substitution.as_slice(&Interner)[1..], ", ")?;
             write!(f, ">")?;
         }
         write!(f, ">::{}", f.db.type_alias_data(from_assoc_type_id(self.associated_ty_id)).name)?;
@@ -274,7 +282,40 @@ impl HirDisplay for OpaqueTy {
             return write!(f, "{}", TYPE_HINT_TRUNCATION);
         }
 
-        self.substitution[0].hir_fmt(f)
+        self.substitution.at(&Interner, 0).hir_fmt(f)
+    }
+}
+
+impl HirDisplay for GenericArg {
+    fn hir_fmt(&self, f: &mut HirFormatter) -> Result<(), HirDisplayError> {
+        match self.interned() {
+            crate::GenericArgData::Ty(ty) => ty.hir_fmt(f),
+            crate::GenericArgData::Lifetime(lt) => lt.hir_fmt(f),
+            crate::GenericArgData::Const(c) => c.hir_fmt(f),
+        }
+    }
+}
+
+impl HirDisplay for Const {
+    fn hir_fmt(&self, f: &mut HirFormatter) -> Result<(), HirDisplayError> {
+        let data = self.interned();
+        match data.value {
+            ConstValue::BoundVar(idx) => idx.hir_fmt(f),
+            ConstValue::InferenceVar(..) => write!(f, "_"),
+            ConstValue::Placeholder(idx) => {
+                let id = const_from_placeholder_idx(f.db, idx);
+                let generics = generics(f.db.upcast(), id.parent);
+                let param_data = &generics.params.consts[id.local_id];
+                write!(f, "{}", param_data.name)
+            }
+            ConstValue::Concrete(_) => write!(f, "_"),
+        }
+    }
+}
+
+impl HirDisplay for BoundVar {
+    fn hir_fmt(&self, f: &mut HirFormatter) -> Result<(), HirDisplayError> {
+        write!(f, "?{}.{}", self.debruijn.depth(), self.index)
     }
 }
 
@@ -284,7 +325,7 @@ impl HirDisplay for Ty {
             return write!(f, "{}", TYPE_HINT_TRUNCATION);
         }
 
-        match self.interned(&Interner) {
+        match self.kind(&Interner) {
             TyKind::Never => write!(f, "!")?,
             TyKind::Str => write!(f, "str")?,
             TyKind::Scalar(Scalar::Bool) => write!(f, "bool")?,
@@ -297,16 +338,15 @@ impl HirDisplay for Ty {
                 t.hir_fmt(f)?;
                 write!(f, "]")?;
             }
-            TyKind::Array(t) => {
+            TyKind::Array(t, c) => {
                 write!(f, "[")?;
                 t.hir_fmt(f)?;
-                write!(f, "; _]")?;
+                write!(f, "; ")?;
+                c.hir_fmt(f)?;
+                write!(f, "]")?;
             }
-            TyKind::Raw(m, t) | TyKind::Ref(m, t) => {
-                let ty_display =
-                    t.into_displayable(f.db, f.max_size, f.omit_verbose_types, f.display_target);
-
-                if matches!(self.interned(&Interner), TyKind::Raw(..)) {
+            TyKind::Raw(m, t) | TyKind::Ref(m, _, t) => {
+                if matches!(self.kind(&Interner), TyKind::Raw(..)) {
                     write!(
                         f,
                         "*{}",
@@ -328,7 +368,7 @@ impl HirDisplay for Ty {
 
                 // FIXME: all this just to decide whether to use parentheses...
                 let datas;
-                let predicates: Vec<_> = match t.interned(&Interner) {
+                let predicates: Vec<_> = match t.kind(&Interner) {
                     TyKind::Dyn(dyn_ty) if dyn_ty.bounds.skip_binders().interned().len() > 1 => {
                         dyn_ty.bounds.skip_binders().interned().iter().cloned().collect()
                     }
@@ -344,8 +384,8 @@ impl HirDisplay for Ty {
                             let data = (*datas)
                                 .as_ref()
                                 .map(|rpit| rpit.impl_traits[idx as usize].bounds.clone());
-                            let bounds = data.subst(parameters);
-                            bounds.value
+                            let bounds = data.substitute(&Interner, parameters);
+                            bounds.into_value_and_skipped_binders().0
                         } else {
                             Vec::new()
                         }
@@ -360,26 +400,26 @@ impl HirDisplay for Ty {
                     if fn_traits(f.db.upcast(), trait_).any(|it| it == trait_)
                         && predicates.len() <= 2
                     {
-                        return write!(f, "{}", ty_display);
+                        return t.hir_fmt(f);
                     }
                 }
 
                 if predicates.len() > 1 {
                     write!(f, "(")?;
-                    write!(f, "{}", ty_display)?;
+                    t.hir_fmt(f)?;
                     write!(f, ")")?;
                 } else {
-                    write!(f, "{}", ty_display)?;
+                    t.hir_fmt(f)?;
                 }
             }
             TyKind::Tuple(_, substs) => {
-                if substs.len() == 1 {
+                if substs.len(&Interner) == 1 {
                     write!(f, "(")?;
-                    substs[0].hir_fmt(f)?;
+                    substs.at(&Interner, 0).hir_fmt(f)?;
                     write!(f, ",)")?;
                 } else {
                     write!(f, "(")?;
-                    f.write_joined(&*substs.0, ", ")?;
+                    f.write_joined(&*substs.as_slice(&Interner), ", ")?;
                     write!(f, ")")?;
                 }
             }
@@ -389,7 +429,7 @@ impl HirDisplay for Ty {
             }
             TyKind::FnDef(def, parameters) => {
                 let def = from_chalk(f.db, *def);
-                let sig = f.db.callable_item_signature(def).subst(parameters);
+                let sig = f.db.callable_item_signature(def).substitute(&Interner, parameters);
                 match def {
                     CallableDefId::FunctionId(ff) => {
                         write!(f, "fn {}", f.db.function_data(ff).name)?
@@ -399,7 +439,7 @@ impl HirDisplay for Ty {
                         write!(f, "{}", f.db.enum_data(e.parent).variants[e.local_id].name)?
                     }
                 };
-                if parameters.len() > 0 {
+                if parameters.len(&Interner) > 0 {
                     let generics = generics(f.db.upcast(), def.into());
                     let (parent_params, self_param, type_params, _impl_trait_params) =
                         generics.provenance_split();
@@ -407,7 +447,7 @@ impl HirDisplay for Ty {
                     // We print all params except implicit impl Trait params. Still a bit weird; should we leave out parent and self?
                     if total_len > 0 {
                         write!(f, "<")?;
-                        f.write_joined(&parameters.0[..total_len], ", ")?;
+                        f.write_joined(&parameters.as_slice(&Interner)[..total_len], ", ")?;
                         write!(f, ">")?;
                     }
                 }
@@ -415,15 +455,9 @@ impl HirDisplay for Ty {
                 f.write_joined(sig.params(), ", ")?;
                 write!(f, ")")?;
                 let ret = sig.ret();
-                if *ret != Ty::unit() {
-                    let ret_display = ret.into_displayable(
-                        f.db,
-                        f.max_size,
-                        f.omit_verbose_types,
-                        f.display_target,
-                    );
-
-                    write!(f, " -> {}", ret_display)?;
+                if !ret.is_unit() {
+                    write!(f, " -> ")?;
+                    ret.hir_fmt(f)?;
                 }
             }
             TyKind::Adt(AdtId(def_id), parameters) => {
@@ -451,7 +485,7 @@ impl HirDisplay for Ty {
                     }
                 }
 
-                if parameters.len() > 0 {
+                if parameters.len(&Interner) > 0 {
                     let parameters_to_write = if f.display_target.is_source_code()
                         || f.omit_verbose_types()
                     {
@@ -460,30 +494,35 @@ impl HirDisplay for Ty {
                             .map(|generic_def_id| f.db.generic_defaults(generic_def_id))
                             .filter(|defaults| !defaults.is_empty())
                         {
-                            None => parameters.0.as_ref(),
+                            None => parameters.as_slice(&Interner),
                             Some(default_parameters) => {
                                 let mut default_from = 0;
-                                for (i, parameter) in parameters.iter().enumerate() {
-                                    match (parameter.interned(&Interner), default_parameters.get(i))
-                                    {
-                                        (&TyKind::Unknown, _) | (_, None) => {
+                                for (i, parameter) in parameters.iter(&Interner).enumerate() {
+                                    match (
+                                        parameter.assert_ty_ref(&Interner).kind(&Interner),
+                                        default_parameters.get(i),
+                                    ) {
+                                        (&TyKind::Error, _) | (_, None) => {
                                             default_from = i + 1;
                                         }
                                         (_, Some(default_parameter)) => {
-                                            let actual_default = default_parameter
-                                                .clone()
-                                                .subst(&parameters.prefix(i));
-                                            if parameter != &actual_default {
+                                            let actual_default =
+                                                default_parameter.clone().substitute(
+                                                    &Interner,
+                                                    &subst_prefix(parameters, i),
+                                                );
+                                            if parameter.assert_ty_ref(&Interner) != &actual_default
+                                            {
                                                 default_from = i + 1;
                                             }
                                         }
                                     }
                                 }
-                                &parameters.0[0..default_from]
+                                &parameters.as_slice(&Interner)[0..default_from]
                             }
                         }
                     } else {
-                        parameters.0.as_ref()
+                        parameters.as_slice(&Interner)
                     };
                     if !parameters_to_write.is_empty() {
                         write!(f, "<")?;
@@ -504,9 +543,9 @@ impl HirDisplay for Ty {
                 // Use placeholder associated types when the target is test (https://rust-lang.github.io/chalk/book/clauses/type_equality.html#placeholder-associated-types)
                 if f.display_target.is_test() {
                     write!(f, "{}::{}", trait_.name, type_alias_data.name)?;
-                    if parameters.len() > 0 {
+                    if parameters.len(&Interner) > 0 {
                         write!(f, "<")?;
-                        f.write_joined(&*parameters.0, ", ")?;
+                        f.write_joined(&*parameters.as_slice(&Interner), ", ")?;
                         write!(f, ">")?;
                     }
                 } else {
@@ -518,7 +557,7 @@ impl HirDisplay for Ty {
                     projection_ty.hir_fmt(f)?;
                 }
             }
-            TyKind::ForeignType(type_alias) => {
+            TyKind::Foreign(type_alias) => {
                 let type_alias = f.db.type_alias_data(from_foreign_def_id(*type_alias));
                 write!(f, "{}", type_alias.name)?;
             }
@@ -531,13 +570,13 @@ impl HirDisplay for Ty {
                         let data = (*datas)
                             .as_ref()
                             .map(|rpit| rpit.impl_traits[idx as usize].bounds.clone());
-                        let bounds = data.subst(&parameters);
-                        write_bounds_like_dyn_trait_with_prefix("impl", &bounds.value, f)?;
+                        let bounds = data.substitute(&Interner, &parameters);
+                        write_bounds_like_dyn_trait_with_prefix("impl", bounds.skip_binders(), f)?;
                         // FIXME: it would maybe be good to distinguish this from the alias type (when debug printing), and to show the substitution
                     }
                     ImplTraitId::AsyncBlockTypeImplTrait(..) => {
                         write!(f, "impl Future<Output = ")?;
-                        parameters[0].hir_fmt(f)?;
+                        parameters.at(&Interner, 0).hir_fmt(f)?;
                         write!(f, ">")?;
                     }
                 }
@@ -548,7 +587,7 @@ impl HirDisplay for Ty {
                         DisplaySourceCodeError::Closure,
                     ));
                 }
-                let sig = substs[0].callable_sig(f.db);
+                let sig = substs.at(&Interner, 0).assert_ty_ref(&Interner).callable_sig(f.db);
                 if let Some(sig) = sig {
                     if sig.params().is_empty() {
                         write!(f, "||")?;
@@ -560,13 +599,8 @@ impl HirDisplay for Ty {
                         write!(f, "|")?;
                     };
 
-                    let ret_display = sig.ret().into_displayable(
-                        f.db,
-                        f.max_size,
-                        f.omit_verbose_types,
-                        f.display_target,
-                    );
-                    write!(f, " -> {}", ret_display)?;
+                    write!(f, " -> ")?;
+                    sig.ret().hir_fmt(f)?;
                 } else {
                     write!(f, "{{closure}}")?;
                 }
@@ -580,26 +614,27 @@ impl HirDisplay for Ty {
                         write!(f, "{}", param_data.name.clone().unwrap_or_else(Name::missing))?
                     }
                     TypeParamProvenance::ArgumentImplTrait => {
-                        let substs = Substitution::type_params_for_generics(f.db, &generics);
-                        let bounds = f
-                            .db
-                            .generic_predicates(id.parent)
-                            .into_iter()
-                            .map(|pred| pred.clone().subst(&substs))
-                            .filter(|wc| match &wc.skip_binders() {
-                                WhereClause::Implemented(tr) => tr.self_type_parameter() == self,
-                                WhereClause::AliasEq(AliasEq {
-                                    alias: AliasTy::Projection(proj),
-                                    ty: _,
-                                }) => proj.self_type_parameter() == self,
-                                _ => false,
-                            })
-                            .collect::<Vec<_>>();
+                        let substs = generics.type_params_subst(f.db);
+                        let bounds =
+                            f.db.generic_predicates(id.parent)
+                                .into_iter()
+                                .map(|pred| pred.clone().substitute(&Interner, &substs))
+                                .filter(|wc| match &wc.skip_binders() {
+                                    WhereClause::Implemented(tr) => {
+                                        &tr.self_type_parameter(&Interner) == self
+                                    }
+                                    WhereClause::AliasEq(AliasEq {
+                                        alias: AliasTy::Projection(proj),
+                                        ty: _,
+                                    }) => &proj.self_type_parameter(&Interner) == self,
+                                    _ => false,
+                                })
+                                .collect::<Vec<_>>();
                         write_bounds_like_dyn_trait_with_prefix("impl", &bounds, f)?;
                     }
                 }
             }
-            TyKind::BoundVar(idx) => write!(f, "?{}.{}", idx.debruijn.depth(), idx.index)?,
+            TyKind::BoundVar(idx) => idx.hir_fmt(f)?,
             TyKind::Dyn(dyn_ty) => {
                 write_bounds_like_dyn_trait_with_prefix(
                     "dyn",
@@ -617,15 +652,15 @@ impl HirDisplay for Ty {
                         let data = (*datas)
                             .as_ref()
                             .map(|rpit| rpit.impl_traits[idx as usize].bounds.clone());
-                        let bounds = data.subst(&opaque_ty.substitution);
-                        write_bounds_like_dyn_trait_with_prefix("impl", &bounds.value, f)?;
+                        let bounds = data.substitute(&Interner, &opaque_ty.substitution);
+                        write_bounds_like_dyn_trait_with_prefix("impl", bounds.skip_binders(), f)?;
                     }
                     ImplTraitId::AsyncBlockTypeImplTrait(..) => {
                         write!(f, "{{async block}}")?;
                     }
                 };
             }
-            TyKind::Unknown => {
+            TyKind::Error => {
                 if f.display_target.is_source_code() {
                     return Err(HirDisplayError::DisplaySourceCodeError(
                         DisplaySourceCodeError::UnknownType,
@@ -634,6 +669,8 @@ impl HirDisplay for Ty {
                 write!(f, "{{unknown}}")?;
             }
             TyKind::InferenceVar(..) => write!(f, "_")?,
+            TyKind::Generator(..) => write!(f, "{{generator}}")?,
+            TyKind::GeneratorWitness(..) => write!(f, "{{generator witness}}")?,
         }
         Ok(())
     }
@@ -652,10 +689,9 @@ impl HirDisplay for CallableSig {
         }
         write!(f, ")")?;
         let ret = self.ret();
-        if *ret != Ty::unit() {
-            let ret_display =
-                ret.into_displayable(f.db, f.max_size, f.omit_verbose_types, f.display_target);
-            write!(f, " -> {}", ret_display)?;
+        if !ret.is_unit() {
+            write!(f, " -> ")?;
+            ret.hir_fmt(f)?;
         }
         Ok(())
     }
@@ -712,15 +748,17 @@ fn write_bounds_like_dyn_trait(
                 if !first {
                     write!(f, " + ")?;
                 }
-                // We assume that the self type is $0 (i.e. the
+                // We assume that the self type is ^0.0 (i.e. the
                 // existential) here, which is the only thing that's
                 // possible in actual Rust, and hence don't print it
                 write!(f, "{}", f.db.trait_data(trait_).name)?;
-                if let [_, params @ ..] = &*trait_ref.substitution.0 {
+                if let [_, params @ ..] = &*trait_ref.substitution.as_slice(&Interner) {
                     if is_fn_trait {
-                        if let Some(args) = params.first().and_then(|it| it.as_tuple()) {
+                        if let Some(args) =
+                            params.first().and_then(|it| it.assert_ty_ref(&Interner).as_tuple())
+                        {
                             write!(f, "(")?;
-                            f.write_joined(&*args.0, ", ")?;
+                            f.write_joined(args.as_slice(&Interner), ", ")?;
                             write!(f, ")")?;
                         }
                     } else if !params.is_empty() {
@@ -752,6 +790,10 @@ fn write_bounds_like_dyn_trait(
                 }
                 ty.hir_fmt(f)?;
             }
+
+            // FIXME implement these
+            WhereClause::LifetimeOutlives(_) => {}
+            WhereClause::TypeOutlives(_) => {}
         }
         first = false;
     }
@@ -761,31 +803,29 @@ fn write_bounds_like_dyn_trait(
     Ok(())
 }
 
-impl TraitRef {
-    fn hir_fmt_ext(&self, f: &mut HirFormatter, use_as: bool) -> Result<(), HirDisplayError> {
-        if f.should_truncate() {
-            return write!(f, "{}", TYPE_HINT_TRUNCATION);
-        }
-
-        self.substitution[0].hir_fmt(f)?;
-        if use_as {
-            write!(f, " as ")?;
-        } else {
-            write!(f, ": ")?;
-        }
-        write!(f, "{}", f.db.trait_data(self.hir_trait_id()).name)?;
-        if self.substitution.len() > 1 {
-            write!(f, "<")?;
-            f.write_joined(&self.substitution[1..], ", ")?;
-            write!(f, ">")?;
-        }
-        Ok(())
+fn fmt_trait_ref(tr: &TraitRef, f: &mut HirFormatter, use_as: bool) -> Result<(), HirDisplayError> {
+    if f.should_truncate() {
+        return write!(f, "{}", TYPE_HINT_TRUNCATION);
     }
+
+    tr.self_type_parameter(&Interner).hir_fmt(f)?;
+    if use_as {
+        write!(f, " as ")?;
+    } else {
+        write!(f, ": ")?;
+    }
+    write!(f, "{}", f.db.trait_data(tr.hir_trait_id()).name)?;
+    if tr.substitution.len(&Interner) > 1 {
+        write!(f, "<")?;
+        f.write_joined(&tr.substitution.as_slice(&Interner)[1..], ", ")?;
+        write!(f, ">")?;
+    }
+    Ok(())
 }
 
 impl HirDisplay for TraitRef {
     fn hir_fmt(&self, f: &mut HirFormatter) -> Result<(), HirDisplayError> {
-        self.hir_fmt_ext(f, false)
+        fmt_trait_ref(self, f, false)
     }
 }
 
@@ -799,7 +839,7 @@ impl HirDisplay for WhereClause {
             WhereClause::Implemented(trait_ref) => trait_ref.hir_fmt(f)?,
             WhereClause::AliasEq(AliasEq { alias: AliasTy::Projection(projection_ty), ty }) => {
                 write!(f, "<")?;
-                projection_ty.trait_ref(f.db).hir_fmt_ext(f, true)?;
+                fmt_trait_ref(&projection_ty.trait_ref(f.db), f, true)?;
                 write!(
                     f,
                     ">::{} = ",
@@ -808,20 +848,44 @@ impl HirDisplay for WhereClause {
                 ty.hir_fmt(f)?;
             }
             WhereClause::AliasEq(_) => write!(f, "{{error}}")?,
+
+            // FIXME implement these
+            WhereClause::TypeOutlives(..) => {}
+            WhereClause::LifetimeOutlives(..) => {}
         }
         Ok(())
     }
 }
 
+impl HirDisplay for LifetimeOutlives {
+    fn hir_fmt(&self, f: &mut HirFormatter) -> Result<(), HirDisplayError> {
+        self.a.hir_fmt(f)?;
+        write!(f, ": ")?;
+        self.b.hir_fmt(f)
+    }
+}
+
 impl HirDisplay for Lifetime {
     fn hir_fmt(&self, f: &mut HirFormatter) -> Result<(), HirDisplayError> {
+        self.interned().hir_fmt(f)
+    }
+}
+
+impl HirDisplay for LifetimeData {
+    fn hir_fmt(&self, f: &mut HirFormatter) -> Result<(), HirDisplayError> {
         match self {
-            Lifetime::Parameter(id) => {
+            LifetimeData::BoundVar(idx) => idx.hir_fmt(f),
+            LifetimeData::InferenceVar(_) => write!(f, "_"),
+            LifetimeData::Placeholder(idx) => {
+                let id = lt_from_placeholder_idx(f.db, *idx);
                 let generics = generics(f.db.upcast(), id.parent);
                 let param_data = &generics.params.lifetimes[id.local_id];
-                write!(f, "{}", &param_data.name)
+                write!(f, "{}", param_data.name)
             }
-            Lifetime::Static => write!(f, "'static"),
+            LifetimeData::Static => write!(f, "'static"),
+            LifetimeData::Empty(_) => Ok(()),
+            LifetimeData::Erased => Ok(()),
+            LifetimeData::Phantom(_, _) => Ok(()),
         }
     }
 }
@@ -832,9 +896,11 @@ impl HirDisplay for DomainGoal {
             DomainGoal::Holds(wc) => {
                 write!(f, "Holds(")?;
                 wc.hir_fmt(f)?;
-                write!(f, ")")
+                write!(f, ")")?;
             }
+            _ => write!(f, "?")?,
         }
+        Ok(())
     }
 }
 
@@ -932,6 +998,18 @@ impl HirDisplay for TypeRef {
                 write!(f, "dyn ")?;
                 f.write_joined(bounds, " + ")?;
             }
+            TypeRef::Macro(macro_call) => {
+                let macro_call = macro_call.to_node(f.db.upcast());
+                let ctx = body::LowerCtx::with_hygiene(&Hygiene::new_unhygienic());
+                match macro_call.path() {
+                    Some(path) => match Path::from_src(path, &ctx) {
+                        Some(path) => path.hir_fmt(f)?,
+                        None => write!(f, "{{macro}}")?,
+                    },
+                    None => write!(f, "{{macro}}")?,
+                }
+                write!(f, "!(..)")?;
+            }
             TypeRef::Error => write!(f, "{{error}}")?,
         }
         Ok(())
@@ -1016,11 +1094,11 @@ impl HirDisplay for Path {
     }
 }
 
-impl HirDisplay for GenericArg {
+impl HirDisplay for hir_def::path::GenericArg {
     fn hir_fmt(&self, f: &mut HirFormatter) -> Result<(), HirDisplayError> {
         match self {
-            GenericArg::Type(ty) => ty.hir_fmt(f),
-            GenericArg::Lifetime(lifetime) => write!(f, "{}", lifetime.name),
+            hir_def::path::GenericArg::Type(ty) => ty.hir_fmt(f),
+            hir_def::path::GenericArg::Lifetime(lifetime) => write!(f, "{}", lifetime.name),
         }
     }
 }

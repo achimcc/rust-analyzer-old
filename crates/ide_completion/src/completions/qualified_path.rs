@@ -24,7 +24,7 @@ pub(crate) fn complete_qualified_path(acc: &mut Completions, ctx: &CompletionCon
     };
 
     // Add associated types on type parameters and `Self`.
-    resolution.assoc_type_shorthand_candidates(ctx.db, |alias| {
+    resolution.assoc_type_shorthand_candidates(ctx.db, |_, alias| {
         acc.add_type_alias(ctx, alias);
         None::<()>
     });
@@ -117,7 +117,7 @@ pub(crate) fn complete_qualified_path(acc: &mut Completions, ctx: &CompletionCon
             if let Some(krate) = ctx.krate {
                 let ty = match resolution {
                     PathResolution::TypeParam(param) => param.ty(ctx.db),
-                    PathResolution::SelfType(impl_def) => impl_def.target_ty(ctx.db),
+                    PathResolution::SelfType(impl_def) => impl_def.self_ty(ctx.db),
                     _ => return,
                 };
 

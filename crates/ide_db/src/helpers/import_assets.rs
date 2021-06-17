@@ -361,7 +361,7 @@ fn item_for_path_search(db: &RootDatabase, item: ItemInNs) -> Option<ItemInNs> {
             Some(assoc_item) => match assoc_item.container(db) {
                 AssocItemContainer::Trait(trait_) => ItemInNs::from(ModuleDef::from(trait_)),
                 AssocItemContainer::Impl(impl_) => {
-                    ItemInNs::from(ModuleDef::from(impl_.target_ty(db).as_adt()?))
+                    ItemInNs::from(ModuleDef::from(impl_.self_ty(db).as_adt()?))
                 }
             },
             None => item,
@@ -436,6 +436,8 @@ fn trait_applicable_items(
     })
     .collect();
 
+    let related_dyn_traits =
+        trait_candidate.receiver_ty.applicable_inherent_traits(db).collect::<FxHashSet<_>>();
     let mut located_imports = FxHashSet::default();
 
     if trait_assoc_item {
@@ -451,12 +453,16 @@ fn trait_applicable_items(
                             return None;
                         }
                     }
+                    let located_trait = assoc.containing_trait(db)?;
+                    if related_dyn_traits.contains(&located_trait) {
+                        return None;
+                    }
 
-                    let item = ItemInNs::from(ModuleDef::from(assoc.containing_trait(db)?));
+                    let trait_item = ItemInNs::from(ModuleDef::from(located_trait));
                     let original_item = assoc_to_item(assoc);
                     located_imports.insert(LocatedImport::new(
-                        mod_path(item)?,
-                        item,
+                        mod_path(trait_item)?,
+                        trait_item,
                         original_item,
                         mod_path(original_item),
                     ));
@@ -473,11 +479,15 @@ fn trait_applicable_items(
             |_, function| {
                 let assoc = function.as_assoc_item(db)?;
                 if required_assoc_items.contains(&assoc) {
-                    let item = ItemInNs::from(ModuleDef::from(assoc.containing_trait(db)?));
+                    let located_trait = assoc.containing_trait(db)?;
+                    if related_dyn_traits.contains(&located_trait) {
+                        return None;
+                    }
+                    let trait_item = ItemInNs::from(ModuleDef::from(located_trait));
                     let original_item = assoc_to_item(assoc);
                     located_imports.insert(LocatedImport::new(
-                        mod_path(item)?,
-                        item,
+                        mod_path(trait_item)?,
+                        trait_item,
                         original_item,
                         mod_path(original_item),
                     ));

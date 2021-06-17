@@ -53,11 +53,11 @@ https://www.tedinski.com/2018/02/06/system-boundaries.html
 ## Crates.io Dependencies
 
 We try to be very conservative with usage of crates.io dependencies.
-Don't use small "helper" crates (exception: `itertools` is allowed).
+Don't use small "helper" crates (exception: `itertools` and `either` are allowed).
 If there's some general reusable bit of code you need, consider adding it to the `stdx` crate.
+A useful exercise is to read Cargo.lock and see if some *transitive* dependencies do not make sense for rust-analyzer.
 
-**Rationale:** keep compile times low, create ecosystem pressure for faster
-compiles, reduce the number of things which might break.
+**Rationale:** keep compile times low, create ecosystem pressure for faster compiles, reduce the number of things which might break.
 
 ## Commit Style
 
@@ -83,8 +83,19 @@ This makes it easier to prepare a changelog.
 
 If the change adds a new user-visible functionality, consider recording a GIF with [peek](https://github.com/phw/peek) and pasting it into the PR description.
 
+To make writing the release notes easier, you can mark a pull request as a feature, fix, internal change, or minor.
+Minor changes are excluded from the release notes, while the other types are distributed in their corresponding sections.
+There are two ways to mark this:
+
+* use a `feat: `, `feature: `, `fix: `, `internal: ` or `minor: ` prefix in the PR title
+* write `changelog [feature|fix|internal|skip] [description]` in a comment or in the PR description; the description is optional, and will replace the title if included.
+
+These comments don't have to be added by the PR author.
+Editing a comment or the PR description or title is also fine, as long as it happens before the release.
+
 **Rationale:** clean history is potentially useful, but rarely used.
 But many users read changelogs.
+Including a description and GIF suitable for the changelog means less work for the maintainers on the release day.
 
 ## Clippy
 
@@ -152,6 +163,16 @@ Do not reuse marks between several tests.
 
 **Rationale:** marks provide an easy way to find the canonical test for each bit of code.
 This makes it much easier to understand.
+More than one mark per test / code branch doesn't add significantly to understanding.
+
+## `#[should_panic]`
+
+Do not use `#[should_panic]` tests.
+Instead, explicitly check for `None`, `Err`, etc.
+
+**Rationale:** `#[should_panic]` is a tool for library authors, to makes sure that API does not fail silently, when misused.
+`rust-analyzer` is not a library, we don't need to test for API misuse, and we have to handle any user input without panics.
+Panic messages in the logs from the `#[should_panic]` tests are confusing.
 
 ## Function Preconditions
 
@@ -330,7 +351,7 @@ When implementing `do_thing`, it might be very useful to create a context object
 
 ```rust
 pub fn do_thing(arg1: Arg1, arg2: Arg2) -> Res {
-    let mut ctx = Ctx { arg1, arg2 }
+    let mut ctx = Ctx { arg1, arg2 };
     ctx.run()
 }
 
@@ -586,7 +607,7 @@ use super::{}
 
 **Rationale:** consistency.
 Reading order is important for new contributors.
-Grouping by crate allows to spot unwanted dependencies easier.
+Grouping by crate allows spotting unwanted dependencies easier.
 
 ## Import Style
 
@@ -779,7 +800,7 @@ assert!(x < y);
 assert!(x > 0);
 
 // BAD
-assert!(x >= lo && x <= hi>);
+assert!(x >= lo && x <= hi);
 assert!(r1 < l2 || l1 > r2);
 assert!(y > x);
 assert!(0 > x);
@@ -806,8 +827,66 @@ if let Some(expected_type) = ctx.expected_type.as_ref() {
 }
 ```
 
-**Rational:** `match` is almost always more compact.
+**Rationale:** `match` is almost always more compact.
 The `else` branch can get a more precise pattern: `None` or `Err(_)` instead of `_`.
+
+## Helper Functions
+
+Avoid creating singe-use helper functions:
+
+```rust
+// GOOD
+let buf = {
+    let mut buf = get_empty_buf(&mut arena);
+    buf.add_item(item);
+    buf
+};
+
+// BAD
+
+let buf = prepare_buf(&mut arena, item);
+
+...
+
+fn prepare_buf(arena: &mut Arena, item: Item) -> ItemBuf {
+    let mut res = get_empty_buf(&mut arena);
+    res.add_item(item);
+    res
+}
+```
+
+Exception: if you want to make use of `return` or `?`.
+
+**Rationale:** single-use functions change frequently, adding or removing parameters adds churn.
+A block serves just as well to delineate a bit of logic, but has access to all the context.
+Re-using originally single-purpose function often leads to bad coupling.
+
+## Helper Variables
+
+Introduce helper variables freely, especially for multiline conditions:
+
+```rust
+// GOOD
+let rustfmt_not_installed =
+    captured_stderr.contains("not installed") || captured_stderr.contains("not available");
+
+match output.status.code() {
+    Some(1) if !rustfmt_not_installed => Ok(None),
+    _ => Err(format_err!("rustfmt failed:\n{}", captured_stderr)),
+};
+
+// BAD
+match output.status.code() {
+    Some(1)
+        if !captured_stderr.contains("not installed")
+           && !captured_stderr.contains("not available") => Ok(None),
+    _ => Err(format_err!("rustfmt failed:\n{}", captured_stderr)),
+};
+```
+
+**Rationale:** like blocks, single-use variables are a cognitively cheap abstraction, as they have access to all the context.
+Extra variables help during debugging, they make it easy to print/view important intermediate results.
+Giving a name to a condition in `if` expression often improves clarity and leads to a nicer formatted code.
 
 ## Token names
 

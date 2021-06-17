@@ -7,6 +7,11 @@ fn check_diagnostics(ra_fixture: &str) {
     db.check_diagnostics();
 }
 
+fn check_no_diagnostics(ra_fixture: &str) {
+    let db: TestDB = TestDB::with_files(ra_fixture);
+    db.check_no_diagnostics();
+}
+
 #[test]
 fn unresolved_import() {
     check_diagnostics(
@@ -165,7 +170,7 @@ fn unresolved_legacy_scope_macro() {
 
           m!();
           m2!();
-        //^^^^^^ unresolved macro call
+        //^^^^^^ unresolved macro `self::m2!`
         "#,
     );
 }
@@ -182,7 +187,7 @@ fn unresolved_module_scope_macro() {
 
           self::m!();
           self::m2!();
-        //^^^^^^^^^^^^ unresolved macro call
+        //^^^^^^^^^^^^ unresolved macro `self::m2!`
         "#,
     );
 }
@@ -202,6 +207,21 @@ fn builtin_macro_fails_expansion() {
 }
 
 #[test]
+fn include_macro_should_allow_empty_content() {
+    check_no_diagnostics(
+        r#"
+        //- /lib.rs
+          #[rustc_builtin_macro]
+          macro_rules! include { () => {} }
+
+          include!("bar.rs");
+        //- /bar.rs
+          // empty
+        "#,
+    );
+}
+
+#[test]
 fn good_out_dir_diagnostic() {
     check_diagnostics(
         r#"
@@ -213,7 +233,7 @@ fn good_out_dir_diagnostic() {
         macro_rules! concat { () => {} }
 
         include!(concat!(env!("OUT_DIR"), "/out.rs"));
-      //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `OUT_DIR` not set, enable "load out dirs from check" to fix
+      //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `OUT_DIR` not set, enable "run build scripts" to fix
         "#,
     );
 }

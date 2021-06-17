@@ -2,9 +2,10 @@
 use std::sync::Arc;
 
 use base_db::{salsa, CrateId, SourceDatabase, Upcast};
+use either::Either;
 use hir_expand::{db::AstDatabase, HirFileId};
 use la_arena::ArenaMap;
-use syntax::SmolStr;
+use syntax::{ast, AstPtr, SmolStr};
 
 use crate::{
     adt::{EnumData, StructData},
@@ -13,6 +14,7 @@ use crate::{
     data::{ConstData, FunctionData, ImplData, StaticData, TraitData, TypeAliasData},
     generics::GenericParams,
     import_map::ImportMap,
+    intern::Interned,
     item_tree::ItemTree,
     lang_item::{LangItemTarget, LangItems},
     nameres::DefMap,
@@ -113,13 +115,25 @@ pub trait DefDatabase: InternDatabase + AstDatabase + Upcast<dyn AstDatabase> {
     fn expr_scopes(&self, def: DefWithBodyId) -> Arc<ExprScopes>;
 
     #[salsa::invoke(GenericParams::generic_params_query)]
-    fn generic_params(&self, def: GenericDefId) -> Arc<GenericParams>;
+    fn generic_params(&self, def: GenericDefId) -> Interned<GenericParams>;
 
     #[salsa::invoke(Attrs::variants_attrs_query)]
     fn variants_attrs(&self, def: EnumId) -> Arc<ArenaMap<LocalEnumVariantId, Attrs>>;
 
     #[salsa::invoke(Attrs::fields_attrs_query)]
     fn fields_attrs(&self, def: VariantId) -> Arc<ArenaMap<LocalFieldId, Attrs>>;
+
+    #[salsa::invoke(crate::attr::variants_attrs_source_map)]
+    fn variants_attrs_source_map(
+        &self,
+        def: EnumId,
+    ) -> Arc<ArenaMap<LocalEnumVariantId, AstPtr<ast::Variant>>>;
+
+    #[salsa::invoke(crate::attr::fields_attrs_source_map)]
+    fn fields_attrs_source_map(
+        &self,
+        def: VariantId,
+    ) -> Arc<ArenaMap<LocalFieldId, Either<AstPtr<ast::TupleField>, AstPtr<ast::RecordField>>>>;
 
     #[salsa::invoke(AttrsWithOwner::attrs_query)]
     fn attrs(&self, def: AttrDefId) -> AttrsWithOwner;

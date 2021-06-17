@@ -75,7 +75,8 @@ pub(crate) fn extract_function(acc: &mut Assists, ctx: &AssistContext) -> Option
     let insert_after = scope_for_fn_insertion(&body, anchor)?;
     let module = ctx.sema.scope(&insert_after).module()?;
 
-    let vars_defined_in_body_and_outlive = vars_defined_in_body_and_outlive(ctx, &body);
+    let vars_defined_in_body_and_outlive =
+        vars_defined_in_body_and_outlive(ctx, &body, &node.parent().as_ref().unwrap_or(&node));
     let ret_ty = body_return_ty(ctx, &body)?;
 
     // FIXME: we compute variables that outlive here just to check `never!` condition
@@ -257,7 +258,7 @@ struct Function {
     control_flow: ControlFlow,
     ret_ty: RetType,
     body: FunctionBody,
-    vars_defined_in_body_and_outlive: Vec<Local>,
+    vars_defined_in_body_and_outlive: Vec<OutlivedLocal>,
 }
 
 #[derive(Debug)]
@@ -296,9 +297,9 @@ impl Function {
             RetType::Expr(ty) => FunType::Single(ty.clone()),
             RetType::Stmt => match self.vars_defined_in_body_and_outlive.as_slice() {
                 [] => FunType::Unit,
-                [var] => FunType::Single(var.ty(ctx.db())),
+                [var] => FunType::Single(var.local.ty(ctx.db())),
                 vars => {
-                    let types = vars.iter().map(|v| v.ty(ctx.db())).collect();
+                    let types = vars.iter().map(|v| v.local.ty(ctx.db())).collect();
                     FunType::Tuple(types)
                 }
             },
@@ -562,6 +563,12 @@ impl HasTokenAtOffset for FunctionBody {
     }
 }
 
+#[derive(Debug)]
+struct OutlivedLocal {
+    local: Local,
+    mut_usage_outside_body: bool,
+}
+
 /// Try to guess what user wants to extract
 ///
 /// We have basically have two cases:
@@ -592,7 +599,12 @@ fn extraction_target(node: &SyntaxNode, selection_range: TextRange) -> Option<Fu
     // we have selected a few statements in a block
     // so covering_element returns the whole block
     if node.kind() == BLOCK_EXPR {
-        let body = FunctionBody::from_range(node.clone(), selection_range);
+        // Extract the full statements.
+        let statements_range = node
+            .children()
+            .filter(|c| selection_range.intersect(c.text_range()).is_some())
+            .fold(selection_range, |acc, c| acc.cover(c.text_range()));
+        let body = FunctionBody::from_range(node.clone(), statements_range);
         if body.is_some() {
             return body;
         }
@@ -603,7 +615,8 @@ fn extraction_target(node: &SyntaxNode, selection_range: TextRange) -> Option<Fu
     // so we try to expand covering_element to parent and repeat the previous
     if let Some(parent) = node.parent() {
         if parent.kind() == BLOCK_EXPR {
-            let body = FunctionBody::from_range(parent, selection_range);
+            // Extract the full statement.
+            let body = FunctionBody::from_range(parent, node.text_range());
             if body.is_some() {
                 return body;
             }
@@ -707,10 +720,10 @@ fn has_exclusive_usages(ctx: &AssistContext, usages: &LocalUsages, body: &Functi
         .any(|reference| reference_is_exclusive(reference, body, ctx))
 }
 
-/// checks if this reference requires `&mut` access inside body
+/// checks if this reference requires `&mut` access inside node
 fn reference_is_exclusive(
     reference: &FileReference,
-    body: &FunctionBody,
+    node: &dyn HasTokenAtOffset,
     ctx: &AssistContext,
 ) -> bool {
     // we directly modify variable with set: `n = 0`, `n += 1`
@@ -719,7 +732,7 @@ fn reference_is_exclusive(
     }
 
     // we take `&mut` reference to variable: `&mut v`
-    let path = match path_element_of_reference(body, reference) {
+    let path = match path_element_of_reference(node, reference) {
         Some(path) => path,
         None => return false,
     };
@@ -729,6 +742,14 @@ fn reference_is_exclusive(
 
 /// checks if this expr requires `&mut` access, recurses on field access
 fn expr_require_exclusive_access(ctx: &AssistContext, expr: &ast::Expr) -> Option<bool> {
+    match expr {
+        ast::Expr::MacroCall(_) => {
+            // FIXME: expand macro and check output for mutable usages of the variable?
+            return None;
+        }
+        _ => (),
+    }
+
     let parent = expr.syntax().parent()?;
 
     if let Some(bin_expr) = ast::BinExpr::cast(parent.clone()) {
@@ -787,7 +808,7 @@ impl HasTokenAtOffset for SyntaxNode {
     }
 }
 
-/// find relevant `ast::PathExpr` for reference
+/// find relevant `ast::Expr` for reference
 ///
 /// # Preconditions
 ///
@@ -804,7 +825,11 @@ fn path_element_of_reference(
         stdx::never!(false, "cannot find path parent of variable usage: {:?}", token);
         None
     })?;
-    stdx::always!(matches!(path, ast::Expr::PathExpr(_)));
+    stdx::always!(
+        matches!(path, ast::Expr::PathExpr(_) | ast::Expr::MacroCall(_)),
+        "unexpected expression type for variable usage: {:?}",
+        path
+    );
     Some(path)
 }
 
@@ -820,10 +845,16 @@ fn vars_defined_in_body(body: &FunctionBody, ctx: &AssistContext) -> Vec<Local> 
 }
 
 /// list local variables defined inside `body` that should be returned from extracted function
-fn vars_defined_in_body_and_outlive(ctx: &AssistContext, body: &FunctionBody) -> Vec<Local> {
-    let mut vars_defined_in_body = vars_defined_in_body(&body, ctx);
-    vars_defined_in_body.retain(|var| var_outlives_body(ctx, body, var));
+fn vars_defined_in_body_and_outlive(
+    ctx: &AssistContext,
+    body: &FunctionBody,
+    parent: &SyntaxNode,
+) -> Vec<OutlivedLocal> {
+    let vars_defined_in_body = vars_defined_in_body(&body, ctx);
     vars_defined_in_body
+        .into_iter()
+        .filter_map(|var| var_outlives_body(ctx, body, var, parent))
+        .collect()
 }
 
 /// checks if the relevant local was defined before(outside of) body
@@ -843,11 +874,23 @@ fn either_syntax(value: &Either<ast::IdentPat, ast::SelfParam>) -> &SyntaxNode {
     }
 }
 
-/// checks if local variable is used after(outside of) body
-fn var_outlives_body(ctx: &AssistContext, body: &FunctionBody, var: &Local) -> bool {
-    let usages = LocalUsages::find(ctx, *var);
+/// returns usage details if local variable is used after(outside of) body
+fn var_outlives_body(
+    ctx: &AssistContext,
+    body: &FunctionBody,
+    var: Local,
+    parent: &SyntaxNode,
+) -> Option<OutlivedLocal> {
+    let usages = LocalUsages::find(ctx, var);
     let has_usages = usages.iter().any(|reference| body.preceedes_range(reference.range));
-    has_usages
+    if !has_usages {
+        return None;
+    }
+    let has_mut_usages = usages
+        .iter()
+        .filter(|reference| body.preceedes_range(reference.range))
+        .any(|reference| reference_is_exclusive(reference, parent, ctx));
+    Some(OutlivedLocal { local: var, mut_usage_outside_body: has_mut_usages })
 }
 
 fn body_return_ty(ctx: &AssistContext, body: &FunctionBody) -> Option<RetType> {
@@ -927,14 +970,23 @@ fn format_replacement(ctx: &AssistContext, fun: &Function, indent: IndentLevel) 
     let mut buf = String::new();
     match fun.vars_defined_in_body_and_outlive.as_slice() {
         [] => {}
-        [var] => format_to!(buf, "let {} = ", var.name(ctx.db()).unwrap()),
+        [var] => {
+            format_to!(buf, "let {}{} = ", mut_modifier(var), var.local.name(ctx.db()).unwrap())
+        }
         [v0, vs @ ..] => {
             buf.push_str("let (");
-            format_to!(buf, "{}", v0.name(ctx.db()).unwrap());
+            format_to!(buf, "{}{}", mut_modifier(v0), v0.local.name(ctx.db()).unwrap());
             for var in vs {
-                format_to!(buf, ", {}", var.name(ctx.db()).unwrap());
+                format_to!(buf, ", {}{}", mut_modifier(var), var.local.name(ctx.db()).unwrap());
             }
             buf.push_str(") = ");
+        }
+    }
+    fn mut_modifier(var: &OutlivedLocal) -> &'static str {
+        if var.mut_usage_outside_body {
+            "mut "
+        } else {
+            ""
         }
     }
     format_to!(buf, "{}", expr);
@@ -1131,7 +1183,7 @@ fn make_ret_ty(ctx: &AssistContext, module: hir::Module, fun: &Function) -> Opti
         }
         FlowHandler::Try { kind: TryKind::Result { ty: parent_ret_ty } } => {
             let handler_ty = parent_ret_ty
-                .type_parameters()
+                .type_arguments()
                 .nth(1)
                 .map(|ty| make_ty(&ty, ctx, module))
                 .unwrap_or_else(make::ty_unit);
@@ -1175,9 +1227,19 @@ fn make_body(
         FunctionBody::Expr(expr) => {
             let expr = rewrite_body_segment(ctx, &fun.params, &handler, expr.syntax());
             let expr = ast::Expr::cast(expr).unwrap();
-            let expr = expr.dedent(old_indent).indent(IndentLevel(1));
+            match expr {
+                ast::Expr::BlockExpr(block) => {
+                    // If the extracted expression is itself a block, there is no need to wrap it inside another block.
+                    let block = block.dedent(old_indent);
+                    // Recreate the block for formatting consistency with other extracted functions.
+                    make::block_expr(block.statements(), block.tail_expr())
+                }
+                _ => {
+                    let expr = expr.dedent(old_indent).indent(IndentLevel(1));
 
-            make::block_expr(Vec::new(), Some(expr))
+                    make::block_expr(Vec::new(), Some(expr))
+                }
+            }
         }
         FunctionBody::Span { parent, text_range } => {
             let mut elements: Vec<_> = parent
@@ -1199,10 +1261,10 @@ fn make_body(
                 match fun.vars_defined_in_body_and_outlive.as_slice() {
                     [] => {}
                     [var] => {
-                        tail_expr = Some(path_expr_from_local(ctx, *var));
+                        tail_expr = Some(path_expr_from_local(ctx, var.local));
                     }
                     vars => {
-                        let exprs = vars.iter().map(|var| path_expr_from_local(ctx, *var));
+                        let exprs = vars.iter().map(|var| path_expr_from_local(ctx, var.local));
                         let expr = make::expr_tuple(exprs);
                         tail_expr = Some(expr);
                     }
@@ -1492,7 +1554,7 @@ fn foo() {
 }
 
 fn $0fun_name() -> i32 {
-    { 1 + 1 }
+    1 + 1
 }"#,
         );
     }
@@ -1734,6 +1796,60 @@ fn $0fun_name() -> i32 {
         Some(x) => x,
         None => 0,
     }
+}"#,
+        );
+    }
+
+    #[test]
+    fn extract_partial_block_single_line() {
+        check_assist(
+            extract_function,
+            r#"
+fn foo() {
+    let n = 1;
+    let mut v = $0n * n;$0
+    v += 1;
+}"#,
+            r#"
+fn foo() {
+    let n = 1;
+    let mut v = fun_name(n);
+    v += 1;
+}
+
+fn $0fun_name(n: i32) -> i32 {
+    let mut v = n * n;
+    v
+}"#,
+        );
+    }
+
+    #[test]
+    fn extract_partial_block() {
+        check_assist(
+            extract_function,
+            r#"
+fn foo() {
+    let m = 2;
+    let n = 1;
+    let mut v = m $0* n;
+    let mut w = 3;$0
+    v += 1;
+    w += 1;
+}"#,
+            r#"
+fn foo() {
+    let m = 2;
+    let n = 1;
+    let (mut v, mut w) = fun_name(m, n);
+    v += 1;
+    w += 1;
+}
+
+fn $0fun_name(m: i32, n: i32) -> (i32, i32) {
+    let mut v = m * n;
+    let mut w = 3;
+    (v, w)
 }"#,
         );
     }
@@ -2111,6 +2227,30 @@ fn $0fun_name(n: i32) -> i32 {
     }
 
     #[test]
+    fn variable_defined_inside_and_used_after_mutably_no_ret() {
+        check_assist(
+            extract_function,
+            r"
+fn foo() {
+    let n = 1;
+    $0let mut k = n * n;$0
+    k += 1;
+}",
+            r"
+fn foo() {
+    let n = 1;
+    let mut k = fun_name(n);
+    k += 1;
+}
+
+fn $0fun_name(n: i32) -> i32 {
+    let mut k = n * n;
+    k
+}",
+        );
+    }
+
+    #[test]
     fn two_variables_defined_inside_and_used_after_no_ret() {
         check_assist(
             extract_function,
@@ -2132,6 +2272,38 @@ fn $0fun_name(n: i32) -> (i32, i32) {
     let k = n * n;
     let m = k + 2;
     (k, m)
+}",
+        );
+    }
+
+    #[test]
+    fn multi_variables_defined_inside_and_used_after_mutably_no_ret() {
+        check_assist(
+            extract_function,
+            r"
+fn foo() {
+    let n = 1;
+    $0let mut k = n * n;
+    let mut m = k + 2;
+    let mut o = m + 3;
+    o += 1;$0
+    k += o;
+    m = 1;
+}",
+            r"
+fn foo() {
+    let n = 1;
+    let (mut k, mut m, o) = fun_name(n);
+    k += o;
+    m = 1;
+}
+
+fn $0fun_name(n: i32) -> (i32, i32, i32) {
+    let mut k = n * n;
+    let mut m = k + 2;
+    let mut o = m + 3;
+    o += 1;
+    (k, m, o)
 }",
         );
     }
@@ -2364,17 +2536,15 @@ fn foo() {
 }
 
 fn $0fun_name(n: &mut i32) {
-    {
-        *n += *n;
-        bar(*n);
-        bar(*n+1);
-        bar(*n**n);
-        bar(&*n);
-        n.inc();
-        let v = n;
-        *v = v.succ();
-        n.succ();
-    }
+    *n += *n;
+    bar(*n);
+    bar(*n+1);
+    bar(*n**n);
+    bar(&*n);
+    n.inc();
+    let v = n;
+    *v = v.succ();
+    n.succ();
 }",
         );
     }
@@ -3370,6 +3540,38 @@ fn foo() -> Result<(), i64> {
     let h = 1 + m;
     Ok(())
 }"##,
+        );
+    }
+
+    #[test]
+    fn param_usage_in_macro() {
+        check_assist(
+            extract_function,
+            r"
+macro_rules! m {
+    ($val:expr) => { $val };
+}
+
+fn foo() {
+    let n = 1;
+    $0let k = n * m!(n);$0
+    let m = k + 1;
+}",
+            r"
+macro_rules! m {
+    ($val:expr) => { $val };
+}
+
+fn foo() {
+    let n = 1;
+    let k = fun_name(n);
+    let m = k + 1;
+}
+
+fn $0fun_name(n: i32) -> i32 {
+    let k = n * m!(n);
+    k
+}",
         );
     }
 }

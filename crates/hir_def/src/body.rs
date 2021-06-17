@@ -21,7 +21,7 @@ use profile::Count;
 use rustc_hash::FxHashMap;
 use syntax::{ast, AstNode, AstPtr};
 
-pub(crate) use lower::LowerCtx;
+pub use lower::LowerCtx;
 
 use crate::{
     attr::{Attrs, RawAttrs},
@@ -37,13 +37,15 @@ use crate::{
 
 /// A subset of Expander that only deals with cfg attributes. We only need it to
 /// avoid cyclic queries in crate def map during enum processing.
+#[derive(Debug)]
 pub(crate) struct CfgExpander {
     cfg_options: CfgOptions,
     hygiene: Hygiene,
     krate: CrateId,
 }
 
-pub(crate) struct Expander {
+#[derive(Debug)]
+pub struct Expander {
     cfg_expander: CfgExpander,
     def_map: Arc<DefMap>,
     current_file_id: HirFileId,
@@ -80,11 +82,7 @@ impl CfgExpander {
 }
 
 impl Expander {
-    pub(crate) fn new(
-        db: &dyn DefDatabase,
-        current_file_id: HirFileId,
-        module: ModuleId,
-    ) -> Expander {
+    pub fn new(db: &dyn DefDatabase, current_file_id: HirFileId, module: ModuleId) -> Expander {
         let cfg_expander = CfgExpander::new(db, current_file_id, module.krate);
         let def_map = module.def_map(db);
         let ast_id_map = db.ast_id_map(current_file_id);
@@ -98,7 +96,7 @@ impl Expander {
         }
     }
 
-    pub(crate) fn enter_expand<T: ast::AstNode>(
+    pub fn enter_expand<T: ast::AstNode>(
         &mut self,
         db: &dyn DefDatabase,
         macro_call: ast::MacroCall,
@@ -170,7 +168,7 @@ impl Expander {
         Ok(ExpandResult { value: Some((mark, node)), err })
     }
 
-    pub(crate) fn exit(&mut self, db: &dyn DefDatabase, mut mark: Mark) {
+    pub fn exit(&mut self, db: &dyn DefDatabase, mut mark: Mark) {
         self.cfg_expander.hygiene = Hygiene::new(db.upcast(), mark.file_id);
         self.current_file_id = mark.file_id;
         self.ast_id_map = mem::take(&mut mark.ast_id_map);
@@ -190,8 +188,13 @@ impl Expander {
         &self.cfg_expander.cfg_options
     }
 
+    pub fn current_file_id(&self) -> HirFileId {
+        self.current_file_id
+    }
+
     fn parse_path(&mut self, path: ast::Path) -> Option<Path> {
-        Path::from_src(path, &self.cfg_expander.hygiene)
+        let ctx = LowerCtx::with_hygiene(&self.cfg_expander.hygiene);
+        Path::from_src(path, &ctx)
     }
 
     fn resolve_path_as_macro(&self, db: &dyn DefDatabase, path: &ModPath) -> Option<MacroDefId> {
@@ -204,7 +207,8 @@ impl Expander {
     }
 }
 
-pub(crate) struct Mark {
+#[derive(Debug)]
+pub struct Mark {
     file_id: HirFileId,
     ast_id_map: Arc<AstIdMap>,
     bomb: DropBomb,
@@ -226,7 +230,7 @@ pub struct Body {
     /// The `ExprId` of the actual body expression.
     pub body_expr: ExprId,
     /// Block expressions in this body that may contain inner items.
-    pub block_scopes: Vec<BlockId>,
+    block_scopes: Vec<BlockId>,
     _c: Count<Self>,
 }
 
@@ -302,12 +306,23 @@ impl Body {
             }
         };
         let expander = Expander::new(db, file_id, module);
-        let (body, source_map) = Body::new(db, expander, params, body);
+        let (mut body, source_map) = Body::new(db, expander, params, body);
+        body.shrink_to_fit();
         (Arc::new(body), Arc::new(source_map))
     }
 
     pub(crate) fn body_query(db: &dyn DefDatabase, def: DefWithBodyId) -> Arc<Body> {
         db.body_with_source_map(def).0
+    }
+
+    /// Returns an iterator over all block expressions in this body that define inner items.
+    pub fn blocks<'a>(
+        &'a self,
+        db: &'a dyn DefDatabase,
+    ) -> impl Iterator<Item = (BlockId, Arc<DefMap>)> + '_ {
+        self.block_scopes
+            .iter()
+            .map(move |block| (*block, db.block_def_map(*block).expect("block ID without DefMap")))
     }
 
     fn new(
@@ -317,6 +332,15 @@ impl Body {
         body: Option<ast::Expr>,
     ) -> (Body, BodySourceMap) {
         lower::lower(db, expander, params, body)
+    }
+
+    fn shrink_to_fit(&mut self) {
+        let Self { _c: _, body_expr: _, block_scopes, exprs, labels, params, pats } = self;
+        block_scopes.shrink_to_fit();
+        exprs.shrink_to_fit();
+        labels.shrink_to_fit();
+        params.shrink_to_fit();
+        pats.shrink_to_fit();
     }
 }
 

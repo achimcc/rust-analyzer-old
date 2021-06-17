@@ -7,26 +7,31 @@ use std::{
 
 use anyhow::Result;
 use flate2::{write::GzEncoder, Compression};
-use xshell::{cmd, cp, mkdir_p, pushd, read_file, rm_rf, write_file};
+use xshell::{cmd, cp, mkdir_p, pushd, pushenv, read_file, rm_rf, write_file};
 
-use crate::{date_iso, project_root};
+use crate::{date_iso, flags, project_root};
 
-pub(crate) struct DistCmd {
-    pub(crate) nightly: bool,
-    pub(crate) client_version: Option<String>,
-}
-
-impl DistCmd {
+impl flags::Dist {
     pub(crate) fn run(self) -> Result<()> {
+        let stable =
+            std::env::var("GITHUB_REF").unwrap_or_default().as_str() == "refs/heads/release";
+
         let dist = project_root().join("dist");
         rm_rf(&dist)?;
         mkdir_p(&dist)?;
 
-        if let Some(version) = self.client_version {
-            let release_tag = if self.nightly { "nightly".to_string() } else { date_iso()? };
+        if let Some(patch_version) = self.client_patch_version {
+            let version = if stable {
+                format!("0.2.{}", patch_version)
+            } else {
+                // A hack to make VS Code prefer nightly over stable.
+                format!("0.3.{}", patch_version)
+            };
+            let release_tag = if stable { date_iso()? } else { "nightly".to_string() };
             dist_client(&version, &release_tag)?;
         }
-        dist_server()?;
+        let release_channel = if stable { "stable" } else { "nightly" };
+        dist_server(release_channel)?;
         Ok(())
     }
 }
@@ -39,7 +44,9 @@ fn dist_client(version: &str, release_tag: &str) -> Result<()> {
 
     patch
         .replace(r#""version": "0.4.0-dev""#, &format!(r#""version": "{}""#, version))
-        .replace(r#""releaseTag": null"#, &format!(r#""releaseTag": "{}""#, release_tag));
+        .replace(r#""releaseTag": null"#, &format!(r#""releaseTag": "{}""#, release_tag))
+        .replace(r#""$generated-start": false,"#, "")
+        .replace(",\n                \"$generated-end\": false", "");
 
     if nightly {
         patch.replace(
@@ -57,7 +64,8 @@ fn dist_client(version: &str, release_tag: &str) -> Result<()> {
     Ok(())
 }
 
-fn dist_server() -> Result<()> {
+fn dist_server(release_channel: &str) -> Result<()> {
+    let _e = pushenv("RUST_ANALYZER_CHANNEL", release_channel);
     let target = get_target();
     if target.contains("-linux-gnu") || target.contains("-linux-musl") {
         env::set_var("CC", "clang");

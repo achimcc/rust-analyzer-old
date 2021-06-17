@@ -1,6 +1,8 @@
 //! A module with ide helpers for high-level ide features.
-pub mod insert_use;
 pub mod import_assets;
+pub mod insert_use;
+pub mod merge_imports;
+pub mod rust_doc;
 
 use std::collections::VecDeque;
 
@@ -93,6 +95,10 @@ impl FamousDefs<'_, '_> {
         self.find_trait("core:convert:From")
     }
 
+    pub fn core_convert_Into(&self) -> Option<Trait> {
+        self.find_trait("core:convert:Into")
+    }
+
     pub fn core_option_Option(&self) -> Option<Enum> {
         self.find_enum("core:option:Option")
     }
@@ -107,6 +113,10 @@ impl FamousDefs<'_, '_> {
 
     pub fn core_iter(&self) -> Option<Module> {
         self.find_module("core:iter")
+    }
+
+    pub fn core_ops_Deref(&self) -> Option<Trait> {
+        self.find_trait("core:ops:Deref")
     }
 
     fn find_trait(&self, path: &str) -> Option<Trait> {

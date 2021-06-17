@@ -14,8 +14,7 @@ use crate::{
         MismatchedArgCount, MissingFields, MissingMatchArms, MissingOkOrSomeInTailExpr,
         MissingPatFields, RemoveThisSemicolon,
     },
-    utils::variant_data,
-    AdtId, InferenceResult, Interner, Ty, TyKind,
+    AdtId, InferenceResult, Interner, TyExt, TyKind,
 };
 
 pub(crate) use hir_def::{
@@ -104,7 +103,7 @@ impl<'a, 'b> ExprValidator<'a, 'b> {
             let root = source_ptr.file_syntax(db.upcast());
             if let ast::Expr::RecordExpr(record_expr) = &source_ptr.value.to_node(&root) {
                 if let Some(_) = record_expr.record_expr_field_list() {
-                    let variant_data = variant_data(db.upcast(), variant_def);
+                    let variant_data = variant_def.variant_data(db.upcast());
                     let missed_fields = missed_fields
                         .into_iter()
                         .map(|idx| variant_data.fields()[idx].name.clone())
@@ -135,7 +134,7 @@ impl<'a, 'b> ExprValidator<'a, 'b> {
                 let root = source_ptr.file_syntax(db.upcast());
                 if let ast::Pat::RecordPat(record_pat) = expr.to_node(&root) {
                     if let Some(_) = record_pat.record_pat_field_list() {
-                        let variant_data = variant_data(db.upcast(), variant_def);
+                        let variant_data = variant_def.variant_data(db.upcast());
                         let missed_fields = missed_fields
                             .into_iter()
                             .map(|idx| variant_data.fields()[idx].name.clone())
@@ -245,7 +244,8 @@ impl<'a, 'b> ExprValidator<'a, 'b> {
                     Some(callee) => callee,
                     None => return,
                 };
-                let sig = db.callable_item_signature(callee.into()).value;
+                let sig =
+                    db.callable_item_signature(callee.into()).into_value_and_skipped_binders().0;
 
                 (sig, args)
             }
@@ -314,7 +314,7 @@ impl<'a, 'b> ExprValidator<'a, 'b> {
                 if pat_ty == match_expr_ty
                     || match_expr_ty
                         .as_reference()
-                        .map(|(match_expr_ty, _)| match_expr_ty == pat_ty)
+                        .map(|(match_expr_ty, ..)| match_expr_ty == pat_ty)
                         .unwrap_or(false)
                 {
                     // If we had a NotUsefulMatchArm diagnostic, we could
@@ -378,7 +378,7 @@ impl<'a, 'b> ExprValidator<'a, 'b> {
             _ => return,
         };
 
-        let (params, required) = match mismatch.expected.interned(&Interner) {
+        let (params, required) = match mismatch.expected.kind(&Interner) {
             TyKind::Adt(AdtId(hir_def::AdtId::EnumId(enum_id)), ref parameters)
                 if *enum_id == core_result_enum =>
             {
@@ -392,7 +392,9 @@ impl<'a, 'b> ExprValidator<'a, 'b> {
             _ => return,
         };
 
-        if params.len() > 0 && params[0] == mismatch.actual {
+        if params.len(&Interner) > 0
+            && params.at(&Interner, 0).ty(&Interner) == Some(&mismatch.actual)
+        {
             let (_, source_map) = db.body_with_source_map(self.owner);
 
             if let Ok(source_ptr) = source_map.expr_syntax(id) {
@@ -421,7 +423,7 @@ impl<'a, 'b> ExprValidator<'a, 'b> {
             None => return,
         };
 
-        if mismatch.actual != Ty::unit() || mismatch.expected != *possible_tail_ty {
+        if !mismatch.actual.is_unit() || mismatch.expected != *possible_tail_ty {
             return;
         }
 
@@ -450,7 +452,7 @@ pub fn record_literal_missing_fields(
         return None;
     }
 
-    let variant_data = variant_data(db.upcast(), variant_def);
+    let variant_data = variant_def.variant_data(db.upcast());
 
     let specified_fields: FxHashSet<_> = fields.iter().map(|f| &f.name).collect();
     let missed_fields: Vec<LocalFieldId> = variant_data
@@ -480,7 +482,7 @@ pub fn record_pattern_missing_fields(
         return None;
     }
 
-    let variant_data = variant_data(db.upcast(), variant_def);
+    let variant_data = variant_def.variant_data(db.upcast());
 
     let specified_fields: FxHashSet<_> = fields.iter().map(|f| &f.name).collect();
     let missed_fields: Vec<LocalFieldId> = variant_data

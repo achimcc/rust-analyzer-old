@@ -44,6 +44,7 @@ use hir_def::{
     per_ns::PerNs,
     resolver::{HasResolver, Resolver},
     src::HasSource as _,
+    type_ref::TraitRef,
     AdtId, AssocContainerId, AssocItemId, AssocItemLoc, AttrDefId, ConstId, ConstParamId,
     DefWithBodyId, EnumId, FunctionId, GenericDefId, HasModule, ImplId, LifetimeParamId,
     LocalEnumVariantId, LocalFieldId, Lookup, ModuleId, StaticId, StructId, TraitId, TypeAliasId,
@@ -52,13 +53,14 @@ use hir_def::{
 use hir_expand::{diagnostics::DiagnosticSink, name::name, MacroDefKind};
 use hir_ty::{
     autoderef, could_unify,
-    method_resolution::{self, TyFingerprint},
+    method_resolution::{self, def_crates, TyFingerprint},
     primitive::UintTy,
-    to_assoc_type_id,
-    traits::{FnTrait, Solution, SolutionVariables},
+    subst_prefix,
+    traits::FnTrait,
     AliasEq, AliasTy, BoundVar, CallableDefId, CallableSig, Canonical, CanonicalVarKinds, Cast,
-    DebruijnIndex, InEnvironment, Interner, ProjectionTy, QuantifiedWhereClause, Scalar,
-    Substitution, TraitEnvironment, Ty, TyDefId, TyKind, TyVariableKind, WhereClause,
+    DebruijnIndex, InEnvironment, Interner, QuantifiedWhereClause, Scalar, Solution, Substitution,
+    TraitEnvironment, TraitRefExt, Ty, TyBuilder, TyDefId, TyExt, TyKind, TyVariableKind,
+    WhereClause,
 };
 use itertools::Itertools;
 use rustc_hash::FxHashSet;
@@ -507,15 +509,15 @@ impl Field {
     /// placeholder types for type parameters). This is good for showing
     /// signature help, but not so good to actually get the type of the field
     /// when you actually have a variable of the struct.
-    pub fn signature_ty(&self, db: &dyn HirDatabase) -> Type {
+    pub fn ty(&self, db: &dyn HirDatabase) -> Type {
         let var_id = self.parent.into();
         let generic_def_id: GenericDefId = match self.parent {
             VariantDef::Struct(it) => it.id.into(),
             VariantDef::Union(it) => it.id.into(),
             VariantDef::Variant(it) => it.parent.id.into(),
         };
-        let substs = Substitution::type_params(db, generic_def_id);
-        let ty = db.field_types(var_id)[self.id].clone().subst(&substs);
+        let substs = TyBuilder::type_params_subst(db, generic_def_id);
+        let ty = db.field_types(var_id)[self.id].clone().substitute(&Interner, &substs);
         Type::new(db, self.parent.module(db).id.krate(), var_id, ty)
     }
 
@@ -701,7 +703,7 @@ impl_from!(Struct, Union, Enum for Adt);
 impl Adt {
     pub fn has_non_default_type_params(self, db: &dyn HirDatabase) -> bool {
         let subst = db.generic_defaults(self.into());
-        subst.iter().any(|ty| ty.value.is_unknown())
+        subst.iter().any(|ty| ty.skip_binders().is_unknown())
     }
 
     /// Turns this ADT into a type. Any type parameters of the ADT will be
@@ -831,7 +833,7 @@ impl Function {
     }
 
     pub fn self_param(self, db: &dyn HirDatabase) -> Option<SelfParam> {
-        if !db.function_data(self.id).has_self_param {
+        if !db.function_data(self.id).has_self_param() {
             return None;
         }
         Some(SelfParam { func: self.id })
@@ -863,7 +865,7 @@ impl Function {
     }
 
     pub fn is_unsafe(self, db: &dyn HirDatabase) -> bool {
-        db.function_data(self.id).qualifier.is_unsafe
+        db.function_data(self.id).is_unsafe()
     }
 
     pub fn diagnostics(self, db: &dyn HirDatabase, sink: &mut DiagnosticSink) {
@@ -877,7 +879,7 @@ impl Function {
     ///
     /// This is false in the case of required (not provided) trait methods.
     pub fn has_body(self, db: &dyn HirDatabase) -> bool {
-        db.function_data(self.id).has_body
+        db.function_data(self.id).has_body()
     }
 
     /// A textual representation of the HIR of this function for debugging purposes.
@@ -956,7 +958,7 @@ impl SelfParam {
         func_data
             .params
             .first()
-            .map(|param| match *param {
+            .map(|param| match &**param {
                 TypeRef::Reference(.., mutability) => match mutability {
                     hir_def::type_ref::Mutability::Shared => Access::Shared,
                     hir_def::type_ref::Mutability::Mut => Access::Exclusive,
@@ -1010,7 +1012,7 @@ impl Const {
     }
 
     pub fn type_ref(self, db: &dyn HirDatabase) -> TypeRef {
-        db.const_data(self.id).type_ref.clone()
+        db.const_data(self.id).type_ref.as_ref().clone()
     }
 }
 
@@ -1088,7 +1090,7 @@ pub struct TypeAlias {
 impl TypeAlias {
     pub fn has_non_default_type_params(self, db: &dyn HirDatabase) -> bool {
         let subst = db.generic_defaults(self.id.into());
-        subst.iter().any(|ty| ty.value.is_unknown())
+        subst.iter().any(|ty| ty.skip_binders().is_unknown())
     }
 
     pub fn module(self, db: &dyn HirDatabase) -> Module {
@@ -1100,7 +1102,7 @@ impl TypeAlias {
     }
 
     pub fn type_ref(self, db: &dyn HirDatabase) -> Option<TypeRef> {
-        db.type_alias_data(self.id).type_ref.clone()
+        db.type_alias_data(self.id).type_ref.as_deref().cloned()
     }
 
     pub fn ty(self, db: &dyn HirDatabase) -> Type {
@@ -1128,7 +1130,7 @@ pub struct BuiltinType {
 impl BuiltinType {
     pub fn ty(self, db: &dyn HirDatabase, module: Module) -> Type {
         let resolver = module.id.resolver(db.upcast());
-        Type::new_with_resolver(db, &resolver, Ty::builtin(self.inner))
+        Type::new_with_resolver(db, &resolver, TyBuilder::builtin(self.inner))
             .expect("crate not present in resolver")
     }
 
@@ -1501,8 +1503,8 @@ impl TypeParam {
         let resolver = self.id.parent.resolver(db.upcast());
         let krate = self.id.parent.module(db.upcast()).krate();
         let ty = params.get(local_idx)?.clone();
-        let subst = Substitution::type_params(db, self.id.parent);
-        let ty = ty.subst(&subst.prefix(local_idx));
+        let subst = TyBuilder::type_params_subst(db, self.id.parent);
+        let ty = ty.substitute(&Interner, &subst_prefix(&subst, local_idx));
         Some(Type::new_with_resolver_inner(db, krate, &resolver, ty))
     }
 }
@@ -1567,22 +1569,35 @@ impl Impl {
     }
 
     pub fn all_for_type(db: &dyn HirDatabase, Type { krate, ty, .. }: Type) -> Vec<Impl> {
-        let def_crates = match ty.def_crates(db, krate) {
+        let def_crates = match def_crates(db, &ty, krate) {
             Some(def_crates) => def_crates,
             None => return Vec::new(),
         };
 
         let filter = |impl_def: &Impl| {
-            let target_ty = impl_def.target_ty(db);
-            let rref = target_ty.remove_ref();
-            ty.equals_ctor(rref.as_ref().map_or(&target_ty.ty, |it| &it.ty))
+            let self_ty = impl_def.self_ty(db);
+            let rref = self_ty.remove_ref();
+            ty.equals_ctor(rref.as_ref().map_or(&self_ty.ty, |it| &it.ty))
+        };
+
+        let fp = TyFingerprint::for_inherent_impl(&ty);
+        let fp = if let Some(fp) = fp {
+            fp
+        } else {
+            return Vec::new();
         };
 
         let mut all = Vec::new();
         def_crates.iter().for_each(|&id| {
-            all.extend(db.inherent_impls_in_crate(id).all_impls().map(Self::from).filter(filter))
+            all.extend(
+                db.inherent_impls_in_crate(id)
+                    .for_self_ty(&ty)
+                    .into_iter()
+                    .cloned()
+                    .map(Self::from)
+                    .filter(filter),
+            )
         });
-        let fp = TyFingerprint::for_impl(&ty);
         for id in def_crates
             .iter()
             .flat_map(|&id| Crate { id }.transitive_reverse_dependencies(db))
@@ -1590,13 +1605,12 @@ impl Impl {
             .chain(def_crates.iter().copied())
             .unique()
         {
-            match fp {
-                Some(fp) => all.extend(
-                    db.trait_impls_in_crate(id).for_self_ty(fp).map(Self::from).filter(filter),
-                ),
-                None => all
-                    .extend(db.trait_impls_in_crate(id).all_impls().map(Self::from).filter(filter)),
-            }
+            all.extend(
+                db.trait_impls_in_crate(id)
+                    .for_self_ty_without_blanket_impls(fp)
+                    .map(Self::from)
+                    .filter(filter),
+            );
         }
         all
     }
@@ -1613,16 +1627,16 @@ impl Impl {
 
     // FIXME: the return type is wrong. This should be a hir version of
     // `TraitRef` (ie, resolved `TypeRef`).
-    pub fn target_trait(self, db: &dyn HirDatabase) -> Option<TypeRef> {
-        db.impl_data(self.id).target_trait.clone()
+    pub fn trait_(self, db: &dyn HirDatabase) -> Option<TraitRef> {
+        db.impl_data(self.id).target_trait.as_deref().cloned()
     }
 
-    pub fn target_ty(self, db: &dyn HirDatabase) -> Type {
+    pub fn self_ty(self, db: &dyn HirDatabase) -> Type {
         let impl_data = db.impl_data(self.id);
         let resolver = self.id.resolver(db.upcast());
         let krate = self.id.lookup(db.upcast()).container.krate();
         let ctx = hir_ty::TyLoweringContext::new(db, &resolver);
-        let ty = ctx.lower_ty(&impl_data.target_type);
+        let ty = ctx.lower_ty(&impl_data.self_ty);
         Type::new_with_resolver_inner(db, krate, &resolver, ty)
     }
 
@@ -1702,30 +1716,29 @@ impl Type {
     fn from_def(
         db: &dyn HirDatabase,
         krate: CrateId,
-        def: impl HasResolver + Into<TyDefId> + Into<GenericDefId>,
+        def: impl HasResolver + Into<TyDefId>,
     ) -> Type {
-        let substs = Substitution::build_for_def(db, def).fill_with_unknown().build();
-        let ty = db.ty(def.into()).subst(&substs);
+        let ty = TyBuilder::def_ty(db, def.into()).fill_with_unknown().build();
         Type::new(db, krate, def, ty)
     }
 
     pub fn is_unit(&self) -> bool {
-        matches!(self.ty.interned(&Interner), TyKind::Tuple(0, ..))
+        matches!(self.ty.kind(&Interner), TyKind::Tuple(0, ..))
     }
     pub fn is_bool(&self) -> bool {
-        matches!(self.ty.interned(&Interner), TyKind::Scalar(Scalar::Bool))
+        matches!(self.ty.kind(&Interner), TyKind::Scalar(Scalar::Bool))
     }
 
     pub fn is_mutable_reference(&self) -> bool {
-        matches!(self.ty.interned(&Interner), TyKind::Ref(hir_ty::Mutability::Mut, ..))
+        matches!(self.ty.kind(&Interner), TyKind::Ref(hir_ty::Mutability::Mut, ..))
     }
 
     pub fn is_usize(&self) -> bool {
-        matches!(self.ty.interned(&Interner), TyKind::Scalar(Scalar::Uint(UintTy::Usize)))
+        matches!(self.ty.kind(&Interner), TyKind::Scalar(Scalar::Uint(UintTy::Usize)))
     }
 
     pub fn remove_ref(&self) -> Option<Type> {
-        match &self.ty.interned(&Interner) {
+        match &self.ty.kind(&Interner) {
             TyKind::Ref(.., ty) => Some(self.derived(ty.clone())),
             _ => None,
         }
@@ -1784,16 +1797,13 @@ impl Type {
     }
 
     pub fn impls_trait(&self, db: &dyn HirDatabase, trait_: Trait, args: &[Type]) -> bool {
-        let trait_ref = hir_ty::TraitRef {
-            trait_id: hir_ty::to_chalk_trait_id(trait_.id),
-            substitution: Substitution::build_for_def(db, trait_.id)
-                .push(self.ty.clone())
-                .fill(args.iter().map(|t| t.ty.clone()))
-                .build(),
-        };
+        let trait_ref = TyBuilder::trait_ref(db, trait_.id)
+            .push(self.ty.clone())
+            .fill(args.iter().map(|t| t.ty.clone()))
+            .build();
 
         let goal = Canonical {
-            value: hir_ty::InEnvironment::new(self.env.env.clone(), trait_ref.cast(&Interner)),
+            value: hir_ty::InEnvironment::new(&self.env.env, trait_ref.cast(&Interner)),
             binders: CanonicalVarKinds::empty(&Interner),
         };
 
@@ -1803,22 +1813,18 @@ impl Type {
     pub fn normalize_trait_assoc_type(
         &self,
         db: &dyn HirDatabase,
-        trait_: Trait,
         args: &[Type],
         alias: TypeAlias,
     ) -> Option<Type> {
-        let subst = Substitution::build_for_def(db, trait_.id)
+        let projection = TyBuilder::assoc_type_projection(db, alias.id)
             .push(self.ty.clone())
             .fill(args.iter().map(|t| t.ty.clone()))
             .build();
-        let goal = Canonical::new(
+        let goal = hir_ty::make_canonical(
             InEnvironment::new(
-                self.env.env.clone(),
+                &self.env.env,
                 AliasEq {
-                    alias: AliasTy::Projection(ProjectionTy {
-                        associated_ty_id: to_assoc_type_id(alias.id),
-                        substitution: subst,
-                    }),
+                    alias: AliasTy::Projection(projection),
                     ty: TyKind::BoundVar(BoundVar::new(DebruijnIndex::INNERMOST, 0))
                         .intern(&Interner),
                 }
@@ -1828,9 +1834,12 @@ impl Type {
         );
 
         match db.trait_solve(self.krate, goal)? {
-            Solution::Unique(SolutionVariables(subst)) => {
-                subst.value.first().map(|ty| self.derived(ty.clone()))
-            }
+            Solution::Unique(s) => s
+                .value
+                .subst
+                .as_slice(&Interner)
+                .first()
+                .map(|ty| self.derived(ty.assert_ty_ref(&Interner).clone())),
             Solution::Ambig(_) => None,
         }
     }
@@ -1852,15 +1861,15 @@ impl Type {
     }
 
     pub fn is_closure(&self) -> bool {
-        matches!(&self.ty.interned(&Interner), TyKind::Closure { .. })
+        matches!(&self.ty.kind(&Interner), TyKind::Closure { .. })
     }
 
     pub fn is_fn(&self) -> bool {
-        matches!(&self.ty.interned(&Interner), TyKind::FnDef(..) | TyKind::Function { .. })
+        matches!(&self.ty.kind(&Interner), TyKind::FnDef(..) | TyKind::Function { .. })
     }
 
     pub fn is_packed(&self, db: &dyn HirDatabase) -> bool {
-        let adt_id = match self.ty.interned(&Interner) {
+        let adt_id = match self.ty.kind(&Interner) {
             &TyKind::Adt(hir_ty::AdtId(adt_id), ..) => adt_id,
             _ => return false,
         };
@@ -1873,26 +1882,29 @@ impl Type {
     }
 
     pub fn is_raw_ptr(&self) -> bool {
-        matches!(&self.ty.interned(&Interner), TyKind::Raw(..))
+        matches!(&self.ty.kind(&Interner), TyKind::Raw(..))
     }
 
     pub fn contains_unknown(&self) -> bool {
         return go(&self.ty);
 
         fn go(ty: &Ty) -> bool {
-            match ty.interned(&Interner) {
-                TyKind::Unknown => true,
+            match ty.kind(&Interner) {
+                TyKind::Error => true,
 
                 TyKind::Adt(_, substs)
                 | TyKind::AssociatedType(_, substs)
                 | TyKind::Tuple(_, substs)
                 | TyKind::OpaqueType(_, substs)
                 | TyKind::FnDef(_, substs)
-                | TyKind::Closure(_, substs) => substs.iter().any(go),
-
-                TyKind::Array(ty) | TyKind::Slice(ty) | TyKind::Raw(_, ty) | TyKind::Ref(_, ty) => {
-                    go(ty)
+                | TyKind::Closure(_, substs) => {
+                    substs.iter(&Interner).filter_map(|a| a.ty(&Interner)).any(go)
                 }
+
+                TyKind::Array(ty, _)
+                | TyKind::Slice(ty)
+                | TyKind::Raw(_, ty)
+                | TyKind::Ref(_, _, ty) => go(ty),
 
                 TyKind::Scalar(_)
                 | TyKind::Str
@@ -1903,13 +1915,15 @@ impl Type {
                 | TyKind::Dyn(_)
                 | TyKind::Function(_)
                 | TyKind::Alias(_)
-                | TyKind::ForeignType(_) => false,
+                | TyKind::Foreign(_)
+                | TyKind::Generator(..)
+                | TyKind::GeneratorWitness(..) => false,
             }
         }
     }
 
     pub fn fields(&self, db: &dyn HirDatabase) -> Vec<(Field, Type)> {
-        let (variant_id, substs) = match self.ty.interned(&Interner) {
+        let (variant_id, substs) = match self.ty.kind(&Interner) {
             &TyKind::Adt(hir_ty::AdtId(AdtId::StructId(s)), ref substs) => (s.into(), substs),
             &TyKind::Adt(hir_ty::AdtId(AdtId::UnionId(u)), ref substs) => (u.into(), substs),
             _ => return Vec::new(),
@@ -1919,15 +1933,18 @@ impl Type {
             .iter()
             .map(|(local_id, ty)| {
                 let def = Field { parent: variant_id.into(), id: local_id };
-                let ty = ty.clone().subst(substs);
+                let ty = ty.clone().substitute(&Interner, substs);
                 (def, self.derived(ty))
             })
             .collect()
     }
 
     pub fn tuple_fields(&self, _db: &dyn HirDatabase) -> Vec<Type> {
-        if let TyKind::Tuple(_, substs) = &self.ty.interned(&Interner) {
-            substs.iter().map(|ty| self.derived(ty.clone())).collect()
+        if let TyKind::Tuple(_, substs) = &self.ty.kind(&Interner) {
+            substs
+                .iter(&Interner)
+                .map(|ty| self.derived(ty.assert_ty_ref(&Interner).clone()))
+                .collect()
         } else {
             Vec::new()
         }
@@ -1953,7 +1970,7 @@ impl Type {
         krate: Crate,
         mut callback: impl FnMut(AssocItem) -> Option<T>,
     ) -> Option<T> {
-        for krate in self.ty.def_crates(db, krate.id)? {
+        for krate in def_crates(db, &self.ty, krate.id)? {
             let impls = db.inherent_impls_in_crate(krate);
 
             for impl_def in impls.for_self_ty(&self.ty) {
@@ -1967,13 +1984,14 @@ impl Type {
         None
     }
 
-    pub fn type_parameters(&self) -> impl Iterator<Item = Type> + '_ {
+    pub fn type_arguments(&self) -> impl Iterator<Item = Type> + '_ {
         self.ty
             .strip_references()
-            .substs()
+            .as_adt()
             .into_iter()
-            .flat_map(|substs| substs.iter())
-            .map(move |ty| self.derived(ty.clone()))
+            .flat_map(|(_, substs)| substs.iter(&Interner))
+            .filter_map(|arg| arg.ty(&Interner).cloned())
+            .map(move |ty| self.derived(ty))
     }
 
     pub fn iterate_method_candidates<T>(
@@ -2048,6 +2066,18 @@ impl Type {
         self.ty.dyn_trait().map(Into::into)
     }
 
+    /// If a type can be represented as `dyn Trait`, returns all traits accessible via this type,
+    /// or an empty iterator otherwise.
+    pub fn applicable_inherent_traits<'a>(
+        &'a self,
+        db: &'a dyn HirDatabase,
+    ) -> impl Iterator<Item = Trait> + 'a {
+        self.autoderef(db)
+            .filter_map(|derefed_type| derefed_type.ty.dyn_trait())
+            .flat_map(move |dyn_trait_id| hir_ty::all_super_traits(db.upcast(), dyn_trait_id))
+            .map(Trait::from)
+    }
+
     pub fn as_impl_traits(&self, db: &dyn HirDatabase) -> Option<Vec<Trait>> {
         self.ty.impl_trait_bounds(db).map(|it| {
             it.into_iter()
@@ -2079,7 +2109,7 @@ impl Type {
             substs: &Substitution,
             cb: &mut impl FnMut(Type),
         ) {
-            for ty in substs.iter() {
+            for ty in substs.iter(&Interner).filter_map(|a| a.ty(&Interner)) {
                 walk_type(db, &type_.derived(ty.clone()), cb);
             }
         }
@@ -2095,7 +2125,12 @@ impl Type {
                     WhereClause::Implemented(trait_ref) => {
                         cb(type_.clone());
                         // skip the self type. it's likely the type we just got the bounds from
-                        for ty in trait_ref.substitution.iter().skip(1) {
+                        for ty in trait_ref
+                            .substitution
+                            .iter(&Interner)
+                            .skip(1)
+                            .filter_map(|a| a.ty(&Interner))
+                        {
                             walk_type(db, &type_.derived(ty.clone()), cb);
                         }
                     }
@@ -2106,19 +2141,23 @@ impl Type {
 
         fn walk_type(db: &dyn HirDatabase, type_: &Type, cb: &mut impl FnMut(Type)) {
             let ty = type_.ty.strip_references();
-            match ty.interned(&Interner) {
-                TyKind::Adt(..) => {
+            match ty.kind(&Interner) {
+                TyKind::Adt(_, substs) => {
                     cb(type_.derived(ty.clone()));
+                    walk_substs(db, type_, &substs, cb);
                 }
-                TyKind::AssociatedType(..) => {
+                TyKind::AssociatedType(_, substs) => {
                     if let Some(_) = ty.associated_type_parent_trait(db) {
                         cb(type_.derived(ty.clone()));
                     }
+                    walk_substs(db, type_, &substs, cb);
                 }
-                TyKind::OpaqueType(..) => {
+                TyKind::OpaqueType(_, subst) => {
                     if let Some(bounds) = ty.impl_trait_bounds(db) {
                         walk_bounds(db, &type_.derived(ty.clone()), &bounds, cb);
                     }
+
+                    walk_substs(db, type_, subst, cb);
                 }
                 TyKind::Alias(AliasTy::Opaque(opaque_ty)) => {
                     if let Some(bounds) = ty.impl_trait_bounds(db) {
@@ -2141,14 +2180,23 @@ impl Type {
                     );
                 }
 
-                TyKind::Ref(_, ty) | TyKind::Raw(_, ty) | TyKind::Array(ty) | TyKind::Slice(ty) => {
+                TyKind::Ref(_, _, ty)
+                | TyKind::Raw(_, ty)
+                | TyKind::Array(ty, _)
+                | TyKind::Slice(ty) => {
                     walk_type(db, &type_.derived(ty.clone()), cb);
                 }
 
+                TyKind::FnDef(_, substs)
+                | TyKind::Tuple(_, substs)
+                | TyKind::Closure(.., substs) => {
+                    walk_substs(db, type_, &substs, cb);
+                }
+                TyKind::Function(hir_ty::FnPointer { substitution, .. }) => {
+                    walk_substs(db, type_, &substitution.0, cb);
+                }
+
                 _ => {}
-            }
-            if let Some(substs) = ty.substs() {
-                walk_substs(db, type_, &substs, cb);
             }
         }
 

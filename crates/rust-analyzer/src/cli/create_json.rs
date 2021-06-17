@@ -2,7 +2,7 @@
 //! errors.
 
 use crossbeam_channel::{unbounded, Receiver};
-use ide::Change;
+use ide::{AnalysisHost, Change, DiagnosticsConfig, FileId};
 use ide_db::base_db::CrateGraph;
 use project_model::{
     BuildDataCollector, CargoConfig, ProcMacroClient, ProjectManifest, ProjectWorkspace,
@@ -25,20 +25,46 @@ impl CreateJsonCmd {
     pub fn run(self, root: &Path) -> Result<()> {
         
 
-        let (crate_graph, change) = get_crate_data(root, &|_| {})?;
+        let (_crate_graph, change) = get_crate_data(root, &|_| {})?;
 
         // let (_, change2) = get_crate_data(root, &|_| {})?;
 
-        let _json =
-            serde_json::to_string(&crate_graph).expect("serialization of crate_graph must work");
+        // let _json =
+        //    serde_json::to_string(&crate_graph).expect("serialization of crate_graph must work");
         
 
         let json =
             serde_json::to_string(&change).expect("serialization of change must work");
+        let deserialized_change: Change = serde_json::from_str(&json).expect("`Change` deserialization must work");
 
         // let json = str::replace(&json,  "'","@@@"); 
+
+        let file_id = FileId(182);
+        let mut host = AnalysisHost::new(None);
+        host.apply_change(deserialized_change);
+        let analysis = host.analysis();
+        println!("getting status");
+        let status = analysis.status(Some(file_id)).unwrap();
+        println!("{}", status);
+        let _config = DiagnosticsConfig::default();
+        let _highlights: Vec<_> = analysis
+            .highlight(file_id)
+            .unwrap()
+            .into_iter()
+            .collect();
+        // let _highlights = analysis.highlight(file_id);
         
-        println!("{}", json);
+        // println!("{}", json);
+      
+        /*  let mut host = AnalysisHost::new(None);
+        host.apply_change(change);
+        let analysis = host.analysis();
+        let file_id = FileId(0);
+        */
+        // let _highlights = analysis.highlight(file_id);
+        // println!("{}", json);
+ 
+        
 
         // let deserialized_change: Change = serde_json::from_str(&json).expect("`Change` deserialization must work");
 

@@ -35,7 +35,8 @@ impl CreateJsonCmd {
 
         let json =
             serde_json::to_string(&change).expect("serialization of change must work");
-        let deserialized_change: Change = serde_json::from_str(&json).expect("`Change` deserialization must work");
+            /* 
+        _let deserialized_change: Change = serde_json::from_str(&json).expect("`Change` deserialization must work");
 
         // let json = str::replace(&json,  "'","@@@"); 
 
@@ -53,8 +54,9 @@ impl CreateJsonCmd {
             .into_iter()
             .collect();
         // let _highlights = analysis.highlight(file_id);
+        */
         
-        // println!("{}", json);
+        println!("{}", json);
       
         /*  let mut host = AnalysisHost::new(None);
         host.apply_change(change);
@@ -111,8 +113,8 @@ fn get_crate_data(
     let ws = ProjectWorkspace::load(root, &cargo_config, &|_| {})?;
 
     let config = LoadCargoConfig {
-        load_out_dirs_from_check: false,
-        wrap_rustc: false,
+        load_out_dirs_from_check: true,
+        wrap_rustc: true,
         with_proc_macro: false,
     };
     let (sender, receiver) = unbounded();

@@ -182,7 +182,7 @@ pub fn defer<F: FnOnce()>(f: F) -> impl Drop {
     D(Some(f))
 }
 
-#[repr(transparent)]
+// #[repr(transparent)]
 pub struct JodChild(pub std::process::Child);
 
 impl ops::Deref for JodChild {

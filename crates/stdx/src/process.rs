@@ -130,6 +130,22 @@ mod imp {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+mod imp {
+    use std::{
+        io,
+        process::{ChildStderr, ChildStdout},
+    };
+    pub(crate) fn read2(
+        mut out_pipe: ChildStdout,
+        mut err_pipe: ChildStderr,
+        data: &mut dyn FnMut(bool, &mut Vec<u8>, bool),
+    ) -> io::Result<()> {
+        panic!("hopefully doesn't get called!");
+        Ok(())
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use std::{

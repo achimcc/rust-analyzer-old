@@ -8,7 +8,7 @@ use arrayvec::ArrayVec;
 use base_db::{CrateId, Edition};
 use chalk_ir::{cast::Cast, Mutability, UniverseIndex};
 use hir_def::{
-    lang_item::LangItemTarget, nameres::DefMap, AssocContainerId, AssocItemId, FunctionId,
+    lang_item::LangItemTarget, nameres::DefMap, AssocContainerId, AssocItemId, BlockId, FunctionId,
     GenericDefId, HasModule, ImplId, Lookup, ModuleId, TraitId,
 };
 use hir_expand::name::Name;
@@ -60,7 +60,7 @@ impl TyFingerprint {
             TyKind::Adt(AdtId(adt), _) => TyFingerprint::Adt(*adt),
             TyKind::Raw(mutability, ..) => TyFingerprint::RawPtr(*mutability),
             TyKind::Foreign(alias_id, ..) => TyFingerprint::ForeignType(*alias_id),
-            TyKind::Dyn(_) => ty.dyn_trait().map(|trait_| TyFingerprint::Dyn(trait_))?,
+            TyKind::Dyn(_) => ty.dyn_trait().map(TyFingerprint::Dyn)?,
             _ => return None,
         };
         Some(fp)
@@ -77,7 +77,7 @@ impl TyFingerprint {
             TyKind::Adt(AdtId(adt), _) => TyFingerprint::Adt(*adt),
             TyKind::Raw(mutability, ..) => TyFingerprint::RawPtr(*mutability),
             TyKind::Foreign(alias_id, ..) => TyFingerprint::ForeignType(*alias_id),
-            TyKind::Dyn(_) => ty.dyn_trait().map(|trait_| TyFingerprint::Dyn(trait_))?,
+            TyKind::Dyn(_) => ty.dyn_trait().map(TyFingerprint::Dyn)?,
             TyKind::Ref(_, _, ty) => return TyFingerprint::for_trait_impl(ty),
             TyKind::Tuple(_, subst) => {
                 let first_ty = subst.interned().get(0).map(|arg| arg.assert_ty_ref(&Interner));
@@ -139,35 +139,47 @@ impl TraitImpls {
         let mut impls = Self { map: FxHashMap::default() };
 
         let crate_def_map = db.crate_def_map(krate);
-        collect_def_map(db, &crate_def_map, &mut impls);
+        impls.collect_def_map(db, &crate_def_map);
 
         return Arc::new(impls);
+    }
 
-        fn collect_def_map(db: &dyn HirDatabase, def_map: &DefMap, impls: &mut TraitImpls) {
-            for (_module_id, module_data) in def_map.modules() {
-                for impl_id in module_data.scope.impls() {
-                    let target_trait = match db.impl_trait(impl_id) {
-                        Some(tr) => tr.skip_binders().hir_trait_id(),
-                        None => continue,
-                    };
-                    let self_ty = db.impl_self_ty(impl_id);
-                    let self_ty_fp = TyFingerprint::for_trait_impl(self_ty.skip_binders());
-                    impls
-                        .map
-                        .entry(target_trait)
-                        .or_default()
-                        .entry(self_ty_fp)
-                        .or_default()
-                        .push(impl_id);
-                }
+    pub(crate) fn trait_impls_in_block_query(
+        db: &dyn HirDatabase,
+        block: BlockId,
+    ) -> Option<Arc<Self>> {
+        let _p = profile::span("trait_impls_in_block_query");
+        let mut impls = Self { map: FxHashMap::default() };
 
-                // To better support custom derives, collect impls in all unnamed const items.
-                // const _: () = { ... };
-                for konst in module_data.scope.unnamed_consts() {
-                    let body = db.body(konst.into());
-                    for (_, block_def_map) in body.blocks(db.upcast()) {
-                        collect_def_map(db, &block_def_map, impls);
-                    }
+        let block_def_map = db.block_def_map(block)?;
+        impls.collect_def_map(db, &block_def_map);
+
+        return Some(Arc::new(impls));
+    }
+
+    fn collect_def_map(&mut self, db: &dyn HirDatabase, def_map: &DefMap) {
+        for (_module_id, module_data) in def_map.modules() {
+            for impl_id in module_data.scope.impls() {
+                let target_trait = match db.impl_trait(impl_id) {
+                    Some(tr) => tr.skip_binders().hir_trait_id(),
+                    None => continue,
+                };
+                let self_ty = db.impl_self_ty(impl_id);
+                let self_ty_fp = TyFingerprint::for_trait_impl(self_ty.skip_binders());
+                self.map
+                    .entry(target_trait)
+                    .or_default()
+                    .entry(self_ty_fp)
+                    .or_default()
+                    .push(impl_id);
+            }
+
+            // To better support custom derives, collect impls in all unnamed const items.
+            // const _: () = { ... };
+            for konst in module_data.scope.unnamed_consts() {
+                let body = db.body(konst.into());
+                for (_, block_def_map) in body.blocks(db.upcast()) {
+                    self.collect_def_map(db, &block_def_map);
                 }
             }
         }
@@ -372,7 +384,7 @@ pub(crate) fn lookup_method(
         db,
         env,
         krate,
-        &traits_in_scope,
+        traits_in_scope,
         visible_from_module,
         Some(name),
         LookupMode::MethodCall,
@@ -484,7 +496,7 @@ fn iterate_method_candidates_impl(
         LookupMode::Path => {
             // No autoderef for path lookups
             iterate_method_candidates_for_self_ty(
-                &ty,
+                ty,
                 db,
                 env,
                 krate,
@@ -513,7 +525,7 @@ fn iterate_method_candidates_with_autoref(
         db,
         env.clone(),
         krate,
-        &traits_in_scope,
+        traits_in_scope,
         visible_from_module,
         name,
         &mut callback,
@@ -531,7 +543,7 @@ fn iterate_method_candidates_with_autoref(
         db,
         env.clone(),
         krate,
-        &traits_in_scope,
+        traits_in_scope,
         visible_from_module,
         name,
         &mut callback,
@@ -549,7 +561,7 @@ fn iterate_method_candidates_with_autoref(
         db,
         env,
         krate,
-        &traits_in_scope,
+        traits_in_scope,
         visible_from_module,
         name,
         &mut callback,
@@ -593,7 +605,7 @@ fn iterate_method_candidates_by_receiver(
             db,
             env.clone(),
             krate,
-            &traits_in_scope,
+            traits_in_scope,
             name,
             Some(receiver_ty),
             &mut callback,
@@ -870,7 +882,7 @@ fn transform_receiver_ty(
             .fill_with_unknown()
             .build(),
         AssocContainerId::ImplId(impl_id) => {
-            let impl_substs = inherent_impl_substs(db, env, impl_id, &self_ty)?;
+            let impl_substs = inherent_impl_substs(db, env, impl_id, self_ty)?;
             TyBuilder::subst_for_def(db, function_id)
                 .use_parent_substs(&impl_substs)
                 .fill_with_unknown()

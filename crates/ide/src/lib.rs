@@ -24,32 +24,34 @@ mod display;
 
 mod annotations;
 mod call_hierarchy;
-mod diagnostics;
+mod doc_links;
+mod highlight_related;
 mod expand_macro;
 mod extend_selection;
 mod file_structure;
+mod fn_references;
 mod folding_ranges;
+mod goto_declaration;
 mod goto_definition;
 mod goto_implementation;
 mod goto_type_definition;
-mod view_hir;
 mod hover;
 mod inlay_hints;
 mod join_lines;
+mod markdown_remove;
 mod matching_brace;
 mod move_item;
 mod parent_module;
 mod references;
-mod fn_references;
+mod rename;
 mod runnables;
 mod ssr;
 mod status;
 mod syntax_highlighting;
 mod syntax_tree;
 mod typing;
-mod markdown_remove;
-mod doc_links;
 mod view_crate_graph;
+mod view_hir;
 mod view_item_tree;
 
 use std::sync::Arc;
@@ -71,17 +73,18 @@ use crate::display::ToNav;
 pub use crate::{
     annotations::{Annotation, AnnotationConfig, AnnotationKind},
     call_hierarchy::CallItem,
-    diagnostics::{Diagnostic, DiagnosticsConfig, Severity},
     display::navigation_target::NavigationTarget,
     expand_macro::ExpandedMacro,
     file_structure::{StructureNode, StructureNodeKind},
     folding_ranges::{Fold, FoldKind},
-    hover::{HoverAction, HoverConfig, HoverGotoTypeData, HoverResult},
+    highlight_related::HighlightedRange,
+    hover::{HoverAction, HoverConfig, HoverDocFormat, HoverGotoTypeData, HoverResult},
     inlay_hints::{InlayHint, InlayHintsConfig, InlayKind},
     markup::Markup,
     move_item::Direction,
     prime_caches::PrimeCachesProgress,
-    references::{rename::RenameError, ReferenceSearchResult},
+    references::ReferenceSearchResult,
+    rename::RenameError,
     runnables::{Runnable, RunnableKind, TestId},
     syntax_highlighting::{
         tags::{Highlight, HlMod, HlMods, HlOperator, HlPunct, HlTag},
@@ -109,6 +112,7 @@ pub use ide_db::{
     symbol_index::Query,
     RootDatabase, SymbolKind,
 };
+pub use ide_diagnostics::{Diagnostic, DiagnosticsConfig, Severity};
 pub use ide_ssr::SsrError;
 pub use syntax::{TextRange, TextSize};
 pub use text_edit::{Indel, TextEdit};
@@ -216,6 +220,7 @@ impl Analysis {
             file_id,
             Edition::Edition2018,
             None,
+            cfg_options.clone(),
             cfg_options,
             Env::default(),
             Default::default(),
@@ -282,20 +287,20 @@ impl Analysis {
         file_id: FileId,
         text_range: Option<TextRange>,
     ) -> Cancellable<String> {
-        self.with_db(|db| syntax_tree::syntax_tree(&db, file_id, text_range))
+        self.with_db(|db| syntax_tree::syntax_tree(db, file_id, text_range))
     }
 
     pub fn view_hir(&self, position: FilePosition) -> Cancellable<String> {
-        self.with_db(|db| view_hir::view_hir(&db, position))
+        self.with_db(|db| view_hir::view_hir(db, position))
     }
 
     pub fn view_item_tree(&self, file_id: FileId) -> Cancellable<String> {
-        self.with_db(|db| view_item_tree::view_item_tree(&db, file_id))
+        self.with_db(|db| view_item_tree::view_item_tree(db, file_id))
     }
 
     /// Renders the crate graph to GraphViz "dot" syntax.
     pub fn view_crate_graph(&self) -> Cancellable<Result<String, String>> {
-        self.with_db(|db| view_crate_graph::view_crate_graph(&db))
+        self.with_db(|db| view_crate_graph::view_crate_graph(db))
     }
 
     pub fn expand_macro(&self, position: FilePosition) -> Cancellable<Option<ExpandedMacro>> {
@@ -315,7 +320,7 @@ impl Analysis {
     /// up minor stuff like continuing the comment.
     /// The edit will be a snippet (with `$0`).
     pub fn on_enter(&self, position: FilePosition) -> Cancellable<Option<TextEdit>> {
-        self.with_db(|db| typing::on_enter(&db, position))
+        self.with_db(|db| typing::on_enter(db, position))
     }
 
     /// Returns an edit which should be applied after a character was typed.
@@ -331,7 +336,7 @@ impl Analysis {
         if !typing::TRIGGER_CHARS.contains(char_typed) {
             return Ok(None);
         }
-        self.with_db(|db| typing::on_char_typed(&db, position, char_typed))
+        self.with_db(|db| typing::on_char_typed(db, position, char_typed))
     }
 
     /// Returns a tree representation of symbols in the file. Useful to draw a
@@ -372,6 +377,14 @@ impl Analysis {
         self.with_db(|db| goto_definition::goto_definition(db, position))
     }
 
+    /// Returns the declaration from the symbol at `position`.
+    pub fn goto_declaration(
+        &self,
+        position: FilePosition,
+    ) -> Cancellable<Option<RangeInfo<Vec<NavigationTarget>>>> {
+        self.with_db(|db| goto_declaration::goto_declaration(db, position))
+    }
+
     /// Returns the impls from the symbol at `position`.
     pub fn goto_implementation(
         &self,
@@ -406,10 +419,9 @@ impl Analysis {
     pub fn hover(
         &self,
         position: FilePosition,
-        links_in_hover: bool,
-        markdown: bool,
+        config: &HoverConfig,
     ) -> Cancellable<Option<RangeInfo<HoverResult>>> {
-        self.with_db(|db| hover::hover(db, position, links_in_hover, markdown))
+        self.with_db(|db| hover::hover(db, position, config))
     }
 
     /// Return URL(s) for the documentation of the symbol under the cursor.
@@ -438,7 +450,7 @@ impl Analysis {
         self.with_db(|db| call_hierarchy::incoming_calls(db, position))
     }
 
-    /// Computes incoming calls for the given file position.
+    /// Computes outgoing calls for the given file position.
     pub fn outgoing_calls(&self, position: FilePosition) -> Cancellable<Option<Vec<CallItem>>> {
         self.with_db(|db| call_hierarchy::outgoing_calls(db, position))
     }
@@ -480,6 +492,14 @@ impl Analysis {
     /// Computes syntax highlighting for the given file
     pub fn highlight(&self, file_id: FileId) -> Cancellable<Vec<HlRange>> {
         self.with_db(|db| syntax_highlighting::highlight(db, file_id, None, false))
+    }
+
+    /// Computes all ranges to highlight for a given item in a file.
+    pub fn highlight_related(
+        &self,
+        position: FilePosition,
+    ) -> Cancellable<Option<Vec<HighlightedRange>>> {
+        self.with_db(|db| highlight_related::highlight_related(&Semantics::new(db), position))
     }
 
     /// Computes syntax highlighting for the given file range.
@@ -536,7 +556,7 @@ impl Analysis {
     ) -> Cancellable<Vec<Assist>> {
         self.with_db(|db| {
             let ssr_assists = ssr::ssr_assists(db, &resolve, frange);
-            let mut acc = Assist::get(db, config, resolve, frange);
+            let mut acc = ide_assists::assists(db, config, resolve, frange);
             acc.extend(ssr_assists.into_iter());
             acc
         })
@@ -549,7 +569,7 @@ impl Analysis {
         resolve: AssistResolveStrategy,
         file_id: FileId,
     ) -> Cancellable<Vec<Diagnostic>> {
-        self.with_db(|db| diagnostics::diagnostics(db, config, &resolve, file_id))
+        self.with_db(|db| ide_diagnostics::diagnostics(db, config, &resolve, file_id))
     }
 
     /// Convenience function to return assists + quick fixes for diagnostics
@@ -566,9 +586,8 @@ impl Analysis {
         };
 
         self.with_db(|db| {
-            let ssr_assists = ssr::ssr_assists(db, &resolve, frange);
             let diagnostic_assists = if include_fixes {
-                diagnostics::diagnostics(db, diagnostics_config, &resolve, frange.file_id)
+                ide_diagnostics::diagnostics(db, diagnostics_config, &resolve, frange.file_id)
                     .into_iter()
                     .flat_map(|it| it.fixes.unwrap_or_default())
                     .filter(|it| it.target.intersect(frange.range).is_some())
@@ -576,10 +595,12 @@ impl Analysis {
             } else {
                 Vec::new()
             };
+            let ssr_assists = ssr::ssr_assists(db, &resolve, frange);
+            let assists = ide_assists::assists(db, assist_config, resolve, frange);
 
-            let mut res = Assist::get(db, assist_config, resolve, frange);
+            let mut res = diagnostic_assists;
             res.extend(ssr_assists.into_iter());
-            res.extend(diagnostic_assists.into_iter());
+            res.extend(assists.into_iter());
 
             res
         })
@@ -592,14 +613,14 @@ impl Analysis {
         position: FilePosition,
         new_name: &str,
     ) -> Cancellable<Result<SourceChange, RenameError>> {
-        self.with_db(|db| references::rename::rename(db, position, new_name))
+        self.with_db(|db| rename::rename(db, position, new_name))
     }
 
     pub fn prepare_rename(
         &self,
         position: FilePosition,
     ) -> Cancellable<Result<RangeInfo<()>, RenameError>> {
-        self.with_db(|db| references::rename::prepare_rename(db, position))
+        self.with_db(|db| rename::prepare_rename(db, position))
     }
 
     pub fn will_rename_file(
@@ -607,7 +628,7 @@ impl Analysis {
         file_id: FileId,
         new_name_stem: &str,
     ) -> Cancellable<Option<SourceChange>> {
-        self.with_db(|db| references::rename::will_rename_file(db, file_id, new_name_stem))
+        self.with_db(|db| rename::will_rename_file(db, file_id, new_name_stem))
     }
 
     pub fn structural_search_replace(

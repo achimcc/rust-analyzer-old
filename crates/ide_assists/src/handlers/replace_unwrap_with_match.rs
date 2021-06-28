@@ -20,17 +20,16 @@ use ide_db::ty_filter::TryEnum;
 // Replaces `unwrap` with a `match` expression. Works for Result and Option.
 //
 // ```
-// enum Result<T, E> { Ok(T), Err(E) }
+// # //- minicore: result
 // fn main() {
-//     let x: Result<i32, i32> = Result::Ok(92);
+//     let x: Result<i32, i32> = Ok(92);
 //     let y = x.$0unwrap();
 // }
 // ```
 // ->
 // ```
-// enum Result<T, E> { Ok(T), Err(E) }
 // fn main() {
-//     let x: Result<i32, i32> = Result::Ok(92);
+//     let x: Result<i32, i32> = Ok(92);
 //     let y = match x {
 //         Ok(it) => it,
 //         $0_ => unreachable!(),
@@ -97,25 +96,24 @@ mod tests {
     fn test_replace_result_unwrap_with_match() {
         check_assist(
             replace_unwrap_with_match,
-            r"
-enum Result<T, E> { Ok(T), Err(E) }
+            r#"
+//- minicore: result
 fn i<T>(a: T) -> T { a }
 fn main() {
-    let x: Result<i32, i32> = Result::Ok(92);
+    let x: Result<i32, i32> = Ok(92);
     let y = i(x).$0unwrap();
 }
-            ",
-            r"
-enum Result<T, E> { Ok(T), Err(E) }
+"#,
+            r#"
 fn i<T>(a: T) -> T { a }
 fn main() {
-    let x: Result<i32, i32> = Result::Ok(92);
+    let x: Result<i32, i32> = Ok(92);
     let y = match i(x) {
         Ok(it) => it,
         $0_ => unreachable!(),
     };
 }
-            ",
+"#,
         )
     }
 
@@ -123,25 +121,24 @@ fn main() {
     fn test_replace_option_unwrap_with_match() {
         check_assist(
             replace_unwrap_with_match,
-            r"
-enum Option<T> { Some(T), None }
+            r#"
+//- minicore: option
 fn i<T>(a: T) -> T { a }
 fn main() {
-    let x = Option::Some(92);
+    let x = Some(92);
     let y = i(x).$0unwrap();
 }
-            ",
-            r"
-enum Option<T> { Some(T), None }
+"#,
+            r#"
 fn i<T>(a: T) -> T { a }
 fn main() {
-    let x = Option::Some(92);
+    let x = Some(92);
     let y = match i(x) {
         Some(it) => it,
         $0_ => unreachable!(),
     };
 }
-            ",
+"#,
         );
     }
 
@@ -149,25 +146,24 @@ fn main() {
     fn test_replace_result_unwrap_with_match_chaining() {
         check_assist(
             replace_unwrap_with_match,
-            r"
-enum Result<T, E> { Ok(T), Err(E) }
+            r#"
+//- minicore: result
 fn i<T>(a: T) -> T { a }
 fn main() {
-    let x: Result<i32, i32> = Result::Ok(92);
+    let x: Result<i32, i32> = Ok(92);
     let y = i(x).$0unwrap().count_zeroes();
 }
-            ",
-            r"
-enum Result<T, E> { Ok(T), Err(E) }
+"#,
+            r#"
 fn i<T>(a: T) -> T { a }
 fn main() {
-    let x: Result<i32, i32> = Result::Ok(92);
+    let x: Result<i32, i32> = Ok(92);
     let y = match i(x) {
         Ok(it) => it,
         $0_ => unreachable!(),
     }.count_zeroes();
 }
-            ",
+"#,
         )
     }
 
@@ -175,14 +171,14 @@ fn main() {
     fn replace_unwrap_with_match_target() {
         check_assist_target(
             replace_unwrap_with_match,
-            r"
-enum Option<T> { Some(T), None }
+            r#"
+//- minicore: option
 fn i<T>(a: T) -> T { a }
 fn main() {
-    let x = Option::Some(92);
+    let x = Some(92);
     let y = i(x).$0unwrap();
 }
-            ",
+"#,
             r"i(x).unwrap()",
         );
     }

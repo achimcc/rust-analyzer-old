@@ -1,30 +1,32 @@
 //! Completion of names from the current scope, e.g. locals and imported items.
 
 use hir::ScopeDef;
+use syntax::{ast, AstNode};
 
-use crate::{CompletionContext, Completions};
+use crate::{patterns::ImmediateLocation, CompletionContext, Completions};
 
 pub(crate) fn complete_unqualified_path(acc: &mut Completions, ctx: &CompletionContext) {
-    if !ctx.is_trivial_path {
-        return;
-    }
-    if ctx.is_path_disallowed() || ctx.expects_item() {
+    if ctx.is_path_disallowed() || !ctx.is_trivial_path() || ctx.has_impl_or_trait_prev_sibling() {
         return;
     }
 
-    if ctx.expects_assoc_item() {
-        ctx.scope.process_all_names(&mut |name, def| {
-            if let ScopeDef::MacroDef(macro_def) = def {
-                acc.add_macro(ctx, Some(name.clone()), macro_def);
+    if ctx.expects_item() || ctx.expects_assoc_item() {
+        // only show macros in {Assoc}ItemList
+        ctx.scope.process_all_names(&mut |name, res| {
+            if let hir::ScopeDef::MacroDef(mac) = res {
+                if mac.is_fn_like() {
+                    acc.add_macro(ctx, Some(name.clone()), mac);
+                }
             }
-            if let ScopeDef::ModuleDef(hir::ModuleDef::Module(_)) = def {
-                acc.add_resolution(ctx, name, &def);
+            if let hir::ScopeDef::ModuleDef(hir::ModuleDef::Module(_)) = res {
+                acc.add_resolution(ctx, name, &res);
             }
         });
         return;
     }
 
-    if ctx.expects_use_tree() {
+    if ctx.in_use_tree() {
+        // only show modules in a fresh UseTree
         cov_mark::hit!(only_completes_modules_in_import);
         ctx.scope.process_all_names(&mut |name, res| {
             if let ScopeDef::ModuleDef(hir::ModuleDef::Module(_)) = res {
@@ -34,20 +36,74 @@ pub(crate) fn complete_unqualified_path(acc: &mut Completions, ctx: &CompletionC
         return;
     }
 
-    if let Some(hir::Adt::Enum(e)) =
-        ctx.expected_type.as_ref().and_then(|ty| ty.strip_references().as_adt())
-    {
-        super::complete_enum_variants(acc, ctx, e, |acc, ctx, variant, path| {
-            acc.add_qualified_enum_variant(ctx, variant, path)
+    if matches!(&ctx.completion_location, Some(ImmediateLocation::TypeBound)) {
+        ctx.scope.process_all_names(&mut |name, res| {
+            let add_resolution = match res {
+                ScopeDef::MacroDef(mac) => mac.is_fn_like(),
+                ScopeDef::ModuleDef(hir::ModuleDef::Trait(_) | hir::ModuleDef::Module(_)) => true,
+                _ => false,
+            };
+            if add_resolution {
+                acc.add_resolution(ctx, name, &res);
+            }
         });
+        return;
+    }
+
+    if !ctx.expects_type() {
+        if let Some(hir::Adt::Enum(e)) =
+            ctx.expected_type.as_ref().and_then(|ty| ty.strip_references().as_adt())
+        {
+            super::enum_variants_with_paths(acc, ctx, e, |acc, ctx, variant, path| {
+                acc.add_qualified_enum_variant(ctx, variant, path)
+            });
+        }
+    }
+
+    if let Some(ImmediateLocation::GenericArgList(arg_list)) = &ctx.completion_location {
+        if let Some(path_seg) = arg_list.syntax().parent().and_then(ast::PathSegment::cast) {
+            if let Some(hir::PathResolution::Def(hir::ModuleDef::Trait(trait_))) =
+                ctx.sema.resolve_path(&path_seg.parent_path())
+            {
+                trait_.items(ctx.sema.db).into_iter().for_each(|it| {
+                    if let hir::AssocItem::TypeAlias(alias) = it {
+                        acc.add_type_alias_with_eq(ctx, alias)
+                    }
+                });
+            }
+        }
     }
 
     ctx.scope.process_all_names(&mut |name, res| {
-        if let ScopeDef::GenericParam(hir::GenericParam::LifetimeParam(_)) = res {
+        if let ScopeDef::GenericParam(hir::GenericParam::LifetimeParam(_)) | ScopeDef::Label(_) =
+            res
+        {
             cov_mark::hit!(skip_lifetime_completion);
             return;
         }
-        acc.add_resolution(ctx, name, &res);
+        let add_resolution = match res {
+            ScopeDef::ImplSelfType(_) => {
+                !ctx.previous_token_is(syntax::T![impl]) && !ctx.previous_token_is(syntax::T![for])
+            }
+            // Don't suggest attribute macros and derives.
+            ScopeDef::MacroDef(mac) => mac.is_fn_like(),
+            // no values in type places
+            ScopeDef::ModuleDef(
+                hir::ModuleDef::Function(_)
+                | hir::ModuleDef::Variant(_)
+                | hir::ModuleDef::Static(_),
+            )
+            | ScopeDef::Local(_) => !ctx.expects_type(),
+            // unless its a constant in a generic arg list position
+            ScopeDef::ModuleDef(hir::ModuleDef::Const(_))
+            | ScopeDef::GenericParam(hir::GenericParam::ConstParam(_)) => {
+                !ctx.expects_type() || ctx.expects_generic_arg()
+            }
+            _ => true,
+        };
+        if add_resolution {
+            acc.add_resolution(ctx, name, &res);
+        }
     });
 }
 
@@ -56,7 +112,7 @@ mod tests {
     use expect_test::{expect, Expect};
 
     use crate::{
-        test_utils::{check_edit, completion_list_with_config, TEST_CONFIG},
+        tests::{check_edit, filtered_completion_list_with_config, TEST_CONFIG},
         CompletionConfig, CompletionKind,
     };
 
@@ -65,74 +121,9 @@ mod tests {
     }
 
     fn check_with_config(config: CompletionConfig, ra_fixture: &str, expect: Expect) {
-        let actual = completion_list_with_config(config, ra_fixture, CompletionKind::Reference);
+        let actual =
+            filtered_completion_list_with_config(config, ra_fixture, CompletionKind::Reference);
         expect.assert_eq(&actual)
-    }
-
-    #[test]
-    fn only_completes_modules_in_import() {
-        cov_mark::check!(only_completes_modules_in_import);
-        check(
-            r#"
-use f$0
-
-struct Foo;
-mod foo {}
-"#,
-            expect![[r#"
-                md foo
-            "#]],
-        );
-    }
-
-    #[test]
-    fn bind_pat_and_path_ignore_at() {
-        check(
-            r#"
-enum Enum { A, B }
-fn quux(x: Option<Enum>) {
-    match x {
-        None => (),
-        Some(en$0 @ Enum::A) => (),
-    }
-}
-"#,
-            expect![[r#""#]],
-        );
-    }
-
-    #[test]
-    fn bind_pat_and_path_ignore_ref() {
-        check(
-            r#"
-enum Enum { A, B }
-fn quux(x: Option<Enum>) {
-    match x {
-        None => (),
-        Some(ref en$0) => (),
-    }
-}
-"#,
-            expect![[r#""#]],
-        );
-    }
-
-    #[test]
-    fn bind_pat_and_path() {
-        check(
-            r#"
-enum Enum { A, B }
-fn quux(x: Option<Enum>) {
-    match x {
-        None => (),
-        Some(En$0) => (),
-    }
-}
-"#,
-            expect![[r#"
-                en Enum
-            "#]],
-        );
     }
 
     #[test]
@@ -240,29 +231,6 @@ fn main() {
     }
 
     #[test]
-    fn completes_generic_params_in_struct() {
-        check(
-            r#"struct S<T> { x: $0}"#,
-            expect![[r#"
-                sp Self
-                tp T
-                st S<…>
-            "#]],
-        );
-    }
-
-    #[test]
-    fn completes_self_in_enum() {
-        check(
-            r#"enum X { Y($0) }"#,
-            expect![[r#"
-                sp Self
-                en X
-            "#]],
-        );
-    }
-
-    #[test]
     fn completes_module_items() {
         check(
             r#"
@@ -299,22 +267,6 @@ fn _alpha() {}
     }
 
     #[test]
-    fn completes_extern_prelude() {
-        check(
-            r#"
-//- /lib.rs crate:main deps:other_crate
-use $0;
-
-//- /other_crate/lib.rs crate:other_crate
-// nothing here
-"#,
-            expect![[r#"
-                md other_crate
-            "#]],
-        );
-    }
-
-    #[test]
     fn completes_module_items_in_nested_modules() {
         check(
             r#"
@@ -327,20 +279,6 @@ mod m {
             expect![[r#"
                 fn quux() fn()
                 st Bar
-            "#]],
-        );
-    }
-
-    #[test]
-    fn completes_return_type() {
-        check(
-            r#"
-struct Foo;
-fn x() -> $0
-"#,
-            expect![[r#"
-                st Foo
-                fn x() fn()
             "#]],
         );
     }
@@ -392,7 +330,6 @@ pub mod prelude {
 }
 "#,
             expect![[r#"
-                fn foo()  fn()
                 md std
                 st Option
             "#]],
@@ -428,6 +365,32 @@ mod macros {
     }
 
     #[test]
+    fn does_not_complete_non_fn_macros() {
+        check(
+            r#"
+#[rustc_builtin_macro]
+pub macro Clone {}
+
+fn f() {$0}
+"#,
+            expect![[r#"
+                fn f() fn()
+            "#]],
+        );
+        check(
+            r#"
+#[rustc_builtin_macro]
+pub macro bench {}
+
+fn f() {$0}
+"#,
+            expect![[r#"
+                fn f() fn()
+            "#]],
+        );
+    }
+
+    #[test]
     fn completes_std_prelude_if_core_is_defined() {
         check(
             r#"
@@ -449,7 +412,6 @@ pub mod prelude {
 }
 "#,
             expect![[r#"
-                fn foo()  fn()
                 md std
                 md core
                 st String
@@ -497,20 +459,6 @@ fn foo() { $0 }
 "#,
             expect![[r#"
                 fn foo()   fn()
-                ma foo!(…) macro_rules! foo
-            "#]],
-        );
-    }
-
-    #[test]
-    fn completes_macros_as_type() {
-        check(
-            r#"
-macro_rules! foo { () => {} }
-fn main() { let x: $0 }
-"#,
-            expect![[r#"
-                fn main()  fn()
                 ma foo!(…) macro_rules! foo
             "#]],
         );
@@ -659,60 +607,6 @@ struct Foo;
 fn f() {}
 "#,
             expect![[""]],
-        )
-    }
-
-    #[test]
-    fn completes_target_type_or_trait_in_impl_block() {
-        check(
-            r#"
-trait MyTrait {}
-struct MyStruct {}
-
-impl My$0
-"#,
-            expect![[r#"
-                sp Self
-                tt MyTrait
-                st MyStruct
-            "#]],
-        )
-    }
-
-    #[test]
-    fn completes_in_assoc_item_list() {
-        check(
-            r#"
-macro_rules! foo {}
-mod bar {}
-
-struct MyStruct {}
-impl MyStruct {
-    $0
-}
-"#,
-            expect![[r#"
-                md bar
-                ma foo! macro_rules! foo
-            "#]],
-        )
-    }
-
-    // FIXME: The completions here currently come from `macro_in_item_position`, but they shouldn't
-    #[test]
-    fn completes_in_item_list() {
-        check(
-            r#"
-struct MyStruct {}
-macro_rules! foo {}
-mod bar {}
-
-$0
-"#,
-            expect![[r#"
-                md bar
-                ma foo!(…) macro_rules! foo
-            "#]],
         )
     }
 }

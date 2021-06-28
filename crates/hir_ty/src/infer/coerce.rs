@@ -2,8 +2,8 @@
 //! happen in certain places, e.g. weakening `&mut` to `&` or deref coercions
 //! like going from `&Vec<T>` to `&[T]`.
 //!
-//! See https://doc.rust-lang.org/nomicon/coercions.html and
-//! librustc_typeck/check/coercion.rs.
+//! See <https://doc.rust-lang.org/nomicon/coercions.html> and
+//! `librustc_typeck/check/coercion.rs`.
 
 use chalk_ir::{cast::Cast, Mutability, TyVariableKind};
 use hir_def::{expr::ExprId, lang_item::LangItemTarget};
@@ -47,10 +47,7 @@ impl<'a> InferenceContext<'a> {
         // pointers to have a chance at getting a match. See
         // https://github.com/rust-lang/rust/blob/7b805396bf46dce972692a6846ce2ad8481c5f85/src/librustc_typeck/check/coercion.rs#L877-L916
         let sig = match (ty1.kind(&Interner), ty2.kind(&Interner)) {
-            (TyKind::FnDef(..), TyKind::FnDef(..))
-            | (TyKind::Closure(..), TyKind::FnDef(..))
-            | (TyKind::FnDef(..), TyKind::Closure(..))
-            | (TyKind::Closure(..), TyKind::Closure(..)) => {
+            (TyKind::FnDef(..) | TyKind::Closure(..), TyKind::FnDef(..) | TyKind::Closure(..)) => {
                 // FIXME: we're ignoring safety here. To be more correct, if we have one FnDef and one Closure,
                 // we should be coercing the closure to a fn pointer of the safety of the FnDef
                 cov_mark::hit!(coerce_fn_reification);
@@ -109,7 +106,7 @@ impl<'a> InferenceContext<'a> {
         }
 
         // Consider coercing the subtype to a DST
-        if let Ok(ret) = self.try_coerce_unsized(&from_ty, &to_ty) {
+        if let Ok(ret) = self.try_coerce_unsized(&from_ty, to_ty) {
             return Ok(ret);
         }
 
@@ -331,7 +328,7 @@ impl<'a> InferenceContext<'a> {
 
     /// Coerce a type using `from_ty: CoerceUnsized<ty_ty>`
     ///
-    /// See: https://doc.rust-lang.org/nightly/std/marker/trait.CoerceUnsized.html
+    /// See: <https://doc.rust-lang.org/nightly/std/marker/trait.CoerceUnsized.html>
     fn try_coerce_unsized(&mut self, from_ty: &Ty, to_ty: &Ty) -> InferResult {
         // These 'if' statements require some explanation.
         // The `CoerceUnsized` trait is special - it is only
@@ -448,8 +445,7 @@ fn safe_to_unsafe_fn_ty(fn_ty: FnPointer) -> FnPointer {
 
 fn coerce_mutabilities(from: Mutability, to: Mutability) -> Result<(), TypeError> {
     match (from, to) {
-        (Mutability::Mut, Mutability::Mut)
-        | (Mutability::Mut, Mutability::Not)
+        (Mutability::Mut, Mutability::Mut | Mutability::Not)
         | (Mutability::Not, Mutability::Not) => Ok(()),
         (Mutability::Not, Mutability::Mut) => Err(TypeError),
     }

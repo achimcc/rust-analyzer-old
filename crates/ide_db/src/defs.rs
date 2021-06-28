@@ -43,13 +43,29 @@ impl Definition {
 
     pub fn visibility(&self, db: &RootDatabase) -> Option<Visibility> {
         match self {
-            Definition::Macro(_) => None,
             Definition::Field(sf) => Some(sf.visibility(db)),
-            Definition::ModuleDef(def) => def.definition_visibility(db),
-            Definition::SelfType(_) => None,
-            Definition::Local(_) => None,
-            Definition::GenericParam(_) => None,
-            Definition::Label(_) => None,
+            Definition::ModuleDef(def) => match def {
+                ModuleDef::Module(it) => {
+                    // FIXME: should work like other cases here.
+                    let parent = it.parent(db)?;
+                    parent.visibility_of(db, def)
+                }
+                ModuleDef::Function(it) => Some(it.visibility(db)),
+                ModuleDef::Adt(it) => Some(it.visibility(db)),
+                ModuleDef::Const(it) => Some(it.visibility(db)),
+                ModuleDef::Static(it) => Some(it.visibility(db)),
+                ModuleDef::Trait(it) => Some(it.visibility(db)),
+                ModuleDef::TypeAlias(it) => Some(it.visibility(db)),
+                // NB: Variants don't have their own visibility, and just inherit
+                // one from the parent. Not sure if that's the right thing to do.
+                ModuleDef::Variant(it) => Some(it.parent_enum(db).visibility(db)),
+                ModuleDef::BuiltinType(_) => None,
+            },
+            Definition::Macro(_)
+            | Definition::SelfType(_)
+            | Definition::Local(_)
+            | Definition::GenericParam(_)
+            | Definition::Label(_) => None,
         }
     }
 
@@ -357,9 +373,9 @@ impl NameRefClass {
             }
         }
 
-        if let Some(macro_call) = parent.ancestors().find_map(ast::MacroCall::cast) {
-            if let Some(path) = macro_call.path() {
-                if path.qualifier().is_none() {
+        if let Some(path) = name_ref.syntax().ancestors().find_map(ast::Path::cast) {
+            if path.qualifier().is_none() {
+                if let Some(macro_call) = path.syntax().parent().and_then(ast::MacroCall::cast) {
                     // Only use this to resolve single-segment macro calls like `foo!()`. Multi-segment
                     // paths are handled below (allowing `log$0::info!` to resolve to the log crate).
                     if let Some(macro_def) = sema.resolve_macro_call(&macro_call) {
@@ -367,11 +383,9 @@ impl NameRefClass {
                     }
                 }
             }
-        }
 
-        if let Some(path) = name_ref.syntax().ancestors().find_map(ast::Path::cast) {
             if let Some(resolved) = sema.resolve_path(&path) {
-                if path.syntax().parent().and_then(ast::Attr::cast).is_some() {
+                if path.syntax().ancestors().find_map(ast::Attr::cast).is_some() {
                     if let PathResolution::Def(ModuleDef::Function(func)) = resolved {
                         if func.attrs(sema.db).by_key("proc_macro_attribute").exists() {
                             return Some(NameRefClass::Definition(resolved.into()));

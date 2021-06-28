@@ -202,7 +202,7 @@ impl ExtendedEnum {
     fn variants(self, db: &RootDatabase) -> Vec<ExtendedVariant> {
         match self {
             ExtendedEnum::Enum(e) => {
-                e.variants(db).into_iter().map(|x| ExtendedVariant::Variant(x)).collect::<Vec<_>>()
+                e.variants(db).into_iter().map(ExtendedVariant::Variant).collect::<Vec<_>>()
             }
             ExtendedEnum::Bool => {
                 Vec::<ExtendedVariant>::from([ExtendedVariant::True, ExtendedVariant::False])
@@ -212,7 +212,7 @@ impl ExtendedEnum {
 }
 
 fn resolve_enum_def(sema: &Semantics<RootDatabase>, expr: &ast::Expr) -> Option<ExtendedEnum> {
-    sema.type_of_expr(&expr)?.autoderef(sema.db).find_map(|ty| match ty.as_adt() {
+    sema.type_of_expr(expr)?.autoderef(sema.db).find_map(|ty| match ty.as_adt() {
         Some(Adt::Enum(e)) => Some(ExtendedEnum::Enum(e)),
         _ => {
             if ty.is_bool() {
@@ -228,7 +228,7 @@ fn resolve_tuple_of_enum_def(
     sema: &Semantics<RootDatabase>,
     expr: &ast::Expr,
 ) -> Option<Vec<ExtendedEnum>> {
-    sema.type_of_expr(&expr)?
+    sema.type_of_expr(expr)?
         .tuple_fields(sema.db)
         .iter()
         .map(|ty| {
@@ -278,8 +278,6 @@ fn build_pat(db: &RootDatabase, module: hir::Module, var: ExtendedVariant) -> Op
 
 #[cfg(test)]
 mod tests {
-    use ide_db::helpers::FamousDefs;
-
     use crate::tests::{
         check_assist, check_assist_not_applicable, check_assist_target, check_assist_unresolved,
     };
@@ -483,26 +481,21 @@ fn main() {
         check_assist(
             fill_match_arms,
             r#"
-enum Option<T> { Some(T), None }
-use Option::*;
-
+//- minicore: option
 fn main() {
     match None$0 {
         None => {}
     }
 }
-            "#,
+"#,
             r#"
-enum Option<T> { Some(T), None }
-use Option::*;
-
 fn main() {
     match None {
         None => {}
         Some(${0:_}) => todo!(),
     }
 }
-            "#,
+"#,
         );
     }
 
@@ -716,7 +709,10 @@ fn main() {
 
     #[test]
     fn fill_match_arms_tuple_of_enum_partial_with_wildcards() {
-        let ra_fixture = r#"
+        check_assist(
+            fill_match_arms,
+            r#"
+//- minicore: option
 fn main() {
     let a = Some(1);
     let b = Some(());
@@ -725,10 +721,7 @@ fn main() {
         (None, Some(_)) => {}
     }
 }
-"#;
-        check_assist(
-            fill_match_arms,
-            &format!("//- /main.rs crate:main deps:core{}{}", ra_fixture, FamousDefs::FIXTURE),
+"#,
             r#"
 fn main() {
     let a = Some(1);
@@ -746,17 +739,17 @@ fn main() {
     #[test]
     fn fill_match_arms_partial_with_deep_pattern() {
         // Fixme: cannot handle deep patterns
-        let ra_fixture = r#"
+        check_assist_not_applicable(
+            fill_match_arms,
+            r#"
+//- minicore: option
 fn main() {
     match $0Some(true) {
         Some(true) => {}
         None => {}
     }
 }
-"#;
-        check_assist_not_applicable(
-            fill_match_arms,
-            &format!("//- /main.rs crate:main deps:core{}{}", ra_fixture, FamousDefs::FIXTURE),
+"#,
         );
     }
 
@@ -1007,17 +1000,15 @@ fn foo(a: A) {
     #[test]
     fn option_order() {
         cov_mark::check!(option_order);
-        let before = r#"
+        check_assist(
+            fill_match_arms,
+            r#"
+//- minicore: option
 fn foo(opt: Option<i32>) {
     match opt$0 {
     }
 }
-"#;
-        let before = &format!("//- /main.rs crate:main deps:core{}{}", before, FamousDefs::FIXTURE);
-
-        check_assist(
-            fill_match_arms,
-            before,
+"#,
             r#"
 fn foo(opt: Option<i32>) {
     match opt {

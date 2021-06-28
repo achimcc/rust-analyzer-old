@@ -8,6 +8,7 @@ pub mod db;
 pub mod ast_id_map;
 pub mod name;
 pub mod hygiene;
+pub mod builtin_attr;
 pub mod builtin_derive;
 pub mod builtin_macro;
 pub mod proc_macro;
@@ -32,6 +33,7 @@ use syntax::{
 };
 
 use crate::ast_id_map::FileAstId;
+use crate::builtin_attr::BuiltinAttrExpander;
 use crate::builtin_derive::BuiltinDeriveExpander;
 use crate::builtin_macro::{BuiltinFnLikeExpander, EagerExpander};
 use crate::proc_macro::ProcMacroExpander;
@@ -51,7 +53,7 @@ mod test_db;
 /// this is a recursive definition! However, the size_of of `HirFileId` is
 /// finite (because everything bottoms out at the real `FileId`) and small
 /// (`MacroCallId` uses the location interning. You can check details here:
-/// https://en.wikipedia.org/wiki/String_interning).
+/// <https://en.wikipedia.org/wiki/String_interning>).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HirFileId(HirFileIdRepr);
 
@@ -206,6 +208,7 @@ impl MacroDefId {
         let id = match &self.kind {
             MacroDefKind::Declarative(id) => id,
             MacroDefKind::BuiltIn(_, id) => id,
+            MacroDefKind::BuiltInAttr(_, id) => id,
             MacroDefKind::BuiltInDerive(_, id) => id,
             MacroDefKind::BuiltInEager(_, id) => id,
             MacroDefKind::ProcMacro(.., id) => return Either::Right(*id),
@@ -223,6 +226,7 @@ pub enum MacroDefKind {
     Declarative(AstId<ast::Macro>),
     BuiltIn(BuiltinFnLikeExpander, AstId<ast::Macro>),
     // FIXME: maybe just Builtin and rename BuiltinFnLikeExpander to BuiltinExpander
+    BuiltInAttr(BuiltinAttrExpander, AstId<ast::Macro>),
     BuiltInDerive(BuiltinDeriveExpander, AstId<ast::Macro>),
     BuiltInEager(EagerExpander, AstId<ast::Macro>),
     ProcMacro(ProcMacroExpander, ProcMacroKind, AstId<ast::Fn>),
@@ -364,10 +368,11 @@ impl ExpansionInfo {
         let (token_map, tt) = match origin {
             mbe::Origin::Call => (&self.macro_arg.1, self.arg.clone()),
             mbe::Origin::Def => match (&*self.macro_def, self.def.as_ref()) {
-                (db::TokenExpander::MacroRules { def_site_token_map, .. }, Some(tt))
-                | (db::TokenExpander::MacroDef { def_site_token_map, .. }, Some(tt)) => {
-                    (def_site_token_map, tt.as_ref().map(|tt| tt.syntax().clone()))
-                }
+                (
+                    db::TokenExpander::MacroRules { def_site_token_map, .. }
+                    | db::TokenExpander::MacroDef { def_site_token_map, .. },
+                    Some(tt),
+                ) => (def_site_token_map, tt.as_ref().map(|tt| tt.syntax().clone())),
                 _ => panic!("`Origin::Def` used with non-`macro_rules!` macro"),
             },
         };

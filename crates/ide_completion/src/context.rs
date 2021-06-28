@@ -29,6 +29,36 @@ pub(crate) enum PatternRefutability {
     Irrefutable,
 }
 
+#[derive(Debug)]
+pub(super) enum PathKind {
+    Expr,
+    Type,
+}
+
+#[derive(Debug)]
+pub(crate) struct PathCompletionContext {
+    /// If this is a call with () already there
+    call_kind: Option<CallKind>,
+    /// A single-indent path, like `foo`. `::foo` should not be considered a trivial path.
+    pub(super) is_trivial_path: bool,
+    /// If not a trivial path, the prefix (qualifier).
+    pub(super) qualifier: Option<ast::Path>,
+    /// Whether the qualifier comes from a use tree parent or not
+    pub(super) use_tree_parent: bool,
+    pub(super) kind: Option<PathKind>,
+    /// Whether the path segment has type args or not.
+    pub(super) has_type_args: bool,
+    /// `true` if we are a statement or a last expr in the block.
+    pub(super) can_be_stmt: bool,
+    pub(super) in_loop_body: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CallKind {
+    Pat,
+    Mac,
+    Expr,
+}
 /// `CompletionContext` is created early during completion to figure out, where
 /// exactly is the cursor, syntax-wise.
 #[derive(Debug)]
@@ -45,14 +75,12 @@ pub(crate) struct CompletionContext<'a> {
     pub(super) krate: Option<hir::Crate>,
     pub(super) expected_name: Option<NameOrNameRef>,
     pub(super) expected_type: Option<Type>,
-    pub(super) name_ref_syntax: Option<ast::NameRef>,
-
-    pub(super) use_item_syntax: Option<ast::Use>,
 
     /// The parent function of the cursor position if it exists.
     pub(super) function_def: Option<ast::Fn>,
     /// The parent impl of the cursor position if it exists.
     pub(super) impl_def: Option<ast::Impl>,
+    pub(super) name_ref_syntax: Option<ast::NameRef>,
 
     // potentially set if we are completing a lifetime
     pub(super) lifetime_syntax: Option<ast::Lifetime>,
@@ -67,29 +95,12 @@ pub(crate) struct CompletionContext<'a> {
     pub(super) completion_location: Option<ImmediateLocation>,
     pub(super) prev_sibling: Option<ImmediatePrevSibling>,
     pub(super) attribute_under_caret: Option<ast::Attr>,
+    pub(super) previous_token: Option<SyntaxToken>,
 
-    /// FIXME: `ActiveParameter` is string-based, which is very very wrong
+    pub(super) path_context: Option<PathCompletionContext>,
     pub(super) active_parameter: Option<ActiveParameter>,
-    /// A single-indent path, like `foo`. `::foo` should not be considered a trivial path.
-    pub(super) is_trivial_path: bool,
-    /// If not a trivial path, the prefix (qualifier).
-    pub(super) path_qual: Option<ast::Path>,
-    /// `true` if we are a statement or a last expr in the block.
-    pub(super) can_be_stmt: bool,
-    /// `true` if we expect an expression at the cursor position.
-    pub(super) is_expr: bool,
-    /// If this is a call (method or function) in particular, i.e. the () are already there.
-    pub(super) is_call: bool,
-    /// Like `is_call`, but for tuple patterns.
-    pub(super) is_pattern_call: bool,
-    /// If this is a macro call, i.e. the () are already there.
-    pub(super) is_macro_call: bool,
-    pub(super) is_path_type: bool,
-    pub(super) has_type_args: bool,
     pub(super) locals: Vec<(String, Local)>,
 
-    pub(super) previous_token: Option<SyntaxToken>,
-    pub(super) in_loop_body: bool,
     pub(super) incomplete_let: bool,
 
     no_completion_required: bool,
@@ -136,36 +147,26 @@ impl<'a> CompletionContext<'a> {
             original_token,
             token,
             krate,
-            lifetime_allowed: false,
             expected_name: None,
             expected_type: None,
+            function_def: None,
+            impl_def: None,
             name_ref_syntax: None,
             lifetime_syntax: None,
             lifetime_param_syntax: None,
-            function_def: None,
-            use_item_syntax: None,
-            impl_def: None,
-            active_parameter: ActiveParameter::at(db, position),
+            lifetime_allowed: false,
             is_label_ref: false,
-            is_param: false,
             is_pat_or_const: None,
-            is_trivial_path: false,
-            path_qual: None,
-            can_be_stmt: false,
-            is_expr: false,
-            is_call: false,
-            is_pattern_call: false,
-            is_macro_call: false,
-            is_path_type: false,
-            has_type_args: false,
-            previous_token: None,
-            in_loop_body: false,
+            is_param: false,
             completion_location: None,
             prev_sibling: None,
-            no_completion_required: false,
-            incomplete_let: false,
             attribute_under_caret: None,
+            previous_token: None,
+            path_context: None,
+            active_parameter: ActiveParameter::at(db, position),
             locals,
+            incomplete_let: false,
+            no_completion_required: false,
         };
 
         let mut original_file = original_file.syntax().clone();
@@ -241,30 +242,25 @@ impl<'a> CompletionContext<'a> {
     }
 
     pub(crate) fn expects_assoc_item(&self) -> bool {
-        matches!(
-            self.completion_location,
-            Some(ImmediateLocation::Trait) | Some(ImmediateLocation::Impl)
-        )
+        matches!(self.completion_location, Some(ImmediateLocation::Trait | ImmediateLocation::Impl))
     }
 
     pub(crate) fn has_dot_receiver(&self) -> bool {
         matches!(
             &self.completion_location,
-            Some(ImmediateLocation::FieldAccess { receiver, .. }) | Some(ImmediateLocation::MethodCall { receiver })
+            Some(ImmediateLocation::FieldAccess { receiver, .. } | ImmediateLocation::MethodCall { receiver,.. })
                 if receiver.is_some()
         )
     }
 
     pub(crate) fn dot_receiver(&self) -> Option<&ast::Expr> {
         match &self.completion_location {
-            Some(ImmediateLocation::MethodCall { receiver })
-            | Some(ImmediateLocation::FieldAccess { receiver, .. }) => receiver.as_ref(),
+            Some(
+                ImmediateLocation::MethodCall { receiver, .. }
+                | ImmediateLocation::FieldAccess { receiver, .. },
+            ) => receiver.as_ref(),
             _ => None,
         }
-    }
-
-    pub(crate) fn expects_use_tree(&self) -> bool {
-        matches!(self.completion_location, Some(ImmediateLocation::Use))
     }
 
     pub(crate) fn expects_non_trait_assoc_item(&self) -> bool {
@@ -275,9 +271,8 @@ impl<'a> CompletionContext<'a> {
         matches!(self.completion_location, Some(ImmediateLocation::ItemList))
     }
 
-    //         fn expects_value(&self) -> bool {
-    pub(crate) fn expects_expression(&self) -> bool {
-        self.is_expr
+    pub(crate) fn expects_generic_arg(&self) -> bool {
+        matches!(self.completion_location, Some(ImmediateLocation::GenericArgList(_)))
     }
 
     pub(crate) fn has_block_expr_parent(&self) -> bool {
@@ -287,19 +282,37 @@ impl<'a> CompletionContext<'a> {
     pub(crate) fn expects_ident_pat_or_ref_expr(&self) -> bool {
         matches!(
             self.completion_location,
-            Some(ImmediateLocation::IdentPat) | Some(ImmediateLocation::RefExpr)
+            Some(ImmediateLocation::IdentPat | ImmediateLocation::RefExpr)
         )
     }
 
-    pub(crate) fn expect_record_field(&self) -> bool {
-        matches!(self.completion_location, Some(ImmediateLocation::RecordField))
+    pub(crate) fn expect_field(&self) -> bool {
+        matches!(
+            self.completion_location,
+            Some(ImmediateLocation::RecordField | ImmediateLocation::TupleField)
+        )
+    }
+
+    pub(crate) fn in_use_tree(&self) -> bool {
+        matches!(
+            self.completion_location,
+            Some(ImmediateLocation::Use | ImmediateLocation::UseTree)
+        )
     }
 
     pub(crate) fn has_impl_or_trait_prev_sibling(&self) -> bool {
         matches!(
             self.prev_sibling,
-            Some(ImmediatePrevSibling::ImplDefType) | Some(ImmediatePrevSibling::TraitDefName)
+            Some(ImmediatePrevSibling::ImplDefType | ImmediatePrevSibling::TraitDefName)
         )
+    }
+
+    pub(crate) fn has_impl_prev_sibling(&self) -> bool {
+        matches!(self.prev_sibling, Some(ImmediatePrevSibling::ImplDefType))
+    }
+
+    pub(crate) fn has_visibility_prev_sibling(&self) -> bool {
+        matches!(self.prev_sibling, Some(ImmediatePrevSibling::Visibility))
     }
 
     pub(crate) fn after_if(&self) -> bool {
@@ -307,13 +320,41 @@ impl<'a> CompletionContext<'a> {
     }
 
     pub(crate) fn is_path_disallowed(&self) -> bool {
-        matches!(
-            self.completion_location,
-            Some(ImmediateLocation::Attribute(_))
-                | Some(ImmediateLocation::ModDeclaration(_))
-                | Some(ImmediateLocation::RecordPat(_))
-                | Some(ImmediateLocation::RecordExpr(_))
-        ) || self.attribute_under_caret.is_some()
+        self.attribute_under_caret.is_some()
+            || self.previous_token_is(T![unsafe])
+            || matches!(
+                self.prev_sibling,
+                Some(ImmediatePrevSibling::Attribute | ImmediatePrevSibling::Visibility)
+            )
+            || matches!(
+                self.completion_location,
+                Some(
+                    ImmediateLocation::Attribute(_)
+                        | ImmediateLocation::ModDeclaration(_)
+                        | ImmediateLocation::RecordPat(_)
+                        | ImmediateLocation::RecordExpr(_)
+                )
+            )
+    }
+
+    pub(crate) fn expects_expression(&self) -> bool {
+        matches!(self.path_context, Some(PathCompletionContext { kind: Some(PathKind::Expr), .. }))
+    }
+
+    pub(crate) fn expects_type(&self) -> bool {
+        matches!(self.path_context, Some(PathCompletionContext { kind: Some(PathKind::Type), .. }))
+    }
+
+    pub(crate) fn path_call_kind(&self) -> Option<CallKind> {
+        self.path_context.as_ref().and_then(|it| it.call_kind)
+    }
+
+    pub(crate) fn is_trivial_path(&self) -> bool {
+        matches!(self.path_context, Some(PathCompletionContext { is_trivial_path: true, .. }))
+    }
+
+    pub(crate) fn path_qual(&self) -> Option<&ast::Path> {
+        self.path_context.as_ref().and_then(|it| it.qualifier.as_ref())
     }
 
     fn fill_impl_def(&mut self) {
@@ -347,14 +388,19 @@ impl<'a> CompletionContext<'a> {
                         (ty, name)
                     },
                     ast::ArgList(_it) => {
-                        cov_mark::hit!(expected_type_fn_param_with_leading_char);
-                        cov_mark::hit!(expected_type_fn_param_without_leading_char);
+                        cov_mark::hit!(expected_type_fn_param);
                         ActiveParameter::at_token(
                             &self.sema,
                             self.token.clone(),
                         ).map(|ap| {
                             let name = ap.ident().map(NameOrNameRef::Name);
-                            (Some(ap.ty), name)
+                            let ty = if has_ref(&self.token) {
+                                cov_mark::hit!(expected_type_fn_param_ref);
+                                ap.ty.remove_ref()
+                            } else {
+                                Some(ap.ty)
+                            };
+                            (ty, name)
                         })
                         .unwrap_or((None, None))
                     },
@@ -364,7 +410,7 @@ impl<'a> CompletionContext<'a> {
                         (|| {
                             let expr_field = self.token.prev_sibling_or_token()?
                                       .into_node()
-                                      .and_then(|node| ast::RecordExprField::cast(node))?;
+                                      .and_then(ast::RecordExprField::cast)?;
                             let (_, _, ty) = self.sema.resolve_record_field(&expr_field)?;
                             Some((
                                 Some(ty),
@@ -441,7 +487,6 @@ impl<'a> CompletionContext<'a> {
             let for_is_prev2 = for_is_prev2(syntax_element.clone());
             (fn_is_prev && !inside_impl_trait_block) || for_is_prev2
         };
-        self.in_loop_body = is_in_loop_body(syntax_element.clone());
 
         self.incomplete_let =
             syntax_element.ancestors().take(6).find_map(ast::LetStmt::cast).map_or(false, |it| {
@@ -452,7 +497,7 @@ impl<'a> CompletionContext<'a> {
         self.expected_type = expected_type;
         self.expected_name = expected_name;
 
-        let name_like = match find_node_at_offset(&&file_with_fake_ident, offset) {
+        let name_like = match find_node_at_offset(&file_with_fake_ident, offset) {
             Some(it) => it,
             None => return,
         };
@@ -549,13 +594,6 @@ impl<'a> CompletionContext<'a> {
         self.name_ref_syntax =
             find_node_at_offset(original_file, name_ref.syntax().text_range().start());
 
-        if matches!(self.completion_location, Some(ImmediateLocation::ItemList)) {
-            return;
-        }
-
-        self.use_item_syntax =
-            self.sema.token_ancestors_with_macros(self.token.clone()).find_map(ast::Use::cast);
-
         self.function_def = self
             .sema
             .token_ancestors_with_macros(self.token.clone())
@@ -568,22 +606,44 @@ impl<'a> CompletionContext<'a> {
         };
 
         if let Some(segment) = ast::PathSegment::cast(parent) {
+            let path_ctx = self.path_context.get_or_insert(PathCompletionContext {
+                call_kind: None,
+                is_trivial_path: false,
+                qualifier: None,
+                has_type_args: false,
+                can_be_stmt: false,
+                in_loop_body: false,
+                use_tree_parent: false,
+                kind: None,
+            });
+            path_ctx.in_loop_body = is_in_loop_body(name_ref.syntax());
             let path = segment.parent_path();
-            self.is_call = path
-                .syntax()
-                .parent()
-                .and_then(ast::PathExpr::cast)
-                .and_then(|it| it.syntax().parent().and_then(ast::CallExpr::cast))
-                .is_some();
-            self.is_macro_call = path.syntax().parent().and_then(ast::MacroCall::cast).is_some();
-            self.is_pattern_call =
-                path.syntax().parent().and_then(ast::TupleStructPat::cast).is_some();
 
-            self.is_path_type = path.syntax().parent().and_then(ast::PathType::cast).is_some();
-            self.has_type_args = segment.generic_arg_list().is_some();
+            if let Some(p) = path.syntax().parent() {
+                path_ctx.call_kind = match_ast! {
+                    match p {
+                        ast::PathExpr(it) => it.syntax().parent().and_then(ast::CallExpr::cast).map(|_| CallKind::Expr),
+                        ast::MacroCall(it) => it.excl_token().and(Some(CallKind::Mac)),
+                        ast::TupleStructPat(_it) => Some(CallKind::Pat),
+                        _ => None
+                    }
+                };
+            }
 
-            if let Some(path) = path_or_use_tree_qualifier(&path) {
-                self.path_qual = path
+            if let Some(parent) = path.syntax().parent() {
+                path_ctx.kind = match_ast! {
+                    match parent {
+                        ast::PathType(_it) => Some(PathKind::Type),
+                        ast::PathExpr(_it) => Some(PathKind::Expr),
+                        _ => None,
+                    }
+                };
+            }
+            path_ctx.has_type_args = segment.generic_arg_list().is_some();
+
+            if let Some((path, use_tree_parent)) = path_or_use_tree_qualifier(&path) {
+                path_ctx.use_tree_parent = use_tree_parent;
+                path_ctx.qualifier = path
                     .segment()
                     .and_then(|it| {
                         find_node_with_range::<ast::PathSegment>(
@@ -601,11 +661,11 @@ impl<'a> CompletionContext<'a> {
                 }
             }
 
-            self.is_trivial_path = true;
+            path_ctx.is_trivial_path = true;
 
             // Find either enclosing expr statement (thing with `;`) or a
             // block. If block, check that we are the last expr.
-            self.can_be_stmt = name_ref
+            path_ctx.can_be_stmt = name_ref
                 .syntax()
                 .ancestors()
                 .find_map(|node| {
@@ -621,10 +681,7 @@ impl<'a> CompletionContext<'a> {
                     None
                 })
                 .unwrap_or(false);
-            self.is_expr = path.syntax().parent().and_then(ast::PathExpr::cast).is_some();
         }
-        self.is_call |=
-            matches!(self.completion_location, Some(ImmediateLocation::MethodCall { .. }));
     }
 }
 
@@ -639,13 +696,26 @@ fn is_node<N: AstNode>(node: &SyntaxNode) -> bool {
     }
 }
 
-fn path_or_use_tree_qualifier(path: &ast::Path) -> Option<ast::Path> {
+fn path_or_use_tree_qualifier(path: &ast::Path) -> Option<(ast::Path, bool)> {
     if let Some(qual) = path.qualifier() {
-        return Some(qual);
+        return Some((qual, false));
     }
     let use_tree_list = path.syntax().ancestors().find_map(ast::UseTreeList::cast)?;
     let use_tree = use_tree_list.syntax().parent().and_then(ast::UseTree::cast)?;
-    use_tree.path()
+    use_tree.path().zip(Some(true))
+}
+
+fn has_ref(token: &SyntaxToken) -> bool {
+    let mut token = token.clone();
+    for skip in [WHITESPACE, IDENT, T![mut]] {
+        if token.kind() == skip {
+            token = match token.prev_token() {
+                Some(it) => it,
+                None => return false,
+            }
+        }
+    }
+    token.kind() == T![&]
 }
 
 #[cfg(test)]
@@ -653,7 +723,7 @@ mod tests {
     use expect_test::{expect, Expect};
     use hir::HirDisplay;
 
-    use crate::test_utils::{position, TEST_CONFIG};
+    use crate::tests::{position, TEST_CONFIG};
 
     use super::CompletionContext;
 
@@ -720,14 +790,18 @@ fn foo() {
     }
 
     #[test]
-    fn expected_type_fn_param_without_leading_char() {
-        cov_mark::check!(expected_type_fn_param_without_leading_char);
+    fn expected_type_fn_param() {
+        cov_mark::check!(expected_type_fn_param);
         check_expected_type_and_name(
             r#"
-fn foo() {
-    bar($0);
-}
-
+fn foo() { bar($0); }
+fn bar(x: u32) {}
+"#,
+            expect![[r#"ty: u32, name: x"#]],
+        );
+        check_expected_type_and_name(
+            r#"
+fn foo() { bar(c$0); }
 fn bar(x: u32) {}
 "#,
             expect![[r#"ty: u32, name: x"#]],
@@ -735,16 +809,27 @@ fn bar(x: u32) {}
     }
 
     #[test]
-    fn expected_type_fn_param_with_leading_char() {
-        cov_mark::check!(expected_type_fn_param_with_leading_char);
+    fn expected_type_fn_param_ref() {
+        cov_mark::check!(expected_type_fn_param_ref);
         check_expected_type_and_name(
             r#"
-fn foo() {
-    bar(c$0);
-}
-
-fn bar(x: u32) {}
+fn foo() { bar(&$0); }
+fn bar(x: &u32) {}
 "#,
+            expect![[r#"ty: u32, name: x"#]],
+        );
+        check_expected_type_and_name(
+            r#"
+fn foo() { bar(&mut $0); }
+fn bar(x: &mut u32) {}
+"#,
+            expect![[r#"ty: u32, name: x"#]],
+        );
+        check_expected_type_and_name(
+            r#"
+fn foo() { bar(&c$0); }
+fn bar(x: &u32) {}
+        "#,
             expect![[r#"ty: u32, name: x"#]],
         );
     }
@@ -893,13 +978,12 @@ fn foo() -> u32 {
         // FIXME: make this work with `|| $0`
         check_expected_type_and_name(
             r#"
+//- minicore: fn
 fn foo() {
     bar(|| a$0);
 }
 
 fn bar(f: impl FnOnce() -> u32) {}
-#[lang = "fn_once"]
-trait FnOnce { type Output; }
 "#,
             expect![[r#"ty: u32, name: ?"#]],
         );

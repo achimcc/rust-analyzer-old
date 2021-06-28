@@ -133,7 +133,7 @@ impl Resolver {
             Some(it) => it,
             None => return PerNs::none(),
         };
-        let (module_res, segment_index) = item_map.resolve_path(db, module, &path, shadow);
+        let (module_res, segment_index) = item_map.resolve_path(db, module, path, shadow);
         if segment_index.is_some() {
             return PerNs::none();
         }
@@ -150,7 +150,7 @@ impl Resolver {
         path: &ModPath,
     ) -> Option<TraitId> {
         let (item_map, module) = self.module_scope()?;
-        let (module_res, ..) = item_map.resolve_path(db, module, &path, BuiltinShadowMode::Module);
+        let (module_res, ..) = item_map.resolve_path(db, module, path, BuiltinShadowMode::Module);
         match module_res.take_types()? {
             ModuleDefId::TraitId(it) => Some(it),
             _ => None,
@@ -325,7 +325,7 @@ impl Resolver {
         path: &ModPath,
     ) -> Option<MacroDefId> {
         let (item_map, module) = self.module_scope()?;
-        item_map.resolve_path(db, module, &path, BuiltinShadowMode::Other).0.take_macros()
+        item_map.resolve_path(db, module, path, BuiltinShadowMode::Other).0.take_macros()
     }
 
     pub fn process_all_names(&self, db: &dyn DefDatabase, f: &mut dyn FnMut(Name, ScopeDef)) {
@@ -388,9 +388,9 @@ impl Resolver {
         self.module_scope().map(|t| t.0.krate())
     }
 
-    pub fn where_predicates_in_scope<'a>(
-        &'a self,
-    ) -> impl Iterator<Item = &'a crate::generics::WherePredicate> + 'a {
+    pub fn where_predicates_in_scope(
+        &self,
+    ) -> impl Iterator<Item = &crate::generics::WherePredicate> {
         self.scopes
             .iter()
             .rev()
@@ -464,16 +464,16 @@ impl Scope {
             &Scope::GenericParams { ref params, def: parent } => {
                 for (local_id, param) in params.types.iter() {
                     if let Some(ref name) = param.name {
-                        let id = TypeParamId { local_id, parent };
+                        let id = TypeParamId { parent, local_id };
                         f(name.clone(), ScopeDef::GenericParam(id.into()))
                     }
                 }
                 for (local_id, param) in params.consts.iter() {
-                    let id = ConstParamId { local_id, parent };
+                    let id = ConstParamId { parent, local_id };
                     f(param.name.clone(), ScopeDef::GenericParam(id.into()))
                 }
                 for (local_id, param) in params.lifetimes.iter() {
-                    let id = LifetimeParamId { local_id, parent };
+                    let id = LifetimeParamId { parent, local_id };
                     f(param.name.clone(), ScopeDef::GenericParam(id.into()))
                 }
             }
@@ -561,7 +561,7 @@ impl ModuleItemMap {
         path: &ModPath,
     ) -> Option<ResolveValueResult> {
         let (module_def, idx) =
-            self.def_map.resolve_path_locally(db, self.module_id, &path, BuiltinShadowMode::Other);
+            self.def_map.resolve_path_locally(db, self.module_id, path, BuiltinShadowMode::Other);
         match idx {
             None => {
                 let value = to_value_ns(module_def)?;
@@ -591,7 +591,7 @@ impl ModuleItemMap {
         path: &ModPath,
     ) -> Option<(TypeNs, Option<usize>)> {
         let (module_def, idx) =
-            self.def_map.resolve_path_locally(db, self.module_id, &path, BuiltinShadowMode::Other);
+            self.def_map.resolve_path_locally(db, self.module_id, path, BuiltinShadowMode::Other);
         let res = to_type_ns(module_def)?;
         Some((res, idx))
     }
@@ -605,8 +605,7 @@ fn to_value_ns(per_ns: PerNs) -> Option<ValueNs> {
         ModuleDefId::ConstId(it) => ValueNs::ConstId(it),
         ModuleDefId::StaticId(it) => ValueNs::StaticId(it),
 
-        ModuleDefId::AdtId(AdtId::EnumId(_))
-        | ModuleDefId::AdtId(AdtId::UnionId(_))
+        ModuleDefId::AdtId(AdtId::EnumId(_) | AdtId::UnionId(_))
         | ModuleDefId::TraitId(_)
         | ModuleDefId::TypeAliasId(_)
         | ModuleDefId::BuiltinType(_)
@@ -641,8 +640,7 @@ pub trait HasResolver: Copy {
 impl HasResolver for ModuleId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
         let mut def_map = self.def_map(db);
-        let mut modules = Vec::new();
-        modules.push((def_map.clone(), self.local_id));
+        let mut modules = vec![(def_map.clone(), self.local_id)];
         while let Some(parent) = def_map.parent() {
             def_map = parent.def_map(db);
             modules.push((def_map.clone(), parent.local_id));

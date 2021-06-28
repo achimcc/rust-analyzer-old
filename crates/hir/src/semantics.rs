@@ -17,7 +17,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     algo::find_node_at_offset,
     ast::{self, GenericParamsOwner, LoopBodyOwner},
-    match_ast, AstNode, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextSize,
+    match_ast, AstNode, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange, TextSize,
 };
 
 use crate::{
@@ -35,8 +35,9 @@ pub enum PathResolution {
     Def(ModuleDef),
     /// A local binding (only value namespace)
     Local(Local),
-    /// A generic parameter
+    /// A type parameter
     TypeParam(TypeParam),
+    /// A const parameter
     ConstParam(ConstParam),
     SelfType(Impl),
     Macro(MacroDef),
@@ -50,12 +51,14 @@ impl PathResolution {
             PathResolution::Def(ModuleDef::BuiltinType(builtin)) => {
                 Some(TypeNs::BuiltinType((*builtin).into()))
             }
-            PathResolution::Def(ModuleDef::Const(_))
-            | PathResolution::Def(ModuleDef::Variant(_))
-            | PathResolution::Def(ModuleDef::Function(_))
-            | PathResolution::Def(ModuleDef::Module(_))
-            | PathResolution::Def(ModuleDef::Static(_))
-            | PathResolution::Def(ModuleDef::Trait(_)) => None,
+            PathResolution::Def(
+                ModuleDef::Const(_)
+                | ModuleDef::Variant(_)
+                | ModuleDef::Function(_)
+                | ModuleDef::Module(_)
+                | ModuleDef::Static(_)
+                | ModuleDef::Trait(_),
+            ) => None,
             PathResolution::Def(ModuleDef::TypeAlias(alias)) => {
                 Some(TypeNs::TypeAliasId((*alias).into()))
             }
@@ -64,8 +67,7 @@ impl PathResolution {
             }
             PathResolution::TypeParam(param) => Some(TypeNs::GenericParam((*param).into())),
             PathResolution::SelfType(impl_def) => Some(TypeNs::SelfType((*impl_def).into())),
-            PathResolution::AssocItem(AssocItem::Const(_))
-            | PathResolution::AssocItem(AssocItem::Function(_)) => None,
+            PathResolution::AssocItem(AssocItem::Const(_) | AssocItem::Function(_)) => None,
             PathResolution::AssocItem(AssocItem::TypeAlias(alias)) => {
                 Some(TypeNs::TypeAliasId((*alias).into()))
             }
@@ -117,6 +119,16 @@ impl<'db, DB: HirDatabase> Semantics<'db, DB> {
     pub fn expand(&self, macro_call: &ast::MacroCall) -> Option<SyntaxNode> {
         self.imp.expand(macro_call)
     }
+
+    /// If `item` has an attribute macro attached to it, expands it.
+    pub fn expand_attr_macro(&self, item: &ast::Item) -> Option<SyntaxNode> {
+        self.imp.expand_attr_macro(item)
+    }
+
+    pub fn is_attr_macro_call(&self, item: &ast::Item) -> bool {
+        self.imp.is_attr_macro_call(item)
+    }
+
     pub fn speculative_expand(
         &self,
         actual_macro_call: &ast::MacroCall,
@@ -181,7 +193,7 @@ impl<'db, DB: HirDatabase> Semantics<'db, DB> {
         node: &SyntaxNode,
         offset: TextSize,
     ) -> Option<N> {
-        if let Some(it) = find_node_at_offset(&node, offset) {
+        if let Some(it) = find_node_at_offset(node, offset) {
             return Some(it);
         }
 
@@ -332,6 +344,22 @@ impl<'db> SemanticsImpl<'db> {
         Some(node)
     }
 
+    fn expand_attr_macro(&self, item: &ast::Item) -> Option<SyntaxNode> {
+        let sa = self.analyze(item.syntax());
+        let src = InFile::new(sa.file_id, item.clone());
+        let macro_call_id = self.with_ctx(|ctx| ctx.item_to_macro_call(src))?;
+        let file_id = macro_call_id.as_file();
+        let node = self.db.parse_or_expand(file_id)?;
+        self.cache(node.clone(), file_id);
+        Some(node)
+    }
+
+    fn is_attr_macro_call(&self, item: &ast::Item) -> bool {
+        let sa = self.analyze(item.syntax());
+        let src = InFile::new(sa.file_id, item.clone());
+        self.with_ctx(|ctx| ctx.item_to_macro_call(src).is_some())
+    }
+
     fn speculative_expand(
         &self,
         actual_macro_call: &ast::MacroCall,
@@ -362,25 +390,65 @@ impl<'db> SemanticsImpl<'db> {
 
         let token = successors(Some(InFile::new(sa.file_id, token)), |token| {
             self.db.unwind_if_cancelled();
-            let macro_call = token.value.ancestors().find_map(ast::MacroCall::cast)?;
-            let tt = macro_call.token_tree()?;
-            if !tt.syntax().text_range().contains_range(token.value.text_range()) {
-                return None;
-            }
-            let file_id = sa.expand(self.db, token.with_value(&macro_call))?;
-            let token = self
-                .expansion_info_cache
-                .borrow_mut()
-                .entry(file_id)
-                .or_insert_with(|| file_id.expansion_info(self.db.upcast()))
-                .as_ref()?
-                .map_token_down(token.as_ref())?;
 
-            if let Some(parent) = token.value.parent() {
-                self.cache(find_root(&parent), token.file_id);
+            for node in token.value.ancestors() {
+                match_ast! {
+                    match node {
+                        ast::MacroCall(macro_call) => {
+                            let tt = macro_call.token_tree()?;
+                            let l_delim = match tt.left_delimiter_token() {
+                                Some(it) => it.text_range().end(),
+                                None => tt.syntax().text_range().start()
+                            };
+                            let r_delim = match tt.right_delimiter_token() {
+                                Some(it) => it.text_range().start(),
+                                None => tt.syntax().text_range().end()
+                            };
+                            if !TextRange::new(l_delim, r_delim).contains_range(token.value.text_range()) {
+                                return None;
+                            }
+                            let file_id = sa.expand(self.db, token.with_value(&macro_call))?;
+                            let token = self
+                                .expansion_info_cache
+                                .borrow_mut()
+                                .entry(file_id)
+                                .or_insert_with(|| file_id.expansion_info(self.db.upcast()))
+                                .as_ref()?
+                                .map_token_down(token.as_ref())?;
+
+                            if let Some(parent) = token.value.parent() {
+                                self.cache(find_root(&parent), token.file_id);
+                            }
+
+                            return Some(token);
+                        },
+                        ast::Item(item) => {
+                            match self.with_ctx(|ctx| ctx.item_to_macro_call(token.with_value(item))) {
+                                Some(call_id) => {
+                                    let file_id = call_id.as_file();
+                                    let token = self
+                                        .expansion_info_cache
+                                        .borrow_mut()
+                                        .entry(file_id)
+                                        .or_insert_with(|| file_id.expansion_info(self.db.upcast()))
+                                        .as_ref()?
+                                        .map_token_down(token.as_ref())?;
+
+                                    if let Some(parent) = token.value.parent() {
+                                        self.cache(find_root(&parent), token.file_id);
+                                    }
+
+                                    return Some(token);
+                                }
+                                None => {}
+                            }
+                        },
+                        _ => {}
+                    }
+                }
             }
 
-            Some(token)
+            None
         })
         .last()
         .unwrap();
@@ -677,7 +745,7 @@ impl<'db> SemanticsImpl<'db> {
                     return None;
                 }
 
-                let func = self.resolve_method_call(&method_call_expr).map(Function::from)?;
+                let func = self.resolve_method_call(method_call_expr).map(Function::from)?;
                 let res = match func.self_param(self.db)?.access(self.db) {
                     Access::Shared | Access::Exclusive => true,
                     Access::Owned => false,

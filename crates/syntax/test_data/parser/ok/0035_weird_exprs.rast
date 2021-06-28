@@ -11,71 +11,76 @@ SOURCE_FILE@0..3813
     POUND@271..272 "#"
     BANG@272..273 "!"
     L_BRACK@273..274 "["
-    PATH@274..279
-      PATH_SEGMENT@274..279
-        NAME_REF@274..279
-          IDENT@274..279 "allow"
-    TOKEN_TREE@279..301
-      L_PAREN@279..280 "("
-      IDENT@280..300 "non_camel_case_types"
-      R_PAREN@300..301 ")"
+    META@274..301
+      PATH@274..279
+        PATH_SEGMENT@274..279
+          NAME_REF@274..279
+            IDENT@274..279 "allow"
+      TOKEN_TREE@279..301
+        L_PAREN@279..280 "("
+        IDENT@280..300 "non_camel_case_types"
+        R_PAREN@300..301 ")"
     R_BRACK@301..302 "]"
   WHITESPACE@302..303 "\n"
   ATTR@303..323
     POUND@303..304 "#"
     BANG@304..305 "!"
     L_BRACK@305..306 "["
-    PATH@306..311
-      PATH_SEGMENT@306..311
-        NAME_REF@306..311
-          IDENT@306..311 "allow"
-    TOKEN_TREE@311..322
-      L_PAREN@311..312 "("
-      IDENT@312..321 "dead_code"
-      R_PAREN@321..322 ")"
+    META@306..322
+      PATH@306..311
+        PATH_SEGMENT@306..311
+          NAME_REF@306..311
+            IDENT@306..311 "allow"
+      TOKEN_TREE@311..322
+        L_PAREN@311..312 "("
+        IDENT@312..321 "dead_code"
+        R_PAREN@321..322 ")"
     R_BRACK@322..323 "]"
   WHITESPACE@323..324 "\n"
   ATTR@324..351
     POUND@324..325 "#"
     BANG@325..326 "!"
     L_BRACK@326..327 "["
-    PATH@327..332
-      PATH_SEGMENT@327..332
-        NAME_REF@327..332
-          IDENT@327..332 "allow"
-    TOKEN_TREE@332..350
-      L_PAREN@332..333 "("
-      IDENT@333..349 "unreachable_code"
-      R_PAREN@349..350 ")"
+    META@327..350
+      PATH@327..332
+        PATH_SEGMENT@327..332
+          NAME_REF@327..332
+            IDENT@327..332 "allow"
+      TOKEN_TREE@332..350
+        L_PAREN@332..333 "("
+        IDENT@333..349 "unreachable_code"
+        R_PAREN@349..350 ")"
     R_BRACK@350..351 "]"
   WHITESPACE@351..352 "\n"
   ATTR@352..376
     POUND@352..353 "#"
     BANG@353..354 "!"
     L_BRACK@354..355 "["
-    PATH@355..360
-      PATH_SEGMENT@355..360
-        NAME_REF@355..360
-          IDENT@355..360 "allow"
-    TOKEN_TREE@360..375
-      L_PAREN@360..361 "("
-      IDENT@361..374 "unused_parens"
-      R_PAREN@374..375 ")"
+    META@355..375
+      PATH@355..360
+        PATH_SEGMENT@355..360
+          NAME_REF@355..360
+            IDENT@355..360 "allow"
+      TOKEN_TREE@360..375
+        L_PAREN@360..361 "("
+        IDENT@361..374 "unused_parens"
+        R_PAREN@374..375 ")"
     R_BRACK@375..376 "]"
   WHITESPACE@376..378 "\n\n"
   ATTR@378..405
     POUND@378..379 "#"
     BANG@379..380 "!"
     L_BRACK@380..381 "["
-    PATH@381..396
-      PATH_SEGMENT@381..396
-        NAME_REF@381..396
-          IDENT@381..396 "recursion_limit"
-    WHITESPACE@396..397 " "
-    EQ@397..398 "="
-    WHITESPACE@398..399 " "
-    LITERAL@399..404
-      STRING@399..404 "\"128\""
+    META@381..404
+      PATH@381..396
+        PATH_SEGMENT@381..396
+          NAME_REF@381..396
+            IDENT@381..396 "recursion_limit"
+      WHITESPACE@396..397 " "
+      EQ@397..398 "="
+      WHITESPACE@398..399 " "
+      LITERAL@399..404
+        STRING@399..404 "\"128\""
     R_BRACK@404..405 "]"
   WHITESPACE@405..407 "\n\n"
   USE@407..427
@@ -1373,14 +1378,14 @@ SOURCE_FILE@0..3813
                         WHITESPACE@2376..2377 " "
                         IDENT@2377..2379 "u8"
                         L_ANGLE@2379..2380 "<"
-                        LIFETIME_IDENT@2380..2383 "\'u8"
+                        LIFETIME_IDENT@2380..2383 "'u8"
                         COLON@2383..2384 ":"
                         WHITESPACE@2384..2385 " "
-                        LIFETIME_IDENT@2385..2388 "\'u8"
+                        LIFETIME_IDENT@2385..2388 "'u8"
                         WHITESPACE@2388..2389 " "
                         PLUS@2389..2390 "+"
                         WHITESPACE@2390..2391 " "
-                        LIFETIME_IDENT@2391..2394 "\'u8"
+                        LIFETIME_IDENT@2391..2394 "'u8"
                         R_ANGLE@2394..2395 ">"
                         TOKEN_TREE@2395..2408
                           L_PAREN@2395..2396 "("
@@ -1388,7 +1393,7 @@ SOURCE_FILE@0..3813
                           COLON@2398..2399 ":"
                           WHITESPACE@2399..2400 " "
                           AMP@2400..2401 "&"
-                          LIFETIME_IDENT@2401..2404 "\'u8"
+                          LIFETIME_IDENT@2401..2404 "'u8"
                           WHITESPACE@2404..2405 " "
                           IDENT@2405..2407 "u8"
                           R_PAREN@2407..2408 ")"
@@ -1397,7 +1402,7 @@ SOURCE_FILE@0..3813
                         R_ANGLE@2410..2411 ">"
                         WHITESPACE@2411..2412 " "
                         AMP@2412..2413 "&"
-                        LIFETIME_IDENT@2413..2416 "\'u8"
+                        LIFETIME_IDENT@2413..2416 "'u8"
                         WHITESPACE@2416..2417 " "
                         IDENT@2417..2419 "u8"
                         WHITESPACE@2419..2420 " "
@@ -1569,7 +1574,7 @@ SOURCE_FILE@0..3813
           L_ANGLE@2862..2863 "<"
           LIFETIME_PARAM@2863..2869
             LIFETIME@2863..2869
-              LIFETIME_IDENT@2863..2869 "\'union"
+              LIFETIME_IDENT@2863..2869 "'union"
           R_ANGLE@2869..2870 ">"
         WHITESPACE@2870..2871 " "
         RECORD_FIELD_LIST@2871..2904
@@ -1583,7 +1588,7 @@ SOURCE_FILE@0..3813
             REF_TYPE@2880..2901
               AMP@2880..2881 "&"
               LIFETIME@2881..2887
-                LIFETIME_IDENT@2881..2887 "\'union"
+                LIFETIME_IDENT@2881..2887 "'union"
               WHITESPACE@2887..2888 " "
               PATH_TYPE@2888..2901
                 PATH@2888..2901
@@ -1594,7 +1599,7 @@ SOURCE_FILE@0..3813
                       L_ANGLE@2893..2894 "<"
                       LIFETIME_ARG@2894..2900
                         LIFETIME@2894..2900
-                          LIFETIME_IDENT@2894..2900 "\'union"
+                          LIFETIME_IDENT@2894..2900 "'union"
                       R_ANGLE@2900..2901 ">"
           COMMA@2901..2902 ","
           WHITESPACE@2902..2903 " "
@@ -1676,7 +1681,7 @@ SOURCE_FILE@0..3813
                           STRING@2975..2979 "\"\\\\\""
                     COMMA@2979..2980 ","
                     LITERAL@2980..2986
-                      CHAR@2980..2986 "\'🤔\'"
+                      CHAR@2980..2986 "'🤔'"
                     R_PAREN@2986..2987 ")"
                   COMMENT@2987..2991 "/**/"
                   COMMA@2991..2992 ","

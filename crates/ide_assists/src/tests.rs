@@ -16,8 +16,8 @@ use syntax::TextRange;
 use test_utils::{assert_eq_text, extract_offset};
 
 use crate::{
-    handlers::Handler, Assist, AssistConfig, AssistContext, AssistKind, AssistResolveStrategy,
-    Assists, SingleResolve,
+    assists, handlers::Handler, Assist, AssistConfig, AssistContext, AssistKind,
+    AssistResolveStrategy, Assists, SingleResolve,
 };
 
 pub(crate) const TEST_CONFIG: AssistConfig = AssistConfig {
@@ -28,6 +28,7 @@ pub(crate) const TEST_CONFIG: AssistConfig = AssistConfig {
         prefix_kind: hir::PrefixKind::Plain,
         enforce_granularity: true,
         group: true,
+        skip_glob_imports: true,
     },
 };
 
@@ -35,6 +36,7 @@ pub(crate) fn with_single_file(text: &str) -> (RootDatabase, FileId) {
     RootDatabase::with_single_file(text)
 }
 
+#[track_caller]
 pub(crate) fn check_assist(assist: Handler, ra_fixture_before: &str, ra_fixture_after: &str) {
     let ra_fixture_after = trim_indent(ra_fixture_after);
     check(assist, ra_fixture_before, ExpectedResult::After(&ra_fixture_after), None);
@@ -74,18 +76,18 @@ pub(crate) fn check_assist_unresolved(assist: Handler, ra_fixture: &str) {
 #[track_caller]
 fn check_doc_test(assist_id: &str, before: &str, after: &str) {
     let after = trim_indent(after);
-    let (db, file_id, selection) = RootDatabase::with_range_or_offset(&before);
+    let (db, file_id, selection) = RootDatabase::with_range_or_offset(before);
     let before = db.file_text(file_id).to_string();
     let frange = FileRange { file_id, range: selection.into() };
 
-    let assist = Assist::get(&db, &TEST_CONFIG, AssistResolveStrategy::All, frange)
+    let assist = assists(&db, &TEST_CONFIG, AssistResolveStrategy::All, frange)
         .into_iter()
         .find(|assist| assist.id.0 == assist_id)
         .unwrap_or_else(|| {
             panic!(
                 "\n\nAssist is not applicable: {}\nAvailable assists: {}",
                 assist_id,
-                Assist::get(&db, &TEST_CONFIG, AssistResolveStrategy::None, frange)
+                assists(&db, &TEST_CONFIG, AssistResolveStrategy::None, frange)
                     .into_iter()
                     .map(|assist| assist.id.0)
                     .collect::<Vec<_>>()
@@ -179,9 +181,10 @@ fn check(handler: Handler, before: &str, expected: ExpectedResult, assist_label:
             "unresolved assist should not contain source changes"
         ),
         (Some(_), ExpectedResult::NotApplicable) => panic!("assist should not be applicable!"),
-        (None, ExpectedResult::After(_))
-        | (None, ExpectedResult::Target(_))
-        | (None, ExpectedResult::Unresolved) => {
+        (
+            None,
+            ExpectedResult::After(_) | ExpectedResult::Target(_) | ExpectedResult::Unresolved,
+        ) => {
             panic!("code action is not applicable")
         }
         (None, ExpectedResult::NotApplicable) => (),
@@ -210,7 +213,7 @@ fn assist_order_field_struct() {
     let (before_cursor_pos, before) = extract_offset(before);
     let (db, file_id) = with_single_file(&before);
     let frange = FileRange { file_id, range: TextRange::empty(before_cursor_pos) };
-    let assists = Assist::get(&db, &TEST_CONFIG, AssistResolveStrategy::None, frange);
+    let assists = assists(&db, &TEST_CONFIG, AssistResolveStrategy::None, frange);
     let mut assists = assists.iter();
 
     assert_eq!(assists.next().expect("expected assist").label, "Change visibility to pub(crate)");
@@ -235,7 +238,7 @@ pub fn test_some_range(a: int) -> bool {
 "#,
     );
 
-    let assists = Assist::get(&db, &TEST_CONFIG, AssistResolveStrategy::None, frange);
+    let assists = assists(&db, &TEST_CONFIG, AssistResolveStrategy::None, frange);
     let expected = labels(&assists);
 
     expect![[r#"
@@ -264,7 +267,7 @@ pub fn test_some_range(a: int) -> bool {
         let mut cfg = TEST_CONFIG;
         cfg.allowed = Some(vec![AssistKind::Refactor]);
 
-        let assists = Assist::get(&db, &cfg, AssistResolveStrategy::None, frange);
+        let assists = assists(&db, &cfg, AssistResolveStrategy::None, frange);
         let expected = labels(&assists);
 
         expect![[r#"
@@ -279,7 +282,7 @@ pub fn test_some_range(a: int) -> bool {
     {
         let mut cfg = TEST_CONFIG;
         cfg.allowed = Some(vec![AssistKind::RefactorExtract]);
-        let assists = Assist::get(&db, &cfg, AssistResolveStrategy::None, frange);
+        let assists = assists(&db, &cfg, AssistResolveStrategy::None, frange);
         let expected = labels(&assists);
 
         expect![[r#"
@@ -292,7 +295,7 @@ pub fn test_some_range(a: int) -> bool {
     {
         let mut cfg = TEST_CONFIG;
         cfg.allowed = Some(vec![AssistKind::QuickFix]);
-        let assists = Assist::get(&db, &cfg, AssistResolveStrategy::None, frange);
+        let assists = assists(&db, &cfg, AssistResolveStrategy::None, frange);
         let expected = labels(&assists);
 
         expect![[r#""#]].assert_eq(&expected);
@@ -317,7 +320,7 @@ pub fn test_some_range(a: int) -> bool {
     cfg.allowed = Some(vec![AssistKind::RefactorExtract]);
 
     {
-        let assists = Assist::get(&db, &cfg, AssistResolveStrategy::None, frange);
+        let assists = assists(&db, &cfg, AssistResolveStrategy::None, frange);
         assert_eq!(2, assists.len());
         let mut assists = assists.into_iter();
 
@@ -353,7 +356,7 @@ pub fn test_some_range(a: int) -> bool {
     }
 
     {
-        let assists = Assist::get(
+        let assists = assists(
             &db,
             &cfg,
             AssistResolveStrategy::Single(SingleResolve {
@@ -397,7 +400,7 @@ pub fn test_some_range(a: int) -> bool {
     }
 
     {
-        let assists = Assist::get(
+        let assists = assists(
             &db,
             &cfg,
             AssistResolveStrategy::Single(SingleResolve {
@@ -462,7 +465,7 @@ pub fn test_some_range(a: int) -> bool {
     }
 
     {
-        let assists = Assist::get(&db, &cfg, AssistResolveStrategy::All, frange);
+        let assists = assists(&db, &cfg, AssistResolveStrategy::All, frange);
         assert_eq!(2, assists.len());
         let mut assists = assists.into_iter();
 

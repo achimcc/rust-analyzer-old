@@ -10,7 +10,10 @@
 use std::{ffi::OsString, iter, path::PathBuf};
 
 use flycheck::FlycheckConfig;
-use ide::{AssistConfig, CompletionConfig, DiagnosticsConfig, HoverConfig, InlayHintsConfig};
+use ide::{
+    AssistConfig, CompletionConfig, DiagnosticsConfig, HoverConfig, HoverDocFormat,
+    InlayHintsConfig,
+};
 use ide_db::helpers::{
     insert_use::{ImportGranularity, InsertUseConfig, PrefixKind},
     SnippetCap,
@@ -32,6 +35,9 @@ use crate::{
 //
 // However, editor specific config, which the server doesn't know about, should
 // be specified directly in `package.json`.
+//
+// To deprecate an option by replacing it with another name use `new_name | `old_name` so that we keep
+// parsing the old name.
 config_data! {
     struct ConfigData {
         /// How imports should be grouped into use statements.
@@ -44,6 +50,9 @@ config_data! {
         assist_importPrefix: ImportPrefixDef               = "\"plain\"",
         /// Group inserted imports by the [following order](https://rust-analyzer.github.io/manual.html#auto-import). Groups are separated by newlines.
         assist_importGroup: bool                           = "true",
+        /// Whether to allow import insertion to merge new imports into single path glob imports like `use std::fmt::*;`.
+        assist_allowMergingIntoGlobImports: bool           = "true",
+
         /// Show function name and docs in parameter hints.
         callInfo_full: bool                                = "true",
 
@@ -52,6 +61,8 @@ config_data! {
         cargo_autoreload: bool           = "true",
         /// Activate all available features (`--all-features`).
         cargo_allFeatures: bool          = "false",
+        /// Unsets `#[cfg(test)]` for the specified crates.
+        cargo_unsetTest: Vec<String>   = "[\"core\"]",
         /// List of features to activate.
         cargo_features: Vec<String>      = "[]",
         /// Run build scripts (`build.rs`) for more precise code analysis.
@@ -141,6 +152,12 @@ config_data! {
         /// their contents.
         highlighting_strings: bool = "true",
 
+        /// Whether to show documentation on hover.
+        hover_documentation: bool       = "true",
+        /// Use markdown syntax for links in hover.
+        hover_linksInHover |
+        hoverActions_linksInHover: bool = "true",
+
         /// Whether to show `Debug` action. Only applies when
         /// `#rust-analyzer.hoverActions.enable#` is set.
         hoverActions_debug: bool           = "true",
@@ -158,8 +175,6 @@ config_data! {
         /// Whether to show `Run` action. Only applies when
         /// `#rust-analyzer.hoverActions.enable#` is set.
         hoverActions_run: bool             = "true",
-        /// Use markdown syntax for links in hover.
-        hoverActions_linksInHover: bool    = "true",
 
         /// Whether to show inlay type hints for method chains.
         inlayHints_chainingHints: bool      = "true",
@@ -297,6 +312,37 @@ impl LensConfig {
 
     pub fn references(&self) -> bool {
         self.method_refs || self.refs
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HoverActionsConfig {
+    pub implementations: bool,
+    pub references: bool,
+    pub run: bool,
+    pub debug: bool,
+    pub goto_type_def: bool,
+}
+
+impl HoverActionsConfig {
+    pub const NO_ACTIONS: Self = Self {
+        implementations: false,
+        references: false,
+        run: false,
+        debug: false,
+        goto_type_def: false,
+    };
+
+    pub fn any(&self) -> bool {
+        self.implementations || self.references || self.runnable() || self.goto_type_def
+    }
+
+    pub fn none(&self) -> bool {
+        !self.any()
+    }
+
+    pub fn runnable(&self) -> bool {
+        self.run || self.debug
     }
 }
 
@@ -518,7 +564,7 @@ impl Config {
     pub fn code_action_group(&self) -> bool {
         self.experimental("codeActionGroup")
     }
-    pub fn hover_actions(&self) -> bool {
+    pub fn experimental_hover_actions(&self) -> bool {
         self.experimental("hoverActions")
     }
     pub fn server_status_notification(&self) -> bool {
@@ -592,8 +638,10 @@ impl Config {
             target: self.data.cargo_target.clone(),
             rustc_source,
             no_sysroot: self.data.cargo_noSysroot,
+            unset_test_crates: self.data.cargo_unsetTest.clone(),
         }
     }
+
     pub fn rustfmt(&self) -> RustfmtConfig {
         match &self.data.rustfmt_overrideCommand {
             Some(args) if !args.is_empty() => {
@@ -672,6 +720,7 @@ impl Config {
                 ImportPrefixDef::BySelf => PrefixKind::BySelf,
             },
             group: self.data.assist_importGroup,
+            skip_glob_imports: !self.data.assist_allowMergingIntoGlobImports,
         }
     }
     pub fn completion(&self) -> CompletionConfig {
@@ -715,30 +764,41 @@ impl Config {
             refs: self.data.lens_enable && self.data.lens_references,
         }
     }
-    pub fn highlighting_strings(&self) -> bool {
-        self.data.highlighting_strings
-    }
-    pub fn hover(&self) -> HoverConfig {
-        HoverConfig {
+    pub fn hover_actions(&self) -> HoverActionsConfig {
+        HoverActionsConfig {
             implementations: self.data.hoverActions_enable
                 && self.data.hoverActions_implementations,
             references: self.data.hoverActions_enable && self.data.hoverActions_references,
             run: self.data.hoverActions_enable && self.data.hoverActions_run,
             debug: self.data.hoverActions_enable && self.data.hoverActions_debug,
             goto_type_def: self.data.hoverActions_enable && self.data.hoverActions_gotoTypeDef,
-            links_in_hover: self.data.hoverActions_linksInHover,
-            markdown: try_or!(
-                self.caps
-                    .text_document
-                    .as_ref()?
-                    .hover
-                    .as_ref()?
-                    .content_format
-                    .as_ref()?
-                    .as_slice(),
-                &[]
-            )
-            .contains(&MarkupKind::Markdown),
+        }
+    }
+    pub fn highlighting_strings(&self) -> bool {
+        self.data.highlighting_strings
+    }
+    pub fn hover(&self) -> HoverConfig {
+        HoverConfig {
+            links_in_hover: self.data.hover_linksInHover,
+            documentation: self.data.hover_documentation.then(|| {
+                let is_markdown = try_or!(
+                    self.caps
+                        .text_document
+                        .as_ref()?
+                        .hover
+                        .as_ref()?
+                        .content_format
+                        .as_ref()?
+                        .as_slice(),
+                    &[]
+                )
+                .contains(&MarkupKind::Markdown);
+                if is_markdown {
+                    HoverDocFormat::Markdown
+                } else {
+                    HoverDocFormat::PlainText
+                }
+            }),
         }
     }
 
@@ -801,7 +861,9 @@ enum ImportGranularityDef {
 #[serde(rename_all = "snake_case")]
 enum ImportPrefixDef {
     Plain,
+    #[serde(alias = "self")]
     BySelf,
+    #[serde(alias = "crate")]
     ByCrate,
 }
 
@@ -846,6 +908,7 @@ macro_rules! _config_data {
                     $({
                         let field = stringify!($field);
                         let ty = stringify!($ty);
+
                         (field, ty, &[$($doc),*], $default)
                     },)*
                 ])
@@ -857,6 +920,7 @@ macro_rules! _config_data {
                     $({
                         let field = stringify!($field);
                         let ty = stringify!($ty);
+
                         (field, ty, &[$($doc),*], $default)
                     },)*
                 ])
@@ -986,13 +1050,13 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
             "type": "string",
             "enum": [
                 "plain",
-                "by_self",
-                "by_crate"
+                "self",
+                "crate"
             ],
             "enumDescriptions": [
                 "Insert import paths relative to the current module, using up to one `super` prefix if the parent module contains the requested item.",
-                "Prefix all import paths with `self` if they don't begin with `self`, `super`, `crate` or a crate name.",
-                "Force import paths to be absolute by always starting them with `crate` or the crate name they refer to."
+                "Insert import paths relative to the current module, using up to one `super` prefix if the parent module contains the requested item. Prefixes `self` in front of the path if it starts with a module.",
+                "Force import paths to be absolute by always starting them with `crate` or the extern crate name they come from."
             ],
         },
         "Vec<ManifestOrProjectJson>" => set! {
@@ -1062,8 +1126,8 @@ mod tests {
         let package_json_path = project_root().join("editors/code/package.json");
         let mut package_json = fs::read_to_string(&package_json_path).unwrap();
 
-        let start_marker = "                \"$generated-start\": false,\n";
-        let end_marker = "                \"$generated-end\": false\n";
+        let start_marker = "                \"$generated-start\": {},\n";
+        let end_marker = "                \"$generated-end\": {}\n";
 
         let start = package_json.find(start_marker).unwrap() + start_marker.len();
         let end = package_json.find(end_marker).unwrap();

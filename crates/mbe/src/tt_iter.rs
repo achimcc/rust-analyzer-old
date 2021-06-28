@@ -115,16 +115,17 @@ impl<'a> TtIter<'a> {
             }
         }
 
-        let buffer = TokenBuffer::from_tokens(&self.inner.as_slice());
+        let buffer = TokenBuffer::from_tokens(self.inner.as_slice());
         let mut src = SubtreeTokenSource::new(&buffer);
         let mut sink = OffsetTokenSink { cursor: buffer.begin(), error: false };
 
         parser::parse_fragment(&mut src, &mut sink, fragment_kind);
 
-        let mut err = None;
-        if !sink.cursor.is_root() || sink.error {
-            err = Some(err!("expected {:?}", fragment_kind));
-        }
+        let mut err = if !sink.cursor.is_root() || sink.error {
+            Some(err!("expected {:?}", fragment_kind))
+        } else {
+            None
+        };
 
         let mut curr = buffer.begin();
         let mut res = vec![];

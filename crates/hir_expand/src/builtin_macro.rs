@@ -202,7 +202,7 @@ fn assert_expand(
 
     let arg_tts = args.into_iter().flat_map(|arg| {
         quote! { &(#arg), }
-    }.token_trees).collect::<Vec<_>>();
+    }.token_trees);
 
     let expanded = quote! {
         { { (##arg_tts); } }
@@ -254,7 +254,7 @@ fn format_args_expand(
     let _format_string = args.remove(0);
     let arg_tts = args.into_iter().flat_map(|arg| {
         quote! { std::fmt::ArgumentV1::new(&(#arg), std::fmt::Display::fmt), }
-    }.token_trees).collect::<Vec<_>>();
+    }.token_trees);
     let expanded = quote! {
         std::fmt::Arguments::new_v1(&[], &[##arg_tts])
     };
@@ -354,7 +354,7 @@ fn concat_expand(
                 // concat works with string and char literals, so remove any quotes.
                 // It also works with integer, float and boolean literals, so just use the rest
                 // as-is.
-                let component = unquote_str(&it).unwrap_or_else(|| it.text.to_string());
+                let component = unquote_str(it).unwrap_or_else(|| it.text.to_string());
                 text.push_str(&component);
             }
             // handle boolean literals
@@ -417,10 +417,10 @@ fn parse_string(tt: &tt::Subtree) -> Result<String, mbe::ExpandError> {
     tt.token_trees
         .get(0)
         .and_then(|tt| match tt {
-            tt::TokenTree::Leaf(tt::Leaf::Literal(it)) => unquote_str(&it),
+            tt::TokenTree::Leaf(tt::Leaf::Literal(it)) => unquote_str(it),
             _ => None,
         })
-        .ok_or_else(|| mbe::ExpandError::ConversionError)
+        .ok_or(mbe::ExpandError::ConversionError)
 }
 
 fn include_expand(
@@ -430,11 +430,10 @@ fn include_expand(
 ) -> ExpandResult<Option<ExpandedEager>> {
     let res = (|| {
         let path = parse_string(tt)?;
-        let file_id = relative_file(db, arg_id.into(), &path, false)?;
+        let file_id = relative_file(db, arg_id, &path, false)?;
 
-        let subtree = parse_to_token_tree(&db.file_text(file_id))
-            .ok_or_else(|| mbe::ExpandError::ConversionError)?
-            .0;
+        let subtree =
+            parse_to_token_tree(&db.file_text(file_id)).ok_or(mbe::ExpandError::ConversionError)?.0;
         Ok((subtree, file_id))
     })();
 
@@ -480,7 +479,7 @@ fn include_str_expand(
     // it's unusual to `include_str!` a Rust file), but we can return an empty string.
     // Ideally, we'd be able to offer a precise expansion if the user asks for macro
     // expansion.
-    let file_id = match relative_file(db, arg_id.into(), &path, true) {
+    let file_id = match relative_file(db, arg_id, &path, true) {
         Ok(file_id) => file_id,
         Err(_) => {
             return ExpandResult::ok(Some(ExpandedEager::new(quote!(""))));
@@ -561,7 +560,7 @@ mod tests {
     use syntax::ast::NameOwner;
 
     fn expand_builtin_macro(ra_fixture: &str) -> String {
-        let (db, file_id) = TestDB::with_single_file(&ra_fixture);
+        let (db, file_id) = TestDB::with_single_file(ra_fixture);
         let parsed = db.parse(file_id);
         let mut macro_rules: Vec<_> =
             parsed.syntax_node().descendants().filter_map(ast::MacroRules::cast).collect();
@@ -598,7 +597,7 @@ mod tests {
                     },
                 };
 
-                let id: MacroCallId = db.intern_macro(loc).into();
+                let id: MacroCallId = db.intern_macro(loc);
                 id.as_file()
             }
             Either::Right(expander) => {
@@ -635,7 +634,7 @@ mod tests {
                     kind: MacroCallKind::FnLike { ast_id: call_id, fragment },
                 };
 
-                let id: MacroCallId = db.intern_macro(loc).into();
+                let id: MacroCallId = db.intern_macro(loc);
                 id.as_file()
             }
         };

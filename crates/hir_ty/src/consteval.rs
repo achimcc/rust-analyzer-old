@@ -38,8 +38,7 @@ impl ConstExt for Const {
 // FIXME: support more than just evaluating literals
 pub fn eval_usize(expr: &Expr) -> Option<u64> {
     match expr {
-        Expr::Literal(Literal::Uint(v, None))
-        | Expr::Literal(Literal::Uint(v, Some(BuiltinUint::Usize))) => (*v).try_into().ok(),
+        Expr::Literal(Literal::Uint(v, None | Some(BuiltinUint::Usize))) => (*v).try_into().ok(),
         _ => None,
     }
 }
@@ -49,7 +48,7 @@ pub fn usize_const(value: Option<u64>) -> Const {
     ConstData {
         ty: TyKind::Scalar(chalk_ir::Scalar::Uint(chalk_ir::UintTy::Usize)).intern(&Interner),
         value: ConstValue::Concrete(chalk_ir::ConcreteConst {
-            interned: value.map(|value| ConstScalar::Usize(value)).unwrap_or(ConstScalar::Unknown),
+            interned: value.map(ConstScalar::Usize).unwrap_or(ConstScalar::Unknown),
         }),
     }
     .intern(&Interner)

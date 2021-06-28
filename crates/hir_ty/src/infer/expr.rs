@@ -54,7 +54,7 @@ impl<'a> InferenceContext<'a> {
     /// Infer type of expression with possibly implicit coerce to the expected type.
     /// Return the type after possible coercion.
     pub(super) fn infer_expr_coerce(&mut self, expr: ExprId, expected: &Expectation) -> Ty {
-        let ty = self.infer_expr_inner(expr, &expected);
+        let ty = self.infer_expr_inner(expr, expected);
         let ty = if let Some(target) = expected.only_has_type(&mut self.table) {
             if !self.coerce(&ty, &target) {
                 self.result
@@ -135,11 +135,11 @@ impl<'a> InferenceContext<'a> {
                 let mut both_arms_diverge = Diverges::Always;
 
                 let mut result_ty = self.table.new_type_var();
-                let then_ty = self.infer_expr_inner(*then_branch, &expected);
+                let then_ty = self.infer_expr_inner(*then_branch, expected);
                 both_arms_diverge &= mem::replace(&mut self.diverges, Diverges::Maybe);
                 result_ty = self.coerce_merge_branch(Some(*then_branch), &result_ty, &then_ty);
                 let else_ty = match else_branch {
-                    Some(else_branch) => self.infer_expr_inner(*else_branch, &expected),
+                    Some(else_branch) => self.infer_expr_inner(*else_branch, expected),
                     None => TyBuilder::unit(),
                 };
                 both_arms_diverge &= self.diverges;
@@ -327,20 +327,19 @@ impl<'a> InferenceContext<'a> {
                 self.normalize_associated_types_in(ret_ty)
             }
             Expr::MethodCall { receiver, args, method_name, generic_args } => self
-                .infer_method_call(
-                    tgt_expr,
-                    *receiver,
-                    &args,
-                    &method_name,
-                    generic_args.as_deref(),
-                ),
+                .infer_method_call(tgt_expr, *receiver, args, method_name, generic_args.as_deref()),
             Expr::Match { expr, arms } => {
                 let input_ty = self.infer_expr(*expr, &Expectation::none());
+
+                let expected = expected.adjust_for_branches(&mut self.table);
 
                 let mut result_ty = if arms.is_empty() {
                     TyKind::Never.intern(&Interner)
                 } else {
-                    self.table.new_type_var()
+                    match &expected {
+                        Expectation::HasType(ty) => ty.clone(),
+                        _ => self.table.new_type_var(),
+                    }
                 };
 
                 let matchee_diverges = self.diverges;
@@ -368,7 +367,7 @@ impl<'a> InferenceContext<'a> {
             Expr::Path(p) => {
                 // FIXME this could be more efficient...
                 let resolver = resolver_for_expr(self.db.upcast(), self.owner, tgt_expr);
-                self.infer_path(&resolver, p, tgt_expr.into()).unwrap_or(self.err_ty())
+                self.infer_path(&resolver, p, tgt_expr.into()).unwrap_or_else(|| self.err_ty())
             }
             Expr::Continue { .. } => TyKind::Never.intern(&Interner),
             Expr::Break { expr, label } => {
@@ -512,7 +511,7 @@ impl<'a> InferenceContext<'a> {
                         _ => None,
                     }
                 })
-                .unwrap_or(self.err_ty());
+                .unwrap_or_else(|| self.err_ty());
                 let ty = self.insert_type_vars(ty);
                 self.normalize_associated_types_in(ty)
             }
@@ -594,11 +593,11 @@ impl<'a> InferenceContext<'a> {
                     UnaryOp::Neg => {
                         match inner_ty.kind(&Interner) {
                             // Fast path for builtins
-                            TyKind::Scalar(Scalar::Int(_))
-                            | TyKind::Scalar(Scalar::Uint(_))
-                            | TyKind::Scalar(Scalar::Float(_))
-                            | TyKind::InferenceVar(_, TyVariableKind::Integer)
-                            | TyKind::InferenceVar(_, TyVariableKind::Float) => inner_ty,
+                            TyKind::Scalar(Scalar::Int(_) | Scalar::Uint(_) | Scalar::Float(_))
+                            | TyKind::InferenceVar(
+                                _,
+                                TyVariableKind::Integer | TyVariableKind::Float,
+                            ) => inner_ty,
                             // Otherwise we resolve via the std::ops::Neg trait
                             _ => self
                                 .resolve_associated_type(inner_ty, self.resolve_ops_neg_output()),
@@ -607,9 +606,7 @@ impl<'a> InferenceContext<'a> {
                     UnaryOp::Not => {
                         match inner_ty.kind(&Interner) {
                             // Fast path for builtins
-                            TyKind::Scalar(Scalar::Bool)
-                            | TyKind::Scalar(Scalar::Int(_))
-                            | TyKind::Scalar(Scalar::Uint(_))
+                            TyKind::Scalar(Scalar::Bool | Scalar::Int(_) | Scalar::Uint(_))
                             | TyKind::InferenceVar(_, TyVariableKind::Integer) => inner_ty,
                             // Otherwise we resolve via the std::ops::Not trait
                             _ => self
@@ -736,7 +733,7 @@ impl<'a> InferenceContext<'a> {
             Expr::Array(array) => {
                 let elem_ty =
                     match expected.to_option(&mut self.table).as_ref().map(|t| t.kind(&Interner)) {
-                        Some(TyKind::Array(st, _)) | Some(TyKind::Slice(st)) => st.clone(),
+                        Some(TyKind::Array(st, _) | TyKind::Slice(st)) => st.clone(),
                         _ => self.table.new_type_var(),
                     };
 
@@ -821,8 +818,10 @@ impl<'a> InferenceContext<'a> {
         for stmt in statements {
             match stmt {
                 Statement::Let { pat, type_ref, initializer } => {
-                    let decl_ty =
-                        type_ref.as_ref().map(|tr| self.make_ty(tr)).unwrap_or(self.err_ty());
+                    let decl_ty = type_ref
+                        .as_ref()
+                        .map(|tr| self.make_ty(tr))
+                        .unwrap_or_else(|| self.err_ty());
 
                     // Always use the declared type when specified
                     let mut ty = decl_ty.clone();
@@ -988,7 +987,7 @@ impl<'a> InferenceContext<'a> {
     }
 
     fn register_obligations_for_call(&mut self, callable_ty: &Ty) {
-        let callable_ty = self.resolve_ty_shallow(&callable_ty);
+        let callable_ty = self.resolve_ty_shallow(callable_ty);
         if let TyKind::FnDef(fn_def, parameters) = callable_ty.kind(&Interner) {
             let def: CallableDefId = from_chalk(self.db, *fn_def);
             let generic_predicates = self.db.generic_predicates(def.into());

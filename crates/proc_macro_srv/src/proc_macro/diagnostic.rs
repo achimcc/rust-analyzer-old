@@ -1,6 +1,6 @@
 //! lib-proc-macro diagnostic
 //!
-//! Copy from https://github.com/rust-lang/rust/blob/6050e523bae6de61de4e060facc43dc512adaccd/src/libproc_macro/diagnostic.rs
+//! Copy from <https://github.com/rust-lang/rust/blob/6050e523bae6de61de4e060facc43dc512adaccd/src/libproc_macro/diagnostic.rs>
 //! augmented with removing unstable features
 
 use crate::proc_macro::Span;
@@ -91,7 +91,7 @@ impl<'a> Iterator for Children<'a> {
 impl Diagnostic {
     /// Creates a new diagnostic with the given `level` and `message`.
     pub fn new<T: Into<String>>(level: Level, message: T) -> Diagnostic {
-        Diagnostic { level: level, message: message.into(), spans: vec![], children: vec![] }
+        Diagnostic { level, message: message.into(), spans: vec![], children: vec![] }
     }
 
     /// Creates a new diagnostic with the given `level` and `message` pointing to
@@ -101,12 +101,7 @@ impl Diagnostic {
         S: MultiSpan,
         T: Into<String>,
     {
-        Diagnostic {
-            level: level,
-            message: message.into(),
-            spans: spans.into_spans(),
-            children: vec![],
-        }
+        Diagnostic { level, message: message.into(), spans: spans.into_spans(), children: vec![] }
     }
 
     diagnostic_child_methods!(span_error, error, Level::Error);

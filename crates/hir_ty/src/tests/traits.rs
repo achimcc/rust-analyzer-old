@@ -1,15 +1,16 @@
+use cov_mark::check;
 use expect_test::expect;
 
-use super::{check_infer, check_infer_with_mismatches, check_types};
+use super::{check, check_infer, check_infer_with_mismatches, check_types};
 
 #[test]
 fn infer_await() {
     check_types(
         r#"
-//- /main.rs crate:main deps:core
+//- minicore: future
 struct IntFuture;
 
-impl Future for IntFuture {
+impl core::future::Future for IntFuture {
     type Output = u64;
 }
 
@@ -18,16 +19,6 @@ fn test() {
     let v = r.await;
     v;
 } //^ u64
-
-//- /core.rs crate:core
-pub mod prelude {
-    pub mod rust_2018 {
-        #[lang = "future_trait"]
-        pub trait Future {
-            type Output;
-        }
-    }
-}
 "#,
     );
 }
@@ -36,25 +27,14 @@ pub mod prelude {
 fn infer_async() {
     check_types(
         r#"
-//- /main.rs crate:main deps:core
-async fn foo() -> u64 {
-            128
-}
+//- minicore: future
+async fn foo() -> u64 { 128 }
 
 fn test() {
     let r = foo();
     let v = r.await;
     v;
 } //^ u64
-
-//- /core.rs crate:core
-#[prelude_import] use future::*;
-mod future {
-    #[lang = "future_trait"]
-    trait Future {
-        type Output;
-    }
-}
 "#,
     );
 }
@@ -63,24 +43,13 @@ mod future {
 fn infer_desugar_async() {
     check_types(
         r#"
-//- /main.rs crate:main deps:core
-async fn foo() -> u64 {
-            128
-}
+//- minicore: future
+async fn foo() -> u64 { 128 }
 
 fn test() {
     let r = foo();
     r;
 } //^ impl Future<Output = u64>
-
-//- /core.rs crate:core
-#[prelude_import] use future::*;
-mod future {
-    trait Future {
-        type Output;
-    }
-}
-
 "#,
     );
 }
@@ -89,7 +58,7 @@ mod future {
 fn infer_async_block() {
     check_types(
         r#"
-//- /main.rs crate:main deps:core
+//- minicore: future, option
 async fn test() {
     let a = async { 42 };
     a;
@@ -101,7 +70,7 @@ async fn test() {
     b;
 //  ^ ()
     let c = async {
-        let y = Option::None;
+        let y = None;
         y
     //  ^ Option<u64>
     };
@@ -109,18 +78,6 @@ async fn test() {
     c;
 //  ^ impl Future<Output = Option<u64>>
 }
-
-enum Option<T> { None, Some(T) }
-
-//- /core.rs crate:core
-#[prelude_import] use future::*;
-mod future {
-    #[lang = "future_trait"]
-    trait Future {
-        type Output;
-    }
-}
-
 "#,
     );
 }
@@ -329,7 +286,7 @@ mod ops {
 
 #[test]
 fn infer_from_bound_1() {
-    check_infer(
+    check_types(
         r#"
 trait Trait<T> {}
 struct S<T>(T);
@@ -337,99 +294,62 @@ impl<U> Trait<U> for S<U> {}
 fn foo<T: Trait<u32>>(t: T) {}
 fn test() {
     let s = S(unknown);
+           // ^^^^^^^ u32
     foo(s);
 }"#,
-        expect![[r#"
-            85..86 't': T
-            91..93 '{}': ()
-            104..143 '{     ...(s); }': ()
-            114..115 's': S<u32>
-            118..119 'S': S<u32>(u32) -> S<u32>
-            118..128 'S(unknown)': S<u32>
-            120..127 'unknown': u32
-            134..137 'foo': fn foo<S<u32>>(S<u32>)
-            134..140 'foo(s)': ()
-            138..139 's': S<u32>
-        "#]],
     );
 }
 
 #[test]
 fn infer_from_bound_2() {
-    check_infer(
+    check_types(
         r#"
 trait Trait<T> {}
 struct S<T>(T);
 impl<U> Trait<U> for S<U> {}
-fn foo<U, T: Trait<U>>(t: T) -> U {}
+fn foo<U, T: Trait<U>>(t: T) -> U { loop {} }
 fn test() {
     let s = S(unknown);
+           // ^^^^^^^ u32
     let x: u32 = foo(s);
 }"#,
-        expect![[r#"
-            86..87 't': T
-            97..99 '{}': ()
-            110..162 '{     ...(s); }': ()
-            120..121 's': S<u32>
-            124..125 'S': S<u32>(u32) -> S<u32>
-            124..134 'S(unknown)': S<u32>
-            126..133 'unknown': u32
-            144..145 'x': u32
-            153..156 'foo': fn foo<u32, S<u32>>(S<u32>) -> u32
-            153..159 'foo(s)': u32
-            157..158 's': S<u32>
-        "#]],
     );
 }
 
 #[test]
 fn trait_default_method_self_bound_implements_trait() {
     cov_mark::check!(trait_self_implements_self);
-    check_infer(
+    check(
         r#"
 trait Trait {
     fn foo(&self) -> i64;
-    fn bar(&self) -> {
-        let x = self.foo();
+    fn bar(&self) -> () {
+        self.foo();
+     // ^^^^^^^^^^ type: i64
     }
 }"#,
-        expect![[r#"
-            26..30 'self': &Self
-            52..56 'self': &Self
-            61..96 '{     ...     }': ()
-            75..76 'x': i64
-            79..83 'self': &Self
-            79..89 'self.foo()': i64
-        "#]],
     );
 }
 
 #[test]
 fn trait_default_method_self_bound_implements_super_trait() {
-    check_infer(
+    check(
         r#"
 trait SuperTrait {
     fn foo(&self) -> i64;
 }
 trait Trait: SuperTrait {
-    fn bar(&self) -> {
-        let x = self.foo();
+    fn bar(&self) -> () {
+        self.foo();
+     // ^^^^^^^^^^ type: i64
     }
 }"#,
-        expect![[r#"
-            31..35 'self': &Self
-            85..89 'self': &Self
-            94..129 '{     ...     }': ()
-            108..109 'x': i64
-            112..116 'self': &Self
-            112..122 'self.foo()': i64
-        "#]],
     );
 }
 
 #[test]
 fn infer_project_associated_type() {
-    check_infer(
+    check_types(
         r#"
 trait Iterable {
     type Item;
@@ -438,89 +358,62 @@ struct S;
 impl Iterable for S { type Item = u32; }
 fn test<T: Iterable>() {
     let x: <S as Iterable>::Item = 1;
-    let y: <T as Iterable>::Item = no_matter;
-    let z: T::Item = no_matter;
-    let a: <T>::Item = no_matter;
+                                // ^ u32
+    let y: <T as Iterable>::Item = u;
+                                // ^ Iterable::Item<T>
+    let z: T::Item = u;
+                  // ^ Iterable::Item<T>
+    let a: <T>::Item = u;
+                    // ^ Iterable::Item<T>
 }"#,
-        expect![[r#"
-            108..261 '{     ...ter; }': ()
-            118..119 'x': u32
-            145..146 '1': u32
-            156..157 'y': Iterable::Item<T>
-            183..192 'no_matter': Iterable::Item<T>
-            202..203 'z': Iterable::Item<T>
-            215..224 'no_matter': Iterable::Item<T>
-            234..235 'a': Iterable::Item<T>
-            249..258 'no_matter': Iterable::Item<T>
-        "#]],
     );
 }
 
 #[test]
 fn infer_return_associated_type() {
-    check_infer(
+    check_types(
         r#"
 trait Iterable {
     type Item;
 }
 struct S;
 impl Iterable for S { type Item = u32; }
-fn foo1<T: Iterable>(t: T) -> T::Item {}
-fn foo2<T: Iterable>(t: T) -> <T as Iterable>::Item {}
-fn foo3<T: Iterable>(t: T) -> <T>::Item {}
+fn foo1<T: Iterable>(t: T) -> T::Item { loop {} }
+fn foo2<T: Iterable>(t: T) -> <T as Iterable>::Item { loop {} }
+fn foo3<T: Iterable>(t: T) -> <T>::Item { loop {} }
 fn test() {
-    let x = foo1(S);
-    let y = foo2(S);
-    let z = foo3(S);
+    foo1(S);
+ // ^^^^^^^ u32
+    foo2(S);
+ // ^^^^^^^ u32
+    foo3(S);
+ // ^^^^^^^ u32
 }"#,
-        expect![[r#"
-            106..107 't': T
-            123..125 '{}': ()
-            147..148 't': T
-            178..180 '{}': ()
-            202..203 't': T
-            221..223 '{}': ()
-            234..300 '{     ...(S); }': ()
-            244..245 'x': u32
-            248..252 'foo1': fn foo1<S>(S) -> <S as Iterable>::Item
-            248..255 'foo1(S)': u32
-            253..254 'S': S
-            265..266 'y': u32
-            269..273 'foo2': fn foo2<S>(S) -> <S as Iterable>::Item
-            269..276 'foo2(S)': u32
-            274..275 'S': S
-            286..287 'z': u32
-            290..294 'foo3': fn foo3<S>(S) -> <S as Iterable>::Item
-            290..297 'foo3(S)': u32
-            295..296 'S': S
-        "#]],
     );
 }
 
 #[test]
 fn infer_associated_type_bound() {
-    check_infer(
+    check_types(
         r#"
 trait Iterable {
     type Item;
 }
 fn test<T: Iterable<Item=u32>>() {
     let y: T::Item = unknown;
+                  // ^^^^^^^ u32
 }"#,
-        expect![[r#"
-            67..100 '{     ...own; }': ()
-            77..78 'y': u32
-            90..97 'unknown': u32
-        "#]],
     );
 }
 
 #[test]
 fn infer_const_body() {
+    // FIXME make check_types work with other bodies
     check_infer(
         r#"
 const A: u32 = 1 + 1;
-static B: u64 = { let x = 1; x };"#,
+static B: u64 = { let x = 1; x };
+"#,
         expect![[r#"
             15..16 '1': u32
             15..20 '1 + 1': u32
@@ -611,11 +504,11 @@ fn indexing_arrays() {
 fn infer_ops_index() {
     check_types(
         r#"
-//- /main.rs crate:main deps:std
+//- minicore: index
 struct Bar;
 struct Foo;
 
-impl std::ops::Index<u32> for Bar {
+impl core::ops::Index<u32> for Bar {
     type Output = Foo;
 }
 
@@ -624,15 +517,6 @@ fn test() {
     let b = a[1u32];
     b;
 } //^ Foo
-
-//- /std.rs crate:std
-#[prelude_import] use ops::*;
-mod ops {
-    #[lang = "index"]
-    pub trait Index<Idx> {
-        type Output;
-    }
-}
 "#,
     );
 }
@@ -641,16 +525,16 @@ mod ops {
 fn infer_ops_index_int() {
     check_types(
         r#"
-//- /main.rs crate:main deps:std
+//- minicore: index
 struct Bar;
 struct Foo;
 
-impl std::ops::Index<u32> for Bar {
+impl core::ops::Index<u32> for Bar {
     type Output = Foo;
 }
 
 struct Range;
-impl std::ops::Index<Range> for Bar {
+impl core::ops::Index<Range> for Bar {
     type Output = Bar;
 }
 
@@ -660,15 +544,6 @@ fn test() {
     b;
   //^ Foo
 }
-
-//- /std.rs crate:std
-#[prelude_import] use ops::*;
-mod ops {
-    #[lang = "index"]
-    pub trait Index<Idx> {
-        type Output;
-    }
-}
 "#,
     );
 }
@@ -677,25 +552,12 @@ mod ops {
 fn infer_ops_index_autoderef() {
     check_types(
         r#"
-//- /main.rs crate:main deps:std
+//- minicore: index, slice
 fn test() {
     let a = &[1u32, 2, 3];
-    let b = a[1u32];
+    let b = a[1];
     b;
 } //^ u32
-
-//- /std.rs crate:std
-impl<T> ops::Index<u32> for [T] {
-    type Output = T;
-}
-
-#[prelude_import] use ops::*;
-mod ops {
-    #[lang = "index"]
-    pub trait Index<Idx> {
-        type Output;
-    }
-}
 "#,
     );
 }
@@ -704,25 +566,20 @@ mod ops {
 fn deref_trait() {
     check_types(
         r#"
-#[lang = "deref"]
-trait Deref {
-    type Target;
-    fn deref(&self) -> &Self::Target;
-}
-
+//- minicore: deref
 struct Arc<T>;
-impl<T> Deref for Arc<T> {
+impl<T> core::ops::Deref for Arc<T> {
     type Target = T;
 }
 
 struct S;
 impl S {
-    fn foo(&self) -> u128 {}
+    fn foo(&self) -> u128 { 0 }
 }
 
 fn test(s: Arc<S>) {
     (*s, s.foo());
-} //^ (S, u128)
+} //^^^^^^^^^^^^^ (S, u128)
 "#,
     );
 }
@@ -731,16 +588,10 @@ fn test(s: Arc<S>) {
 fn deref_trait_with_inference_var() {
     check_types(
         r#"
-//- /main.rs
-#[lang = "deref"]
-trait Deref {
-    type Target;
-    fn deref(&self) -> &Self::Target;
-}
-
+//- minicore: deref
 struct Arc<T>;
-fn new_arc<T>() -> Arc<T> {}
-impl<T> Deref for Arc<T> {
+fn new_arc<T>() -> Arc<T> { Arc }
+impl<T> core::ops::Deref for Arc<T> {
     type Target = T;
 }
 
@@ -749,8 +600,8 @@ fn foo(a: Arc<S>) {}
 
 fn test() {
     let a = new_arc();
-    let b = (*a);
-          //^ S
+    let b = *a;
+          //^^ S
     foo(a);
 }
 "#,
@@ -761,21 +612,16 @@ fn test() {
 fn deref_trait_infinite_recursion() {
     check_types(
         r#"
-#[lang = "deref"]
-trait Deref {
-    type Target;
-    fn deref(&self) -> &Self::Target;
-}
-
+//- minicore: deref
 struct S;
 
-impl Deref for S {
+impl core::ops::Deref for S {
     type Target = S;
 }
 
 fn test(s: S) {
     s.foo();
-}       //^ {unknown}
+} //^^^^^^^ {unknown}
 "#,
     );
 }
@@ -784,25 +630,20 @@ fn test(s: S) {
 fn deref_trait_with_question_mark_size() {
     check_types(
         r#"
-#[lang = "deref"]
-trait Deref {
-    type Target;
-    fn deref(&self) -> &Self::Target;
-}
-
+//- minicore: deref
 struct Arc<T>;
-impl<T> Deref for Arc<T> {
+impl<T: ?Sized> core::ops::Deref for Arc<T> {
     type Target = T;
 }
 
 struct S;
 impl S {
-    fn foo(&self) -> u128 {}
+    fn foo(&self) -> u128 { 0 }
 }
 
 fn test(s: Arc<S>) {
     (*s, s.foo());
-} //^ (S, u128)
+} //^^^^^^^^^^^^^ (S, u128)
 "#,
     );
 }
@@ -816,11 +657,11 @@ struct S;
 trait Trait<T> {}
 impl Trait<u32> for S {}
 
-fn foo<T: Trait<U>, U>(t: T) -> U {}
+fn foo<T: Trait<U>, U>(t: T) -> U { loop {} }
 
 fn test(s: S) {
-    (foo(s));
-} //^ u32
+    foo(s);
+} //^^^^^^ u32
 "#,
     );
 }
@@ -837,12 +678,12 @@ impl Trait<isize> for S {}
 
 struct O;
 impl O {
-    fn foo<T: Trait<U>, U>(&self, t: T) -> U {}
+    fn foo<T: Trait<U>, U>(&self, t: T) -> U { loop {} }
 }
 
 fn test() {
     O.foo(S);
-}      //^ isize
+} //^^^^^^^^ isize
 "#,
     );
 }
@@ -857,12 +698,12 @@ trait Trait<T> {}
 impl Trait<i64> for S {}
 
 impl S {
-    fn foo<U>(&self) -> U where Self: Trait<U> {}
+    fn foo<U>(&self) -> U where Self: Trait<U> { loop {} }
 }
 
 fn test() {
     S.foo();
-}       //^ i64
+} //^^^^^^^ i64
 "#,
     );
 }
@@ -878,12 +719,12 @@ impl Trait<&str> for S {}
 
 struct O<T>;
 impl<U, T: Trait<U>> O<T> {
-    fn foo(&self) -> U {}
+    fn foo(&self) -> U { loop {} }
 }
 
 fn test(o: O<S>) {
     o.foo();
-}       //^ &str
+} //^^^^^^^ &str
 "#,
     );
 }
@@ -898,7 +739,7 @@ struct S;
 impl Clone for S {}
 impl<T> Trait for T where T: Clone {}
 fn test<T: Clone>(t: T) { t.foo(); }
-                             //^ u128
+                        //^^^^^^^ u128
 "#,
     );
 }
@@ -914,7 +755,7 @@ struct S;
 impl Clone for S {}
 impl<T> Trait for T where T: Clone {}
 fn test<T>(t: T) { t.foo(); }
-                       //^ {unknown}
+                 //^^^^^^^ {unknown}
 "#,
     );
 }
@@ -927,7 +768,7 @@ trait Trait { fn foo(self) -> u128; }
 struct S;
 impl Trait for S {}
 fn test<T: Trait>(t: T) { t.foo(); }
-                              //^ u128
+                        //^^^^^^^ u128
 "#,
     );
 }
@@ -940,7 +781,7 @@ trait Trait { fn foo(self) -> u128; }
 struct S;
 impl Trait for S {}
 fn test<T>(t: T) { t.foo(); }
-                       //^ {unknown}
+                 //^^^^^^^ {unknown}
 "#,
     );
 }
@@ -949,16 +790,13 @@ fn test<T>(t: T) { t.foo(); }
 fn generic_param_env_deref() {
     check_types(
         r#"
-#[lang = "deref"]
-trait Deref {
-    type Target;
-}
+//- minicore: deref
 trait Trait {}
-impl<T> Deref for T where T: Trait {
+impl<T> core::ops::Deref for T where T: Trait {
     type Target = i128;
 }
-fn test<T: Trait>(t: T) { (*t); }
-                        //^ i128
+fn test<T: Trait>(t: T) { *t; }
+                        //^^ i128
 "#,
     );
 }
@@ -1475,17 +1313,16 @@ fn test(
 }
 
 #[test]
-#[ignore]
 fn error_bound_chalk() {
     check_types(
         r#"
 trait Trait {
-    fn foo(&self) -> u32 {}
+    fn foo(&self) -> u32 { 0 }
 }
 
 fn test(x: (impl Trait + UnknownTrait)) {
     x.foo();
-}       //^ u32
+} //^^^^^^^ u32
 "#,
     );
 }
@@ -1558,7 +1395,7 @@ fn test<T: Trait<Type = u32>>(x: T, y: impl Trait<Type = i64>) {
 fn impl_trait_assoc_binding_projection_bug() {
     check_types(
         r#"
-//- /main.rs crate:main deps:std
+//- minicore: iterator
 pub trait Language {
     type Kind;
 }
@@ -1576,21 +1413,7 @@ trait Clone {
 fn api_walkthrough() {
     for node in foo() {
         node.clone();
-    }            //^ {unknown}
-}
-
-//- /std.rs crate:std
-#[prelude_import] use iter::*;
-mod iter {
-    trait IntoIterator {
-        type Item;
-    }
-    trait Iterator {
-        type Item;
-    }
-    impl<T: Iterator> IntoIterator for T {
-        type Item = <T as Iterator>::Item;
-    }
+    } //^^^^^^^^^^^^ {unknown}
 }
 "#,
     );
@@ -1627,13 +1450,13 @@ fn where_clause_trait_in_scope_for_method_resolution() {
         r#"
 mod foo {
     trait Trait {
-        fn foo(&self) -> u32 {}
+        fn foo(&self) -> u32 { 0 }
     }
 }
 
 fn test<T: foo::Trait>(x: T) {
     x.foo();
-}      //^ u32
+} //^^^^^^^ u32
 "#,
     );
 }
@@ -1838,20 +1661,7 @@ fn test() {
 fn fn_trait_deref_with_ty_default() {
     check_infer(
         r#"
-#[lang = "deref"]
-trait Deref {
-    type Target;
-
-    fn deref(&self) -> &Self::Target;
-}
-
-#[lang="fn_once"]
-trait FnOnce<Args> {
-    type Output;
-
-    fn call_once(self, args: Args) -> Self::Output;
-}
-
+//- minicore: deref, fn
 struct Foo;
 
 impl Foo {
@@ -1864,7 +1674,7 @@ impl<T, F> Lazy<T, F> {
     pub fn new(f: F) -> Lazy<T, F> {}
 }
 
-impl<T, F: FnOnce() -> T> Deref for Lazy<T, F> {
+impl<T, F: FnOnce() -> T> core::ops::Deref for Lazy<T, F> {
     type Target = T;
 }
 
@@ -1878,32 +1688,29 @@ fn test() {
     let r2 = lazy2.foo();
 }"#,
         expect![[r#"
-            64..68 'self': &Self
-            165..169 'self': Self
-            171..175 'args': Args
-            239..243 'self': &Foo
-            254..256 '{}': ()
-            334..335 'f': F
-            354..356 '{}': ()
-            443..689 '{     ...o(); }': ()
-            453..458 'lazy1': Lazy<Foo, || -> Foo>
-            475..484 'Lazy::new': fn new<Foo, || -> Foo>(|| -> Foo) -> Lazy<Foo, || -> Foo>
-            475..492 'Lazy::...| Foo)': Lazy<Foo, || -> Foo>
-            485..491 '|| Foo': || -> Foo
-            488..491 'Foo': Foo
-            502..504 'r1': usize
-            507..512 'lazy1': Lazy<Foo, || -> Foo>
-            507..518 'lazy1.foo()': usize
-            560..575 'make_foo_fn_ptr': fn() -> Foo
-            591..602 'make_foo_fn': fn make_foo_fn() -> Foo
-            612..617 'lazy2': Lazy<Foo, fn() -> Foo>
-            634..643 'Lazy::new': fn new<Foo, fn() -> Foo>(fn() -> Foo) -> Lazy<Foo, fn() -> Foo>
-            634..660 'Lazy::...n_ptr)': Lazy<Foo, fn() -> Foo>
-            644..659 'make_foo_fn_ptr': fn() -> Foo
-            670..672 'r2': usize
-            675..680 'lazy2': Lazy<Foo, fn() -> Foo>
-            675..686 'lazy2.foo()': usize
-            549..551 '{}': ()
+            36..40 'self': &Foo
+            51..53 '{}': ()
+            131..132 'f': F
+            151..153 '{}': ()
+            251..497 '{     ...o(); }': ()
+            261..266 'lazy1': Lazy<Foo, || -> Foo>
+            283..292 'Lazy::new': fn new<Foo, || -> Foo>(|| -> Foo) -> Lazy<Foo, || -> Foo>
+            283..300 'Lazy::...| Foo)': Lazy<Foo, || -> Foo>
+            293..299 '|| Foo': || -> Foo
+            296..299 'Foo': Foo
+            310..312 'r1': usize
+            315..320 'lazy1': Lazy<Foo, || -> Foo>
+            315..326 'lazy1.foo()': usize
+            368..383 'make_foo_fn_ptr': fn() -> Foo
+            399..410 'make_foo_fn': fn make_foo_fn() -> Foo
+            420..425 'lazy2': Lazy<Foo, fn() -> Foo>
+            442..451 'Lazy::new': fn new<Foo, fn() -> Foo>(fn() -> Foo) -> Lazy<Foo, fn() -> Foo>
+            442..468 'Lazy::...n_ptr)': Lazy<Foo, fn() -> Foo>
+            452..467 'make_foo_fn_ptr': fn() -> Foo
+            478..480 'r2': usize
+            483..488 'lazy2': Lazy<Foo, fn() -> Foo>
+            483..494 'lazy2.foo()': usize
+            357..359 '{}': ()
         "#]],
     );
 }
@@ -1912,11 +1719,7 @@ fn test() {
 fn closure_1() {
     check_infer_with_mismatches(
         r#"
-#[lang = "fn_once"]
-trait FnOnce<Args> {
-    type Output;
-}
-
+//- minicore: fn
 enum Option<T> { Some(T), None }
 impl<T> Option<T> {
     fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Option<U> { loop {} }
@@ -1929,34 +1732,34 @@ fn test() {
     let y: Option<i64> = x.map(|_v| 1);
 }"#,
         expect![[r#"
-            147..151 'self': Option<T>
-            153..154 'f': F
-            172..183 '{ loop {} }': Option<U>
-            174..181 'loop {}': !
-            179..181 '{}': ()
-            197..316 '{     ... 1); }': ()
-            207..208 'x': Option<u32>
-            211..223 'Option::Some': Some<u32>(u32) -> Option<u32>
-            211..229 'Option...(1u32)': Option<u32>
-            224..228 '1u32': u32
-            235..236 'x': Option<u32>
-            235..251 'x.map(...v + 1)': Option<u32>
-            241..250 '|v| v + 1': |u32| -> u32
-            242..243 'v': u32
-            245..246 'v': u32
-            245..250 'v + 1': u32
-            249..250 '1': u32
-            257..258 'x': Option<u32>
-            257..273 'x.map(... 1u64)': Option<u64>
-            263..272 '|_v| 1u64': |u32| -> u64
-            264..266 '_v': u32
-            268..272 '1u64': u64
-            283..284 'y': Option<i64>
-            300..301 'x': Option<u32>
-            300..313 'x.map(|_v| 1)': Option<i64>
-            306..312 '|_v| 1': |u32| -> i64
-            307..309 '_v': u32
-            311..312 '1': i64
+            86..90 'self': Option<T>
+            92..93 'f': F
+            111..122 '{ loop {} }': Option<U>
+            113..120 'loop {}': !
+            118..120 '{}': ()
+            136..255 '{     ... 1); }': ()
+            146..147 'x': Option<u32>
+            150..162 'Option::Some': Some<u32>(u32) -> Option<u32>
+            150..168 'Option...(1u32)': Option<u32>
+            163..167 '1u32': u32
+            174..175 'x': Option<u32>
+            174..190 'x.map(...v + 1)': Option<u32>
+            180..189 '|v| v + 1': |u32| -> u32
+            181..182 'v': u32
+            184..185 'v': u32
+            184..189 'v + 1': u32
+            188..189 '1': u32
+            196..197 'x': Option<u32>
+            196..212 'x.map(... 1u64)': Option<u64>
+            202..211 '|_v| 1u64': |u32| -> u64
+            203..205 '_v': u32
+            207..211 '1u64': u64
+            222..223 'y': Option<i64>
+            239..240 'x': Option<u32>
+            239..252 'x.map(|_v| 1)': Option<i64>
+            245..251 '|_v| 1': |u32| -> i64
+            246..248 '_v': u32
+            250..251 '1': i64
         "#]],
     );
 }
@@ -2030,11 +1833,7 @@ fn test<F: FnOnce(u32) -> u64>(f: F) {
 fn closure_as_argument_inference_order() {
     check_infer_with_mismatches(
         r#"
-#[lang = "fn_once"]
-trait FnOnce<Args> {
-    type Output;
-}
-
+//- minicore: fn
 fn foo1<T, U, F: FnOnce(T) -> U>(x: T, f: F) -> U { loop {} }
 fn foo2<T, U, F: FnOnce(T) -> U>(f: F, x: T) -> U { loop {} }
 
@@ -2053,62 +1852,62 @@ fn test() {
     let x4 = S.foo2(|s| s.method(), S);
 }"#,
         expect![[r#"
-            94..95 'x': T
-            100..101 'f': F
-            111..122 '{ loop {} }': U
-            113..120 'loop {}': !
-            118..120 '{}': ()
-            156..157 'f': F
-            162..163 'x': T
-            173..184 '{ loop {} }': U
-            175..182 'loop {}': !
-            180..182 '{}': ()
-            219..223 'self': S
-            271..275 'self': S
-            277..278 'x': T
-            283..284 'f': F
-            294..305 '{ loop {} }': U
-            296..303 'loop {}': !
-            301..303 '{}': ()
-            343..347 'self': S
-            349..350 'f': F
-            355..356 'x': T
-            366..377 '{ loop {} }': U
-            368..375 'loop {}': !
-            373..375 '{}': ()
-            391..550 '{     ... S); }': ()
-            401..403 'x1': u64
-            406..410 'foo1': fn foo1<S, u64, |S| -> u64>(S, |S| -> u64) -> u64
-            406..429 'foo1(S...hod())': u64
-            411..412 'S': S
-            414..428 '|s| s.method()': |S| -> u64
-            415..416 's': S
-            418..419 's': S
-            418..428 's.method()': u64
-            439..441 'x2': u64
-            444..448 'foo2': fn foo2<S, u64, |S| -> u64>(|S| -> u64, S) -> u64
-            444..467 'foo2(|...(), S)': u64
-            449..463 '|s| s.method()': |S| -> u64
-            450..451 's': S
-            453..454 's': S
-            453..463 's.method()': u64
-            465..466 'S': S
-            477..479 'x3': u64
-            482..483 'S': S
-            482..507 'S.foo1...hod())': u64
-            489..490 'S': S
-            492..506 '|s| s.method()': |S| -> u64
-            493..494 's': S
-            496..497 's': S
-            496..506 's.method()': u64
-            517..519 'x4': u64
-            522..523 'S': S
-            522..547 'S.foo2...(), S)': u64
-            529..543 '|s| s.method()': |S| -> u64
-            530..531 's': S
-            533..534 's': S
-            533..543 's.method()': u64
-            545..546 'S': S
+            33..34 'x': T
+            39..40 'f': F
+            50..61 '{ loop {} }': U
+            52..59 'loop {}': !
+            57..59 '{}': ()
+            95..96 'f': F
+            101..102 'x': T
+            112..123 '{ loop {} }': U
+            114..121 'loop {}': !
+            119..121 '{}': ()
+            158..162 'self': S
+            210..214 'self': S
+            216..217 'x': T
+            222..223 'f': F
+            233..244 '{ loop {} }': U
+            235..242 'loop {}': !
+            240..242 '{}': ()
+            282..286 'self': S
+            288..289 'f': F
+            294..295 'x': T
+            305..316 '{ loop {} }': U
+            307..314 'loop {}': !
+            312..314 '{}': ()
+            330..489 '{     ... S); }': ()
+            340..342 'x1': u64
+            345..349 'foo1': fn foo1<S, u64, |S| -> u64>(S, |S| -> u64) -> u64
+            345..368 'foo1(S...hod())': u64
+            350..351 'S': S
+            353..367 '|s| s.method()': |S| -> u64
+            354..355 's': S
+            357..358 's': S
+            357..367 's.method()': u64
+            378..380 'x2': u64
+            383..387 'foo2': fn foo2<S, u64, |S| -> u64>(|S| -> u64, S) -> u64
+            383..406 'foo2(|...(), S)': u64
+            388..402 '|s| s.method()': |S| -> u64
+            389..390 's': S
+            392..393 's': S
+            392..402 's.method()': u64
+            404..405 'S': S
+            416..418 'x3': u64
+            421..422 'S': S
+            421..446 'S.foo1...hod())': u64
+            428..429 'S': S
+            431..445 '|s| s.method()': |S| -> u64
+            432..433 's': S
+            435..436 's': S
+            435..445 's.method()': u64
+            456..458 'x4': u64
+            461..462 'S': S
+            461..486 'S.foo2...(), S)': u64
+            468..482 '|s| s.method()': |S| -> u64
+            469..470 's': S
+            472..473 's': S
+            472..482 's.method()': u64
+            484..485 'S': S
         "#]],
     );
 }
@@ -2117,14 +1916,10 @@ fn test() {
 fn fn_item_fn_trait() {
     check_types(
         r#"
-#[lang = "fn_once"]
-trait FnOnce<Args> {
-    type Output;
-}
-
+//- minicore: fn
 struct S;
 
-fn foo() -> S {}
+fn foo() -> S { S }
 
 fn takes_closure<U, F: FnOnce() -> U>(f: F) -> U { f() }
 
@@ -2151,7 +1946,7 @@ trait Trait2 {
 fn test<T: Trait>() where T::Item: Trait2 {
     let x: T::Item = no_matter;
     x.foo();
-}       //^ u32
+} //^^^^^^^ u32
 "#,
     );
 }
@@ -2171,7 +1966,7 @@ trait Trait2 {
 fn test<T, U>() where T::Item: Trait2, T: Trait<U::Item>, U: Trait<()> {
     let x: T::Item = no_matter;
     x.foo();
-}       //^ u32
+} //^^^^^^^ u32
 "#,
     );
 }
@@ -2234,7 +2029,7 @@ impl Trait for S {
 
 fn test() {
     S.f();
-}     //^ u32
+} //^^^^^ u32
 "#,
     );
 }
@@ -2262,7 +2057,7 @@ where
 
 fn foo<I: Interner>(interner: &I, t: Ty<I>) {
     fold(interner, t);
-}     //^ Ty<I>
+} //^^^^^^^^^^^^^^^^^ Ty<I>
 "#,
     );
 }
@@ -2281,7 +2076,7 @@ impl Trait<Self> for S {}
 
 fn test() {
     S.foo();
-}       //^ ()
+} //^^^^^^^ ()
 "#,
     );
 }
@@ -2300,7 +2095,7 @@ impl Trait for S<Self> {}
 
 fn test() {
     S.foo();
-}       //^ {unknown}
+} //^^^^^^^ {unknown}
 "#,
     );
 }
@@ -2318,7 +2113,7 @@ trait Trait2<T> {}
 
 fn test<T: Trait>() where T: Trait2<T::Item> {
     let x: T::Item = no_matter;
-}                       //^ {unknown}
+}                  //^^^^^^^^^ {unknown}
 "#,
     );
 }
@@ -2335,7 +2130,7 @@ trait Trait<T> {
 
 fn test<T, U>() where T: Trait<U::Item>, U: Trait<T::Item> {
     let x: T::Item = no_matter;
-}                   //^ {unknown}
+}                  //^^^^^^^^^ {unknown}
 "#,
     );
 }
@@ -2353,7 +2148,7 @@ trait Trait {
 
 fn test<T>() where T: Trait<OtherItem = T::Item> {
     let x: T::Item = no_matter;
-}                   //^ Trait::Item<T>
+}                  //^^^^^^^^^ Trait::Item<T>
 "#,
     );
 }
@@ -2385,7 +2180,7 @@ fn test<T>(t: T) where T: UnificationStoreMut {
     t.push(x);
     let y: Key<T>;
     (x, y);
-}      //^ (UnificationStoreBase::Key<T>, UnificationStoreBase::Key<T>)
+} //^^^^^^ (UnificationStoreBase::Key<T>, UnificationStoreBase::Key<T>)
 "#,
     );
 }
@@ -2410,7 +2205,7 @@ impl<T: Iterator> Iterator for S<T> {
 fn test<I: Iterator<Item: OtherTrait<u32>>>() {
     let x: <S<I> as Iterator>::Item;
     x.foo();
-}       //^ u32
+} //^^^^^^^ u32
 "#,
     );
 }
@@ -2560,12 +2355,7 @@ fn test() -> impl Trait<i32> {
 fn assoc_types_from_bounds() {
     check_infer(
         r#"
-//- /main.rs
-#[lang = "fn_once"]
-trait FnOnce<Args> {
-    type Output;
-}
-
+//- minicore: fn
 trait T {
     type O;
 }
@@ -2584,15 +2374,15 @@ fn main() {
     f::<(), _>(|z| { z; });
 }"#,
         expect![[r#"
-            133..135 '_v': F
-            178..181 '{ }': ()
-            193..224 '{     ... }); }': ()
-            199..209 'f::<(), _>': fn f<(), |&()| -> ()>(|&()| -> ())
-            199..221 'f::<()... z; })': ()
-            210..220 '|z| { z; }': |&()| -> ()
-            211..212 'z': &()
-            214..220 '{ z; }': ()
-            216..217 'z': &()
+            72..74 '_v': F
+            117..120 '{ }': ()
+            132..163 '{     ... }); }': ()
+            138..148 'f::<(), _>': fn f<(), |&()| -> ()>(|&()| -> ())
+            138..160 'f::<()... z; })': ()
+            149..159 '|z| { z; }': |&()| -> ()
+            150..151 'z': &()
+            153..159 '{ z; }': ()
+            155..156 'z': &()
         "#]],
     );
 }
@@ -2617,7 +2407,7 @@ impl<T: Trait> Trait for S<T> {
 fn test<T: Trait>() {
     let y: <S<T> as Trait>::Item = no_matter;
     y.foo();
-}       //^ u32
+} //^^^^^^^ u32
 "#,
     );
 }
@@ -2626,12 +2416,9 @@ fn test<T: Trait>() {
 fn dyn_trait_through_chalk() {
     check_types(
         r#"
+//- minicore: deref
 struct Box<T> {}
-#[lang = "deref"]
-trait Deref {
-    type Target;
-}
-impl<T> Deref for Box<T> {
+impl<T> core::ops::Deref for Box<T> {
     type Target = T;
 }
 trait Trait {
@@ -2640,7 +2427,7 @@ trait Trait {
 
 fn test(x: Box<dyn Trait>) {
     x.foo();
-}       //^ ()
+} //^^^^^^^ ()
 "#,
     );
 }
@@ -2659,7 +2446,7 @@ impl ToOwned for str {
 }
 fn test() {
     "foo".to_owned();
-}               //^ String
+} //^^^^^^^^^^^^^^^^ String
 "#,
     );
 }
@@ -2668,17 +2455,7 @@ fn test() {
 fn iterator_chain() {
     check_infer_with_mismatches(
         r#"
-//- /main.rs
-#[lang = "fn_once"]
-trait FnOnce<Args> {
-    type Output;
-}
-#[lang = "fn_mut"]
-trait FnMut<Args>: FnOnce<Args> { }
-
-enum Option<T> { Some(T), None }
-use Option::*;
-
+//- minicore: fn, option
 pub trait Iterator {
     type Item;
 
@@ -2738,46 +2515,46 @@ fn main() {
     .for_each(|y| { y; });
 }"#,
         expect![[r#"
-            226..230 'self': Self
-            232..233 'f': F
-            317..328 '{ loop {} }': FilterMap<Self, F>
-            319..326 'loop {}': !
-            324..326 '{}': ()
-            349..353 'self': Self
-            355..356 'f': F
-            405..416 '{ loop {} }': ()
-            407..414 'loop {}': !
-            412..414 '{}': ()
-            525..529 'self': Self
-            854..858 'self': I
-            865..885 '{     ...     }': I
-            875..879 'self': I
-            944..955 '{ loop {} }': Vec<T>
-            946..953 'loop {}': !
-            951..953 '{}': ()
-            1142..1269 '{     ... }); }': ()
-            1148..1163 'Vec::<i32>::new': fn new<i32>() -> Vec<i32>
-            1148..1165 'Vec::<...:new()': Vec<i32>
-            1148..1177 'Vec::<...iter()': IntoIter<i32>
-            1148..1240 'Vec::<...one })': FilterMap<IntoIter<i32>, |i32| -> Option<u32>>
-            1148..1266 'Vec::<... y; })': ()
-            1194..1239 '|x| if...None }': |i32| -> Option<u32>
-            1195..1196 'x': i32
-            1198..1239 'if x >...None }': Option<u32>
-            1201..1202 'x': i32
-            1201..1206 'x > 0': bool
-            1205..1206 '0': i32
-            1207..1225 '{ Some...u32) }': Option<u32>
-            1209..1213 'Some': Some<u32>(u32) -> Option<u32>
-            1209..1223 'Some(x as u32)': Option<u32>
-            1214..1215 'x': i32
-            1214..1222 'x as u32': u32
-            1231..1239 '{ None }': Option<u32>
-            1233..1237 'None': Option<u32>
-            1255..1265 '|y| { y; }': |u32| -> ()
-            1256..1257 'y': u32
-            1259..1265 '{ y; }': ()
-            1261..1262 'y': u32
+            61..65 'self': Self
+            67..68 'f': F
+            152..163 '{ loop {} }': FilterMap<Self, F>
+            154..161 'loop {}': !
+            159..161 '{}': ()
+            184..188 'self': Self
+            190..191 'f': F
+            240..251 '{ loop {} }': ()
+            242..249 'loop {}': !
+            247..249 '{}': ()
+            360..364 'self': Self
+            689..693 'self': I
+            700..720 '{     ...     }': I
+            710..714 'self': I
+            779..790 '{ loop {} }': Vec<T>
+            781..788 'loop {}': !
+            786..788 '{}': ()
+            977..1104 '{     ... }); }': ()
+            983..998 'Vec::<i32>::new': fn new<i32>() -> Vec<i32>
+            983..1000 'Vec::<...:new()': Vec<i32>
+            983..1012 'Vec::<...iter()': IntoIter<i32>
+            983..1075 'Vec::<...one })': FilterMap<IntoIter<i32>, |i32| -> Option<u32>>
+            983..1101 'Vec::<... y; })': ()
+            1029..1074 '|x| if...None }': |i32| -> Option<u32>
+            1030..1031 'x': i32
+            1033..1074 'if x >...None }': Option<u32>
+            1036..1037 'x': i32
+            1036..1041 'x > 0': bool
+            1040..1041 '0': i32
+            1042..1060 '{ Some...u32) }': Option<u32>
+            1044..1048 'Some': Some<u32>(u32) -> Option<u32>
+            1044..1058 'Some(x as u32)': Option<u32>
+            1049..1050 'x': i32
+            1049..1057 'x as u32': u32
+            1066..1074 '{ None }': Option<u32>
+            1068..1072 'None': Option<u32>
+            1090..1100 '|y| { y; }': |u32| -> ()
+            1091..1092 'y': u32
+            1094..1100 '{ y; }': ()
+            1096..1097 'y': u32
         "#]],
     );
 }
@@ -2809,7 +2586,7 @@ impl<T:A> B for T {
 
 fn main() {
     Bar::foo();
-}          //^ Foo
+} //^^^^^^^^^^ Foo
 "#,
     );
 }
@@ -2841,9 +2618,7 @@ fn test(x: &dyn Foo) {
 fn builtin_copy() {
     check_infer_with_mismatches(
         r#"
-#[lang = "copy"]
-trait Copy {}
-
+//- minicore: copy
 struct IsCopy;
 impl Copy for IsCopy {}
 struct NotCopy;
@@ -2858,20 +2633,20 @@ fn test() {
     (IsCopy, NotCopy).test();
 }"#,
         expect![[r#"
-            110..114 'self': &Self
-            166..267 '{     ...t(); }': ()
-            172..178 'IsCopy': IsCopy
-            172..185 'IsCopy.test()': bool
-            191..198 'NotCopy': NotCopy
-            191..205 'NotCopy.test()': {unknown}
-            211..227 '(IsCop...sCopy)': (IsCopy, IsCopy)
-            211..234 '(IsCop...test()': bool
-            212..218 'IsCopy': IsCopy
-            220..226 'IsCopy': IsCopy
-            240..257 '(IsCop...tCopy)': (IsCopy, NotCopy)
-            240..264 '(IsCop...test()': {unknown}
-            241..247 'IsCopy': IsCopy
-            249..256 'NotCopy': NotCopy
+            78..82 'self': &Self
+            134..235 '{     ...t(); }': ()
+            140..146 'IsCopy': IsCopy
+            140..153 'IsCopy.test()': bool
+            159..166 'NotCopy': NotCopy
+            159..173 'NotCopy.test()': {unknown}
+            179..195 '(IsCop...sCopy)': (IsCopy, IsCopy)
+            179..202 '(IsCop...test()': bool
+            180..186 'IsCopy': IsCopy
+            188..194 'IsCopy': IsCopy
+            208..225 '(IsCop...tCopy)': (IsCopy, NotCopy)
+            208..232 '(IsCop...test()': {unknown}
+            209..215 'IsCopy': IsCopy
+            217..224 'NotCopy': NotCopy
         "#]],
     );
 }
@@ -2880,9 +2655,7 @@ fn test() {
 fn builtin_fn_def_copy() {
     check_infer_with_mismatches(
         r#"
-#[lang = "copy"]
-trait Copy {}
-
+//- minicore: copy
 fn foo() {}
 fn bar<T: Copy>(T) -> T {}
 struct Struct(usize);
@@ -2898,20 +2671,20 @@ fn test() {
     Enum::Variant.test();
 }"#,
         expect![[r#"
-            41..43 '{}': ()
-            60..61 'T': {unknown}
-            68..70 '{}': ()
-            68..70: expected T, got ()
-            145..149 'self': &Self
-            201..281 '{     ...t(); }': ()
-            207..210 'foo': fn foo()
-            207..217 'foo.test()': bool
-            223..226 'bar': fn bar<{unknown}>({unknown}) -> {unknown}
-            223..233 'bar.test()': bool
-            239..245 'Struct': Struct(usize) -> Struct
-            239..252 'Struct.test()': bool
-            258..271 'Enum::Variant': Variant(usize) -> Enum
-            258..278 'Enum::...test()': bool
+            9..11 '{}': ()
+            28..29 'T': {unknown}
+            36..38 '{}': ()
+            36..38: expected T, got ()
+            113..117 'self': &Self
+            169..249 '{     ...t(); }': ()
+            175..178 'foo': fn foo()
+            175..185 'foo.test()': bool
+            191..194 'bar': fn bar<{unknown}>({unknown}) -> {unknown}
+            191..201 'bar.test()': bool
+            207..213 'Struct': Struct(usize) -> Struct
+            207..220 'Struct.test()': bool
+            226..239 'Enum::Variant': Variant(usize) -> Enum
+            226..246 'Enum::...test()': bool
         "#]],
     );
 }
@@ -2920,9 +2693,7 @@ fn test() {
 fn builtin_fn_ptr_copy() {
     check_infer_with_mismatches(
         r#"
-#[lang = "copy"]
-trait Copy {}
-
+//- minicore: copy
 trait Test { fn test(&self) -> bool; }
 impl<T: Copy> Test for T {}
 
@@ -2932,17 +2703,17 @@ fn test(f1: fn(), f2: fn(usize) -> u8, f3: fn(u8, u8) -> &u8) {
     f3.test();
 }"#,
         expect![[r#"
-            54..58 'self': &Self
-            108..110 'f1': fn()
-            118..120 'f2': fn(usize) -> u8
-            139..141 'f3': fn(u8, u8) -> &u8
-            162..210 '{     ...t(); }': ()
-            168..170 'f1': fn()
-            168..177 'f1.test()': bool
-            183..185 'f2': fn(usize) -> u8
-            183..192 'f2.test()': bool
-            198..200 'f3': fn(u8, u8) -> &u8
-            198..207 'f3.test()': bool
+            22..26 'self': &Self
+            76..78 'f1': fn()
+            86..88 'f2': fn(usize) -> u8
+            107..109 'f3': fn(u8, u8) -> &u8
+            130..178 '{     ...t(); }': ()
+            136..138 'f1': fn()
+            136..145 'f1.test()': bool
+            151..153 'f2': fn(usize) -> u8
+            151..160 'f2.test()': bool
+            166..168 'f3': fn(u8, u8) -> &u8
+            166..175 'f3.test()': bool
         "#]],
     );
 }
@@ -2951,9 +2722,7 @@ fn test(f1: fn(), f2: fn(usize) -> u8, f3: fn(u8, u8) -> &u8) {
 fn builtin_sized() {
     check_infer_with_mismatches(
         r#"
-#[lang = "sized"]
-trait Sized {}
-
+//- minicore: sized
 trait Test { fn test(&self) -> bool; }
 impl<T: Sized> Test for T {}
 
@@ -2964,22 +2733,22 @@ fn test() {
     (1u8, *"foo").test(); // not Sized
 }"#,
         expect![[r#"
-            56..60 'self': &Self
-            113..228 '{     ...ized }': ()
-            119..122 '1u8': u8
-            119..129 '1u8.test()': bool
-            135..150 '(*"foo").test()': {unknown}
-            136..142 '*"foo"': str
-            137..142 '"foo"': &str
-            169..179 '(1u8, 1u8)': (u8, u8)
-            169..186 '(1u8, ...test()': bool
-            170..173 '1u8': u8
-            175..178 '1u8': u8
-            192..205 '(1u8, *"foo")': (u8, str)
-            192..212 '(1u8, ...test()': {unknown}
-            193..196 '1u8': u8
-            198..204 '*"foo"': str
-            199..204 '"foo"': &str
+            22..26 'self': &Self
+            79..194 '{     ...ized }': ()
+            85..88 '1u8': u8
+            85..95 '1u8.test()': bool
+            101..116 '(*"foo").test()': {unknown}
+            102..108 '*"foo"': str
+            103..108 '"foo"': &str
+            135..145 '(1u8, 1u8)': (u8, u8)
+            135..152 '(1u8, ...test()': bool
+            136..139 '1u8': u8
+            141..144 '1u8': u8
+            158..171 '(1u8, *"foo")': (u8, str)
+            158..178 '(1u8, ...test()': {unknown}
+            159..162 '1u8': u8
+            164..170 '*"foo"': str
+            165..170 '"foo"': &str
         "#]],
     );
 }
@@ -3064,45 +2833,23 @@ fn foo() {
 fn infer_fn_trait_arg() {
     check_infer_with_mismatches(
         r#"
-        //- /lib.rs deps:std
-
-        #[lang = "fn_once"]
-        pub trait FnOnce<Args> {
-            type Output;
-
-            extern "rust-call" fn call_once(&self, args: Args) -> Self::Output;
-        }
-
-        #[lang = "fn"]
-        pub trait Fn<Args>:FnOnce<Args> {
-            extern "rust-call" fn call(&self, args: Args) -> Self::Output;
-        }
-
-        enum Option<T> {
-            None,
-            Some(T)
-        }
-
-        fn foo<F, T>(f: F) -> T
-        where
-            F: Fn(Option<i32>) -> T,
-        {
-            let s = None;
-            f(s)
-        }
-        "#,
+//- minicore: fn, option
+fn foo<F, T>(f: F) -> T
+where
+    F: Fn(Option<i32>) -> T,
+{
+    let s = None;
+    f(s)
+}
+"#,
         expect![[r#"
-            101..105 'self': &Self
-            107..111 'args': Args
-            220..224 'self': &Self
-            226..230 'args': Args
-            313..314 'f': F
-            359..389 '{     ...f(s) }': T
-            369..370 's': Option<i32>
-            373..377 'None': Option<i32>
-            383..384 'f': F
-            383..387 'f(s)': T
-            385..386 's': Option<i32>
+            13..14 'f': F
+            59..89 '{     ...f(s) }': T
+            69..70 's': Option<i32>
+            73..77 'None': Option<i32>
+            83..84 'f': F
+            83..87 'f(s)': T
+            85..86 's': Option<i32>
         "#]],
     );
 }
@@ -3112,28 +2859,13 @@ fn infer_box_fn_arg() {
     // The type mismatch is because we don't define Unsize and CoerceUnsized
     check_infer_with_mismatches(
         r#"
-//- /lib.rs deps:std
-
-#[lang = "fn_once"]
-pub trait FnOnce<Args> {
-    type Output;
-
-    extern "rust-call" fn call_once(self, args: Args) -> Self::Output;
-}
-
-#[lang = "deref"]
-pub trait Deref {
-    type Target: ?Sized;
-
-    fn deref(&self) -> &Self::Target;
-}
-
+//- minicore: fn, deref, option
 #[lang = "owned_box"]
 pub struct Box<T: ?Sized> {
     inner: *mut T,
 }
 
-impl<T: ?Sized> Deref for Box<T> {
+impl<T: ?Sized> core::ops::Deref for Box<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -3141,38 +2873,30 @@ impl<T: ?Sized> Deref for Box<T> {
     }
 }
 
-enum Option<T> {
-    None,
-    Some(T)
-}
-
 fn foo() {
-    let s = Option::None;
+    let s = None;
     let f: Box<dyn FnOnce(&Option<i32>)> = box (|ps| {});
     f(&s);
 }"#,
         expect![[r#"
-            100..104 'self': Self
-            106..110 'args': Args
-            214..218 'self': &Self
-            384..388 'self': &Box<T>
-            396..423 '{     ...     }': &T
-            406..417 '&self.inner': &*mut T
-            407..411 'self': &Box<T>
-            407..417 'self.inner': *mut T
-            478..576 '{     ...&s); }': ()
-            488..489 's': Option<i32>
-            492..504 'Option::None': Option<i32>
-            514..515 'f': Box<dyn FnOnce(&Option<i32>)>
-            549..562 'box (|ps| {})': Box<|{unknown}| -> ()>
-            554..561 '|ps| {}': |{unknown}| -> ()
-            555..557 'ps': {unknown}
-            559..561 '{}': ()
-            568..569 'f': Box<dyn FnOnce(&Option<i32>)>
-            568..573 'f(&s)': ()
-            570..572 '&s': &Option<i32>
-            571..572 's': Option<i32>
-            549..562: expected Box<dyn FnOnce(&Option<i32>)>, got Box<|{unknown}| -> ()>
+            154..158 'self': &Box<T>
+            166..193 '{     ...     }': &T
+            176..187 '&self.inner': &*mut T
+            177..181 'self': &Box<T>
+            177..187 'self.inner': *mut T
+            206..296 '{     ...&s); }': ()
+            216..217 's': Option<i32>
+            220..224 'None': Option<i32>
+            234..235 'f': Box<dyn FnOnce(&Option<i32>)>
+            269..282 'box (|ps| {})': Box<|{unknown}| -> ()>
+            274..281 '|ps| {}': |{unknown}| -> ()
+            275..277 'ps': {unknown}
+            279..281 '{}': ()
+            288..289 'f': Box<dyn FnOnce(&Option<i32>)>
+            288..293 'f(&s)': ()
+            290..292 '&s': &Option<i32>
+            291..292 's': Option<i32>
+            269..282: expected Box<dyn FnOnce(&Option<i32>)>, got Box<|{unknown}| -> ()>
         "#]],
     );
 }
@@ -3181,17 +2905,7 @@ fn foo() {
 fn infer_dyn_fn_output() {
     check_types(
         r#"
-#[lang = "fn_once"]
-pub trait FnOnce<Args> {
-    type Output;
-    extern "rust-call" fn call_once(self, args: Args) -> Self::Output;
-}
-
-#[lang = "fn"]
-pub trait Fn<Args>: FnOnce<Args> {
-    extern "rust-call" fn call(&self, args: Args) -> Self::Output;
-}
-
+//- minicore: fn
 fn foo() {
     let f: &dyn Fn() -> i32;
     f();
@@ -3204,12 +2918,7 @@ fn foo() {
 fn infer_dyn_fn_once_output() {
     check_types(
         r#"
-#[lang = "fn_once"]
-pub trait FnOnce<Args> {
-    type Output;
-    extern "rust-call" fn call_once(self, args: Args) -> Self::Output;
-}
-
+//- minicore: fn
 fn foo() {
     let f: dyn FnOnce() -> i32;
     f();
@@ -3230,7 +2939,7 @@ fn test() {
     S.get(1);
   //^^^^^^^^ u128
     S.get(1.);
-  //^^^^^^^^ f32
+  //^^^^^^^^^ f32
 }
         "#,
     );
@@ -3644,20 +3353,16 @@ fn main() {
 fn fn_returning_unit() {
     check_infer_with_mismatches(
         r#"
-#[lang = "fn_once"]
-trait FnOnce<Args> {
-    type Output;
-}
-
+//- minicore: fn
 fn test<F: FnOnce()>(f: F) {
     let _: () = f();
 }"#,
         expect![[r#"
-            82..83 'f': F
-            88..112 '{     ...f(); }': ()
-            98..99 '_': ()
-            106..107 'f': F
-            106..109 'f()': ()
+            21..22 'f': F
+            27..51 '{     ...f(); }': ()
+            37..38 '_': ()
+            45..46 'f': F
+            45..48 'f()': ()
         "#]],
     );
 }
@@ -3696,16 +3401,7 @@ impl foo::Foo for u32 {
 fn infer_async_ret_type() {
     check_types(
         r#"
-//- /main.rs crate:main deps:core
-
-enum Result<T, E> {
-    Ok(T),
-    Err(E),
-}
-
-use Result::*;
-
-
+//- minicore: future, result
 struct Fooey;
 
 impl Fooey {
@@ -3718,23 +3414,82 @@ trait Convert {
     fn new() -> Self;
 }
 impl Convert for u32 {
-    fn new() -> Self {
-        0
-    }
+    fn new() -> Self { 0 }
 }
 
 async fn get_accounts() -> Result<u32, ()> {
     let ret = Fooey.collect();
-    //                      ^ u32
+    //        ^^^^^^^^^^^^^^^ u32
     Ok(ret)
 }
+"#,
+    );
+}
 
-//- /core.rs crate:core
-#[prelude_import] use future::*;
-mod future {
-    #[lang = "future_trait"]
-    trait Future {
-        type Output;
+#[test]
+fn local_impl_1() {
+    check!(block_local_impls);
+    check_types(
+        r#"
+trait Trait<T> {
+    fn foo(&self) -> T;
+}
+
+fn test() {
+    struct S;
+    impl Trait<u32> for S {
+        fn foo(&self) -> u32 { 0 }
+    }
+
+    S.foo();
+ // ^^^^^^^ u32
+}
+"#,
+    );
+}
+
+#[test]
+fn local_impl_2() {
+    check!(block_local_impls);
+    check_types(
+        r#"
+struct S;
+
+fn test() {
+    trait Trait<T> {
+        fn foo(&self) -> T;
+    }
+    impl Trait<u32> for S {
+        fn foo(&self) -> u32 { 0 }
+    }
+
+    S.foo();
+ // ^^^^^^^ u32
+}
+"#,
+    );
+}
+
+#[test]
+fn local_impl_3() {
+    check!(block_local_impls);
+    check_types(
+        r#"
+trait Trait<T> {
+    fn foo(&self) -> T;
+}
+
+fn test() {
+    struct S1;
+    {
+        struct S2;
+
+        impl Trait<S1> for S2 {
+            fn foo(&self) -> S1 { S1 }
+        }
+
+        S2.foo();
+     // ^^^^^^^^ S1
     }
 }
 "#,

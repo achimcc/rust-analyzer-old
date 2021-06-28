@@ -228,6 +228,7 @@ pub struct CrateData {
     /// `Dependency` matters), this name should only be used for UI.
     pub display_name: Option<CrateDisplayName>,
     pub cfg_options: CfgOptions,
+    pub potential_cfg_options: CfgOptions,
     pub env: Env,
     pub dependencies: Vec<Dependency>,
     pub proc_macro: Vec<ProcMacro>,
@@ -260,6 +261,7 @@ impl CrateGraph {
         edition: Edition,
         display_name: Option<CrateDisplayName>,
         cfg_options: CfgOptions,
+        potential_cfg_options: CfgOptions,
         env: Env,
         proc_macro: Vec<ProcMacro>,
     ) -> CrateId {
@@ -268,6 +270,7 @@ impl CrateGraph {
             edition,
             display_name,
             cfg_options,
+            potential_cfg_options,
             env,
             proc_macro,
             dependencies: Vec::new(),
@@ -545,6 +548,7 @@ mod tests {
             Edition2018,
             None,
             CfgOptions::default(),
+            CfgOptions::default(),
             Env::default(),
             Default::default(),
         );
@@ -553,6 +557,7 @@ mod tests {
             Edition2018,
             None,
             CfgOptions::default(),
+            CfgOptions::default(),
             Env::default(),
             Default::default(),
         );
@@ -560,6 +565,7 @@ mod tests {
             FileId(3u32),
             Edition2018,
             None,
+            CfgOptions::default(),
             CfgOptions::default(),
             Env::default(),
             Default::default(),
@@ -577,6 +583,7 @@ mod tests {
             Edition2018,
             None,
             CfgOptions::default(),
+            CfgOptions::default(),
             Env::default(),
             Default::default(),
         );
@@ -584,6 +591,7 @@ mod tests {
             FileId(2u32),
             Edition2018,
             None,
+            CfgOptions::default(),
             CfgOptions::default(),
             Env::default(),
             Default::default(),
@@ -600,6 +608,7 @@ mod tests {
             Edition2018,
             None,
             CfgOptions::default(),
+            CfgOptions::default(),
             Env::default(),
             Default::default(),
         );
@@ -608,6 +617,7 @@ mod tests {
             Edition2018,
             None,
             CfgOptions::default(),
+            CfgOptions::default(),
             Env::default(),
             Default::default(),
         );
@@ -615,6 +625,7 @@ mod tests {
             FileId(3u32),
             Edition2018,
             None,
+            CfgOptions::default(),
             CfgOptions::default(),
             Env::default(),
             Default::default(),
@@ -631,6 +642,7 @@ mod tests {
             Edition2018,
             None,
             CfgOptions::default(),
+            CfgOptions::default(),
             Env::default(),
             Default::default(),
         );
@@ -638,6 +650,7 @@ mod tests {
             FileId(2u32),
             Edition2018,
             None,
+            CfgOptions::default(),
             CfgOptions::default(),
             Env::default(),
             Default::default(),

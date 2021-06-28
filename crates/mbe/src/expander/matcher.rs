@@ -1,6 +1,6 @@
 //! An NFA-based parser, which is porting from rustc mbe parsing code
 //!
-//! See https://github.com/rust-lang/rust/blob/70b18bc2cbac4712020019f5bf57c00905373205/compiler/rustc_expand/src/mbe/macro_parser.rs
+//! See <https://github.com/rust-lang/rust/blob/70b18bc2cbac4712020019f5bf57c00905373205/compiler/rustc_expand/src/mbe/macro_parser.rs>
 //! Here is a quick intro to how the parser works, copied from rustc:
 //!
 //! A 'position' is a dot in the middle of a matcher, usually represented as a
@@ -121,7 +121,7 @@ impl Match {
 
 /// Matching errors are added to the `Match`.
 pub(super) fn match_(pattern: &MetaTemplate, input: &tt::Subtree) -> Match {
-    let mut res = match_loop(pattern, &input);
+    let mut res = match_loop(pattern, input);
     res.bound_count = count(res.bindings.bindings());
     return res;
 
@@ -202,7 +202,7 @@ impl BindingsBuilder {
     }
 
     fn push_nested(&mut self, parent: &mut BindingsIdx, child: &BindingsIdx) {
-        let BindingsIdx(idx, nidx) = self.copy(&child);
+        let BindingsIdx(idx, nidx) = self.copy(child);
         self.nodes[parent.0].push(LinkNode::Node(Rc::new(BindingKind::Nested(idx, nidx))));
     }
 
@@ -221,7 +221,7 @@ impl BindingsBuilder {
 
     fn build_inner(&self, bindings: &mut Bindings, link_nodes: &[LinkNode<Rc<BindingKind>>]) {
         let mut nodes = Vec::new();
-        self.collect_nodes(&link_nodes, &mut nodes);
+        self.collect_nodes(link_nodes, &mut nodes);
 
         for cmd in nodes {
             match &**cmd {
@@ -282,7 +282,7 @@ impl BindingsBuilder {
 
         nested_refs.into_iter().for_each(|iter| {
             let mut child_bindings = Bindings::default();
-            self.build_inner(&mut child_bindings, &iter);
+            self.build_inner(&mut child_bindings, iter);
             nested.push(child_bindings)
         })
     }
@@ -417,7 +417,7 @@ fn match_loop_inner<'t>(
                     let sep_len = item.sep.as_ref().map_or(0, Separator::tt_count);
                     if item.sep.is_some() && sep_idx != sep_len {
                         let sep = item.sep.as_ref().unwrap();
-                        if src.clone().expect_separator(&sep, sep_idx) {
+                        if src.clone().expect_separator(sep, sep_idx) {
                             item.dot.next();
                             item.sep_parsed = Some(sep_idx + 1);
                             try_push!(next_items, item);
@@ -487,7 +487,7 @@ fn match_loop_inner<'t>(
                                 item.meta_result = Some((fork, match_res));
                                 try_push!(bb_items, item);
                             } else {
-                                bindings_builder.push_optional(&mut item.bindings, &name);
+                                bindings_builder.push_optional(&mut item.bindings, name);
                                 item.dot.next();
                                 cur_items.push(item);
                             }
@@ -495,7 +495,7 @@ fn match_loop_inner<'t>(
                         Some(err) => {
                             res.add_err(err);
                             if let Some(fragment) = match_res.value {
-                                bindings_builder.push_fragment(&mut item.bindings, &name, fragment);
+                                bindings_builder.push_fragment(&mut item.bindings, name, fragment);
                             }
                             item.is_error = true;
                             error_items.push(item);
@@ -504,7 +504,7 @@ fn match_loop_inner<'t>(
                 }
             }
             OpDelimited::Op(Op::Leaf(leaf)) => {
-                if let Err(err) = match_leaf(&leaf, &mut src.clone()) {
+                if let Err(err) = match_leaf(leaf, &mut src.clone()) {
                     res.add_err(err);
                     item.is_error = true;
                 } else {
@@ -640,12 +640,12 @@ fn match_loop(pattern: &MetaTemplate, src: &tt::Subtree) -> Match {
                 let (iter, match_res) = item.meta_result.take().unwrap();
                 match match_res.value {
                     Some(fragment) => {
-                        bindings_builder.push_fragment(&mut item.bindings, &name, fragment);
+                        bindings_builder.push_fragment(&mut item.bindings, name, fragment);
                     }
                     None if match_res.err.is_none() => {
-                        bindings_builder.push_optional(&mut item.bindings, &name);
+                        bindings_builder.push_optional(&mut item.bindings, name);
                     }
-                    _ => {}
+                    None => {}
                 }
                 if let Some(err) = match_res.err {
                     res.add_err(err);
@@ -756,7 +756,7 @@ impl<'a> TtIter<'a> {
         let ok = match separator {
             Separator::Ident(lhs) if idx == 0 => match fork.expect_ident_or_underscore() {
                 Ok(rhs) => rhs.text == lhs.text,
-                _ => false,
+                Err(_) => false,
             },
             Separator::Literal(lhs) if idx == 0 => match fork.expect_literal() {
                 Ok(rhs) => match rhs {
@@ -764,11 +764,11 @@ impl<'a> TtIter<'a> {
                     tt::Leaf::Ident(rhs) => rhs.text == lhs.text,
                     tt::Leaf::Punct(_) => false,
                 },
-                _ => false,
+                Err(_) => false,
             },
             Separator::Puncts(lhss) if idx < lhss.len() => match fork.expect_punct() {
                 Ok(rhs) => rhs.char == lhss[idx].char,
-                _ => false,
+                Err(_) => false,
             },
             _ => false,
         };
@@ -804,33 +804,17 @@ impl<'a> TtIter<'a> {
         };
 
         match (punct.char, second, third) {
-            ('.', '.', Some('.'))
-            | ('.', '.', Some('='))
-            | ('<', '<', Some('='))
-            | ('>', '>', Some('=')) => {
+            ('.', '.', Some('.' | '=')) | ('<', '<', Some('=')) | ('>', '>', Some('=')) => {
                 let tt2 = self.next().unwrap().clone();
                 let tt3 = self.next().unwrap().clone();
                 Ok(tt::Subtree { delimiter: None, token_trees: vec![tt, tt2, tt3] }.into())
             }
-            ('-', '=', _)
-            | ('-', '>', _)
+            ('-' | '!' | '*' | '/' | '&' | '%' | '^' | '+' | '<' | '=' | '>' | '|', '=', _)
+            | ('-' | '=' | '>', '>', _)
             | (':', ':', _)
-            | ('!', '=', _)
             | ('.', '.', _)
-            | ('*', '=', _)
-            | ('/', '=', _)
             | ('&', '&', _)
-            | ('&', '=', _)
-            | ('%', '=', _)
-            | ('^', '=', _)
-            | ('+', '=', _)
             | ('<', '<', _)
-            | ('<', '=', _)
-            | ('=', '=', _)
-            | ('=', '>', _)
-            | ('>', '=', _)
-            | ('>', '>', _)
-            | ('|', '=', _)
             | ('|', '|', _) => {
                 let tt2 = self.next().unwrap().clone();
                 Ok(tt::Subtree { delimiter: None, token_trees: vec![tt, tt2] }.into())

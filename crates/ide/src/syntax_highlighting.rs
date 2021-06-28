@@ -137,6 +137,7 @@ pub struct HlRange {
 // injected:: Emitted for doc-string injected highlighting like rust source blocks in documentation.
 // intraDocLink:: Emitted for intra doc links in doc-strings.
 // library:: Emitted for items that are defined outside of the current crate.
+// public:: Emitted for items that are from the current crate and are `pub`.
 // mutable:: Emitted for mutable locals and statics.
 // static:: Emitted for "static" functions, also known as functions that do not take a `self` param, as well as statics and consts.
 // trait:: Emitted for associated trait items.
@@ -192,6 +193,7 @@ fn traverse(
     let mut bindings_shadow_count: FxHashMap<Name, u32> = FxHashMap::default();
 
     let mut current_macro_call: Option<ast::MacroCall> = None;
+    let mut current_attr_macro_call = None;
     let mut current_macro: Option<ast::Macro> = None;
     let mut macro_highlighter = MacroHighlighter::default();
     let mut inside_attribute = false;
@@ -224,6 +226,19 @@ fn traverse(
             WalkEvent::Leave(Some(mc)) => {
                 assert_eq!(current_macro_call, Some(mc));
                 current_macro_call = None;
+            }
+            _ => (),
+        }
+        match event.clone().map(|it| it.into_node().and_then(ast::Item::cast)) {
+            WalkEvent::Enter(Some(item)) => {
+                if sema.is_attr_macro_call(&item) {
+                    current_attr_macro_call = Some(item);
+                }
+            }
+            WalkEvent::Leave(Some(item)) => {
+                if current_attr_macro_call == Some(item) {
+                    current_attr_macro_call = None;
+                }
             }
             _ => (),
         }
@@ -280,7 +295,23 @@ fn traverse(
                 Some(parent) => {
                     // We only care Name and Name_ref
                     match (token.kind(), parent.kind()) {
-                        (IDENT, NAME) | (IDENT, NAME_REF) => parent.into(),
+                        (IDENT, NAME | NAME_REF) => parent.into(),
+                        _ => token.into(),
+                    }
+                }
+                None => token.into(),
+            }
+        } else if current_attr_macro_call.is_some() {
+            let token = match element.clone().into_token() {
+                Some(it) => it,
+                _ => continue,
+            };
+            let token = sema.descend_into_macros(token.clone());
+            match token.parent() {
+                Some(parent) => {
+                    // We only care Name and Name_ref
+                    match (token.kind(), parent.kind()) {
+                        (IDENT, NAME | NAME_REF) => parent.into(),
                         _ => token.into(),
                     }
                 }
@@ -293,7 +324,7 @@ fn traverse(
         if let Some(token) = element.as_token().cloned().and_then(ast::String::cast) {
             if token.is_raw() {
                 let expanded = element_to_highlight.as_token().unwrap().clone();
-                if inject::ra_fixture(hl, &sema, token, expanded).is_some() {
+                if inject::ra_fixture(hl, sema, token, expanded).is_some() {
                     continue;
                 }
             }
@@ -304,7 +335,7 @@ fn traverse(
         }
 
         if let Some((mut highlight, binding_hash)) = highlight::element(
-            &sema,
+            sema,
             krate,
             &mut bindings_shadow_count,
             syntactic_name_ref_highlighting,

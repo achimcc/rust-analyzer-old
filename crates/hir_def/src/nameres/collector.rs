@@ -9,6 +9,7 @@ use base_db::{CrateId, Edition, FileId, ProcMacroId};
 use cfg::{CfgExpr, CfgOptions};
 use hir_expand::{
     ast_id_map::FileAstId,
+    builtin_attr::find_builtin_attr,
     builtin_derive::find_builtin_derive,
     builtin_macro::find_builtin_macro,
     name::{name, AsName, Name},
@@ -499,7 +500,7 @@ impl DefCollector<'_> {
             let (per_ns, _) = self.def_map.resolve_path(
                 self.db,
                 self.def_map.root,
-                &path,
+                path,
                 BuiltinShadowMode::Other,
             );
 
@@ -721,7 +722,7 @@ impl DefCollector<'_> {
         if import.is_extern_crate {
             let res = self.def_map.resolve_name_in_extern_prelude(
                 self.db,
-                &import
+                import
                     .path
                     .as_ident()
                     .expect("extern crate should have been desugared to one-element path"),
@@ -1112,6 +1113,11 @@ impl DefCollector<'_> {
                                     return false;
                                 }
                             }
+
+                            self.def_map.modules[directive.module_id]
+                                .scope
+                                .add_attr_macro_invoc(ast_id.ast_id, call_id);
+
                             resolved.push((directive.module_id, call_id, directive.depth));
                             res = ReachedFixedPoint::No;
                             return false;
@@ -1254,7 +1260,7 @@ impl DefCollector<'_> {
         for directive in &self.unresolved_imports {
             if let ImportSource::Import { id: import, use_tree } = &directive.import.source {
                 match (directive.import.path.segments().first(), &directive.import.path.kind) {
-                    (Some(krate), PathKind::Plain) | (Some(krate), PathKind::Abs) => {
+                    (Some(krate), PathKind::Plain | PathKind::Abs) => {
                         if diagnosed_extern_crates.contains(krate) {
                             continue;
                         }
@@ -1345,7 +1351,7 @@ impl ModCollector<'_, '_> {
                     let imports = Import::from_use(
                         self.def_collector.db,
                         krate,
-                        &self.item_tree,
+                        self.item_tree,
                         ItemTreeId::new(self.file_id, import_id),
                     );
                     self.def_collector.unresolved_imports.extend(imports.into_iter().map(
@@ -1362,7 +1368,7 @@ impl ModCollector<'_, '_> {
                         import: Import::from_extern_crate(
                             self.def_collector.db,
                             krate,
-                            &self.item_tree,
+                            self.item_tree,
                             ItemTreeId::new(self.file_id, import_id),
                         ),
                         status: PartialResolvedImport::Unresolved,
@@ -1500,7 +1506,7 @@ impl ModCollector<'_, '_> {
             }
 
             if let Some(DefData { id, name, visibility, has_constructor }) = def {
-                self.def_collector.def_map.modules[self.module_id].scope.define_def(id);
+                self.def_collector.def_map.modules[self.module_id].scope.declare(id);
                 let vis = self
                     .def_collector
                     .def_map
@@ -1621,7 +1627,7 @@ impl ModCollector<'_, '_> {
         modules[self.module_id].children.insert(name.clone(), res);
         let module = self.def_collector.def_map.module_id(res);
         let def: ModuleDefId = module.into();
-        self.def_collector.def_map.modules[self.module_id].scope.define_def(def);
+        self.def_collector.def_map.modules[self.module_id].scope.declare(def);
         self.def_collector.update(
             self.module_id,
             &[(Some(name), PerNs::from_def(def, vis, false))],
@@ -1831,7 +1837,8 @@ impl ModCollector<'_, '_> {
         let attrs = self.item_tree.attrs(self.def_collector.db, krate, ModItem::from(id).into());
         if attrs.by_key("rustc_builtin_macro").exists() {
             let macro_id = find_builtin_macro(&mac.name, krate, ast_id)
-                .or_else(|| find_builtin_derive(&mac.name, krate, ast_id));
+                .or_else(|| find_builtin_derive(&mac.name, krate, ast_id))
+                .or_else(|| find_builtin_attr(&mac.name, krate, ast_id));
 
             match macro_id {
                 Some(macro_id) => {
@@ -1882,7 +1889,7 @@ impl ModCollector<'_, '_> {
                     self.def_collector.def_map.with_ancestor_maps(
                         self.def_collector.db,
                         self.module_id,
-                        &mut |map, module| map[module].scope.get_legacy_macro(&name),
+                        &mut |map, module| map[module].scope.get_legacy_macro(name),
                     )
                 })
             },
@@ -1985,8 +1992,8 @@ mod tests {
         collector.def_map
     }
 
-    fn do_resolve(code: &str) -> DefMap {
-        let (db, _file_id) = TestDB::with_single_file(&code);
+    fn do_resolve(not_ra_fixture: &str) -> DefMap {
+        let (db, _file_id) = TestDB::with_single_file(not_ra_fixture);
         let krate = db.test_crate();
 
         let edition = db.crate_graph()[krate].edition;
@@ -1998,24 +2005,37 @@ mod tests {
     fn test_macro_expand_will_stop_1() {
         do_resolve(
             r#"
-        macro_rules! foo {
-            ($($ty:ty)*) => { foo!($($ty)*); }
-        }
-        foo!(KABOOM);
-        "#,
+macro_rules! foo {
+    ($($ty:ty)*) => { foo!($($ty)*); }
+}
+foo!(KABOOM);
+"#,
+        );
+        do_resolve(
+            r#"
+macro_rules! foo {
+    ($($ty:ty)*) => { foo!(() $($ty)*); }
+}
+foo!(KABOOM);
+"#,
         );
     }
 
-    #[ignore] // this test does succeed, but takes quite a while :/
+    #[ignore]
     #[test]
     fn test_macro_expand_will_stop_2() {
+        // FIXME: this test does succeed, but takes quite a while: 90 seconds in
+        // the release mode. That's why the argument is not an ra_fixture --
+        // otherwise injection highlighting gets stuck.
+        //
+        // We need to find a way to fail this faster.
         do_resolve(
             r#"
-        macro_rules! foo {
-            ($($ty:ty)*) => { foo!($($ty)* $($ty)*); }
-        }
-        foo!(KABOOM);
-        "#,
+macro_rules! foo {
+    ($($ty:ty)*) => { foo!($($ty)* $($ty)*); }
+}
+foo!(KABOOM);
+"#,
         );
     }
 }

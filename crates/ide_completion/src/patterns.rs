@@ -4,14 +4,14 @@ use hir::Semantics;
 use ide_db::RootDatabase;
 use syntax::{
     algo::non_trivia_sibling,
-    ast::{self, LoopBodyOwner},
+    ast::{self, ArgListOwner, LoopBodyOwner},
     match_ast, AstNode, Direction, SyntaxElement,
     SyntaxKind::*,
     SyntaxNode, SyntaxToken, TextRange, TextSize, T,
 };
 
 #[cfg(test)]
-use crate::test_utils::{check_pattern_is_applicable, check_pattern_is_not_applicable};
+use crate::tests::{check_pattern_is_applicable, check_pattern_is_not_applicable};
 
 /// Immediate previous node to what we are completing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -19,19 +19,24 @@ pub(crate) enum ImmediatePrevSibling {
     IfExpr,
     TraitDefName,
     ImplDefType,
+    Visibility,
+    Attribute,
 }
 
 /// Direct parent "thing" of what we are currently completing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ImmediateLocation {
     Use,
+    UseTree,
     Impl,
     Trait,
     RecordField,
+    TupleField,
     RefExpr,
     IdentPat,
     BlockExpr,
     ItemList,
+    TypeBound,
     // Fake file ast node
     Attribute(ast::Attr),
     // Fake file ast node
@@ -39,12 +44,16 @@ pub(crate) enum ImmediateLocation {
     // Original file ast node
     MethodCall {
         receiver: Option<ast::Expr>,
+        has_parens: bool,
     },
     // Original file ast node
     FieldAccess {
         receiver: Option<ast::Expr>,
         receiver_is_ambiguous_float_literal: bool,
     },
+    // Original file ast node
+    // Only set from a type arg
+    GenericArgList(ast::GenericArgList),
     // Original file ast node
     /// The record expr of the field name we are completing
     RecordExpr(ast::RecordExpr),
@@ -75,6 +84,17 @@ pub(crate) fn determine_prev_sibling(name_like: &ast::NameLike) -> Option<Immedi
         _ => node,
     };
     let prev_sibling = non_trivia_sibling(node.into(), Direction::Prev)?.into_node()?;
+    if prev_sibling.kind() == ERROR {
+        let prev_sibling = prev_sibling.first_child()?;
+        let res = match_ast! {
+            match prev_sibling {
+                // vis followed by random ident will always error the parser
+                ast::Visibility(_it) => ImmediatePrevSibling::Visibility,
+                _ => return None,
+            }
+        };
+        return Some(res);
+    }
     let res = match_ast! {
         match prev_sibling {
             ast::ExprStmt(it) => {
@@ -97,6 +117,7 @@ pub(crate) fn determine_prev_sibling(name_like: &ast::NameLike) -> Option<Immedi
                 } else {
                     return None
             },
+            ast::Attr(_it) => ImmediatePrevSibling::Attribute,
             _ => return None,
         }
     };
@@ -111,12 +132,12 @@ pub(crate) fn determine_location(
 ) -> Option<ImmediateLocation> {
     let node = match name_like {
         ast::NameLike::NameRef(name_ref) => {
-            if ast::RecordExprField::for_field_name(&name_ref).is_some() {
+            if ast::RecordExprField::for_field_name(name_ref).is_some() {
                 return sema
                     .find_node_at_offset_with_macros(original_file, offset)
                     .map(ImmediateLocation::RecordExpr);
             }
-            if ast::RecordPatField::for_field_name_ref(&name_ref).is_some() {
+            if ast::RecordPatField::for_field_name_ref(name_ref).is_some() {
                 return sema
                     .find_node_at_offset_with_macros(original_file, offset)
                     .map(ImmediateLocation::RecordPat);
@@ -124,7 +145,7 @@ pub(crate) fn determine_location(
             maximize_name_ref(name_ref)
         }
         ast::NameLike::Name(name) => {
-            if ast::RecordPatField::for_field_name(&name).is_some() {
+            if ast::RecordPatField::for_field_name(name).is_some() {
                 return sema
                     .find_node_at_offset_with_macros(original_file, offset)
                     .map(ImmediateLocation::RecordPat);
@@ -132,6 +153,13 @@ pub(crate) fn determine_location(
             name.syntax().clone()
         }
         ast::NameLike::Lifetime(lt) => lt.syntax().clone(),
+    };
+
+    match_ast! {
+        match node {
+            ast::TypeBoundList(_it) => return Some(ImmediateLocation::TypeBound),
+            _ => (),
+        }
     };
 
     let parent = match node.parent() {
@@ -158,21 +186,33 @@ pub(crate) fn determine_location(
             }
         }
     };
-
     let res = match_ast! {
         match parent {
             ast::IdentPat(_it) => ImmediateLocation::IdentPat,
             ast::Use(_it) => ImmediateLocation::Use,
+            ast::UseTree(_it) => ImmediateLocation::UseTree,
+            ast::UseTreeList(_it) => ImmediateLocation::UseTree,
             ast::BlockExpr(_it) => ImmediateLocation::BlockExpr,
             ast::SourceFile(_it) => ImmediateLocation::ItemList,
             ast::ItemList(_it) => ImmediateLocation::ItemList,
             ast::RefExpr(_it) => ImmediateLocation::RefExpr,
-            ast::RecordField(_it) => ImmediateLocation::RecordField,
+            ast::RecordField(it) => if it.ty().map_or(false, |it| it.syntax().text_range().contains(offset)) {
+                return None;
+            } else {
+                ImmediateLocation::RecordField
+            },
+            ast::TupleField(_it) => ImmediateLocation::TupleField,
+            ast::TupleFieldList(_it) => ImmediateLocation::TupleField,
+            ast::TypeBound(_it) => ImmediateLocation::TypeBound,
+            ast::TypeBoundList(_it) => ImmediateLocation::TypeBound,
             ast::AssocItemList(it) => match it.syntax().parent().map(|it| it.kind()) {
                 Some(IMPL) => ImmediateLocation::Impl,
                 Some(TRAIT) => ImmediateLocation::Trait,
                 _ => return None,
             },
+            ast::GenericArgList(_it) => sema
+                .find_node_at_offset_with_macros(original_file, offset)
+                .map(ImmediateLocation::GenericArgList)?,
             ast::Module(it) => {
                 if it.item_list().is_none() {
                     ImmediateLocation::ModDeclaration(it)
@@ -204,6 +244,7 @@ pub(crate) fn determine_location(
                     .receiver()
                     .map(|e| e.syntax().text_range())
                     .and_then(|r| find_node_with_range(original_file, r)),
+                has_parens: it.arg_list().map_or(false, |it| it.l_paren_token().is_some())
             },
             _ => return None,
         }
@@ -252,7 +293,7 @@ fn test_inside_impl_trait_block() {
 }
 
 pub(crate) fn previous_token(element: SyntaxElement) -> Option<SyntaxToken> {
-    element.into_token().and_then(|it| previous_non_trivia_token(it))
+    element.into_token().and_then(previous_non_trivia_token)
 }
 
 /// Check if the token previous to the previous one is `for`.
@@ -260,8 +301,8 @@ pub(crate) fn previous_token(element: SyntaxElement) -> Option<SyntaxToken> {
 pub(crate) fn for_is_prev2(element: SyntaxElement) -> bool {
     element
         .into_token()
-        .and_then(|it| previous_non_trivia_token(it))
-        .and_then(|it| previous_non_trivia_token(it))
+        .and_then(previous_non_trivia_token)
+        .and_then(previous_non_trivia_token)
         .filter(|it| it.kind() == T![for])
         .is_some()
 }
@@ -270,9 +311,8 @@ fn test_for_is_prev2() {
     check_pattern_is_applicable(r"for i i$0", for_is_prev2);
 }
 
-pub(crate) fn is_in_loop_body(element: SyntaxElement) -> bool {
-    element
-        .ancestors()
+pub(crate) fn is_in_loop_body(node: &SyntaxNode) -> bool {
+    node.ancestors()
         .take_while(|it| it.kind() != FN && it.kind() != CLOSURE_EXPR)
         .find_map(|it| {
             let loop_body = match_ast! {
@@ -283,7 +323,7 @@ pub(crate) fn is_in_loop_body(element: SyntaxElement) -> bool {
                     _ => None,
                 }
             };
-            loop_body.filter(|it| it.syntax().text_range().contains_range(element.text_range()))
+            loop_body.filter(|it| it.syntax().text_range().contains_range(node.text_range()))
         })
         .is_some()
 }
@@ -304,7 +344,7 @@ fn previous_non_trivia_token(token: SyntaxToken) -> Option<SyntaxToken> {
 mod tests {
     use syntax::algo::find_node_at_offset;
 
-    use crate::test_utils::position;
+    use crate::tests::position;
 
     use super::*;
 
@@ -353,8 +393,8 @@ mod tests {
     fn test_use_loc() {
         check_location(r"use f$0", ImmediateLocation::Use);
         check_location(r"use f$0;", ImmediateLocation::Use);
-        check_location(r"use f::{f$0}", None);
-        check_location(r"use {f$0}", None);
+        check_location(r"use f::{f$0}", ImmediateLocation::UseTree);
+        check_location(r"use {f$0}", ImmediateLocation::UseTree);
     }
 
     #[test]
@@ -414,5 +454,15 @@ mod tests {
     fn test_if_expr_prev_sibling() {
         check_prev_sibling(r"fn foo() { if true {} w$0", ImmediatePrevSibling::IfExpr);
         check_prev_sibling(r"fn foo() { if true {}; w$0", None);
+    }
+
+    #[test]
+    fn test_vis_prev_sibling() {
+        check_prev_sibling(r"pub w$0", ImmediatePrevSibling::Visibility);
+    }
+
+    #[test]
+    fn test_attr_prev_sibling() {
+        check_prev_sibling(r"#[attr] w$0", ImmediatePrevSibling::Attribute);
     }
 }

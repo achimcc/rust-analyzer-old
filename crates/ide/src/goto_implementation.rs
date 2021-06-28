@@ -52,13 +52,13 @@ pub(crate) fn goto_implementation(
         hir::ModuleDef::Function(f) => {
             let assoc = f.as_assoc_item(sema.db)?;
             let name = assoc.name(sema.db)?;
-            let trait_ = assoc.containing_trait(sema.db)?;
+            let trait_ = assoc.containing_trait_or_trait_impl(sema.db)?;
             impls_for_trait_item(&sema, trait_, name)
         }
         hir::ModuleDef::Const(c) => {
             let assoc = c.as_assoc_item(sema.db)?;
             let name = assoc.name(sema.db)?;
-            let trait_ = assoc.containing_trait(sema.db)?;
+            let trait_ = assoc.containing_trait_or_trait_impl(sema.db)?;
             impls_for_trait_item(&sema, trait_, name)
         }
         _ => return None,
@@ -87,7 +87,7 @@ fn impls_for_trait_item(
         .filter_map(|imp| {
             let item = imp.items(sema.db).iter().find_map(|itm| {
                 let itm_name = itm.name(sema.db)?;
-                (itm_name == fun_name).then(|| itm.clone())
+                (itm_name == fun_name).then(|| *itm)
             })?;
             item.try_to_nav(sema.db)
         })
@@ -236,15 +236,10 @@ impl T for &Foo {}
     fn goto_implementation_to_builtin_derive() {
         check(
             r#"
+//- minicore: copy, derive
   #[derive(Copy)]
 //^^^^^^^^^^^^^^^
 struct Foo$0;
-
-mod marker {
-    trait Copy {}
-}
-#[rustc_builtin_macro]
-macro Copy {}
 "#,
         );
     }

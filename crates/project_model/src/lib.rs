@@ -41,7 +41,7 @@ pub use crate::{
     },
     project_json::{ProjectJson, ProjectJsonData},
     sysroot::Sysroot,
-    workspace::{PackageRoot, ProjectWorkspace},
+    workspace::{CfgOverrides, PackageRoot, ProjectWorkspace},
 };
 
 pub use proc_macro_api::ProcMacroClient;
@@ -119,7 +119,7 @@ impl ProjectManifest {
         }
     }
 
-    pub fn discover_all(paths: &[impl AsRef<AbsPath>]) -> Vec<ProjectManifest> {
+    pub fn discover_all(paths: &[AbsPathBuf]) -> Vec<ProjectManifest> {
         let mut res = paths
             .iter()
             .filter_map(|it| ProjectManifest::discover(it.as_ref()).ok())

@@ -103,8 +103,9 @@ pub(crate) fn auto_import(acc: &mut Assists, ctx: &AssistContext) -> Option<()> 
                 let scope = match scope.clone() {
                     ImportScope::File(it) => ImportScope::File(builder.make_mut(it)),
                     ImportScope::Module(it) => ImportScope::Module(builder.make_mut(it)),
+                    ImportScope::Block(it) => ImportScope::Block(builder.make_mut(it)),
                 };
-                insert_use(&scope, mod_path_to_ast(&import.import_path), ctx.config.insert_use);
+                insert_use(&scope, mod_path_to_ast(&import.import_path), &ctx.config.insert_use);
             },
         );
     }

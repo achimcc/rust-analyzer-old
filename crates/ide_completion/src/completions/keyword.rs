@@ -5,8 +5,8 @@ use std::iter;
 use syntax::{SyntaxKind, T};
 
 use crate::{
-    patterns::ImmediateLocation, CompletionContext, CompletionItem, CompletionItemKind,
-    CompletionKind, Completions,
+    context::PathCompletionContext, patterns::ImmediateLocation, CompletionContext, CompletionItem,
+    CompletionItemKind, CompletionKind, Completions,
 };
 
 pub(crate) fn complete_use_tree_keyword(acc: &mut Completions, ctx: &CompletionContext) {
@@ -18,25 +18,22 @@ pub(crate) fn complete_use_tree_keyword(acc: &mut Completions, ctx: &CompletionC
         item
     };
 
-    if ctx.use_item_syntax.is_some() {
-        if ctx.path_qual.is_none() {
-            kw_completion("crate::").add_to(acc);
-        }
-        kw_completion("self").add_to(acc);
-        if iter::successors(ctx.path_qual.clone(), |p| p.qualifier())
-            .all(|p| p.segment().and_then(|s| s.super_token()).is_some())
-        {
-            kw_completion("super::").add_to(acc);
-        }
-    }
-
-    // Suggest .await syntax for types that implement Future trait
-    if let Some(receiver) = ctx.dot_receiver() {
-        if let Some(ty) = ctx.sema.type_of_expr(receiver) {
-            if ty.impls_future(ctx.db) {
-                let mut item = kw_completion("await");
-                item.detail("expr.await");
-                item.add_to(acc);
+    if ctx.in_use_tree() {
+        match &ctx.path_context {
+            Some(PathCompletionContext { qualifier: Some(qual), use_tree_parent, .. }) => {
+                if iter::successors(Some(qual.clone()), |p| p.qualifier())
+                    .all(|p| p.segment().and_then(|s| s.super_token()).is_some())
+                {
+                    kw_completion("super::").add_to(acc);
+                }
+                if *use_tree_parent {
+                    kw_completion("self").add_to(acc);
+                }
+            }
+            _ => {
+                kw_completion("crate::").add_to(acc);
+                kw_completion("self::").add_to(acc);
+                kw_completion("super::").add_to(acc);
             }
         };
     }
@@ -51,6 +48,23 @@ pub(crate) fn complete_expr_keyword(acc: &mut Completions, ctx: &CompletionConte
         cov_mark::hit!(no_keyword_completion_in_record_lit);
         return;
     }
+    if ctx.attribute_under_caret.is_some() {
+        cov_mark::hit!(no_keyword_completion_in_attr_of_expr);
+        return;
+    }
+
+    // Suggest .await syntax for types that implement Future trait
+    if let Some(receiver) = ctx.dot_receiver() {
+        if let Some(ty) = ctx.sema.type_of_expr(receiver) {
+            if ty.impls_future(ctx.db) {
+                let mut item =
+                    CompletionItem::new(CompletionKind::Keyword, ctx.source_range(), "await");
+                item.kind(CompletionItemKind::Keyword).detail("expr.await");
+                item.add_to(acc);
+            }
+        };
+    }
+
     let mut add_keyword = |kw, snippet| add_keyword(ctx, acc, kw, snippet);
 
     let expects_assoc_item = ctx.expects_assoc_item();
@@ -59,6 +73,9 @@ pub(crate) fn complete_expr_keyword(acc: &mut Completions, ctx: &CompletionConte
 
     if ctx.has_impl_or_trait_prev_sibling() {
         add_keyword("where", "where ");
+        if ctx.has_impl_prev_sibling() {
+            add_keyword("for", "for ");
+        }
         return;
     }
     if ctx.previous_token_is(T![unsafe]) {
@@ -74,7 +91,9 @@ pub(crate) fn complete_expr_keyword(acc: &mut Completions, ctx: &CompletionConte
         return;
     }
 
-    if expects_item || ctx.expects_non_trait_assoc_item() || ctx.expect_record_field() {
+    if !ctx.has_visibility_prev_sibling()
+        && (expects_item || ctx.expects_non_trait_assoc_item() || ctx.expect_field())
+    {
         add_keyword("pub(crate)", "pub(crate) ");
         add_keyword("pub", "pub ");
     }
@@ -87,11 +106,13 @@ pub(crate) fn complete_expr_keyword(acc: &mut Completions, ctx: &CompletionConte
     }
 
     if expects_item || has_block_expr_parent {
+        if !ctx.has_visibility_prev_sibling() {
+            add_keyword("impl", "impl $1 {\n    $0\n}");
+            add_keyword("extern", "extern $0");
+        }
         add_keyword("use", "use $0");
-        add_keyword("impl", "impl $1 {\n    $0\n}");
         add_keyword("trait", "trait $1 {\n    $0\n}");
         add_keyword("static", "static $0");
-        add_keyword("extern", "extern $0");
         add_keyword("mod", "mod $0");
     }
 
@@ -99,6 +120,10 @@ pub(crate) fn complete_expr_keyword(acc: &mut Completions, ctx: &CompletionConte
         add_keyword("enum", "enum $1 {\n    $0\n}");
         add_keyword("struct", "struct $0");
         add_keyword("union", "union $1 {\n    $0\n}");
+    }
+
+    if ctx.expects_type() {
+        return;
     }
 
     if ctx.expects_expression() {
@@ -127,8 +152,15 @@ pub(crate) fn complete_expr_keyword(acc: &mut Completions, ctx: &CompletionConte
         add_keyword("mut", "mut ");
     }
 
-    if ctx.in_loop_body {
-        if ctx.can_be_stmt {
+    let (can_be_stmt, in_loop_body) = match ctx.path_context {
+        Some(PathCompletionContext {
+            is_trivial_path: true, can_be_stmt, in_loop_body, ..
+        }) => (can_be_stmt, in_loop_body),
+        _ => return,
+    };
+
+    if in_loop_body {
+        if can_be_stmt {
             add_keyword("continue", "continue;");
             add_keyword("break", "break;");
         } else {
@@ -137,9 +169,6 @@ pub(crate) fn complete_expr_keyword(acc: &mut Completions, ctx: &CompletionConte
         }
     }
 
-    if !ctx.is_trivial_path {
-        return;
-    }
     let fn_def = match &ctx.function_def {
         Some(it) => it,
         None => return,
@@ -147,7 +176,7 @@ pub(crate) fn complete_expr_keyword(acc: &mut Completions, ctx: &CompletionConte
 
     add_keyword(
         "return",
-        match (ctx.can_be_stmt, fn_def.ret_type().is_some()) {
+        match (can_be_stmt, fn_def.ret_type().is_some()) {
             (true, true) => "return $0;",
             (true, false) => "return;",
             (false, true) => "return $0",
@@ -181,72 +210,13 @@ mod tests {
     use expect_test::{expect, Expect};
 
     use crate::{
-        test_utils::{check_edit, completion_list},
+        tests::{check_edit, filtered_completion_list},
         CompletionKind,
     };
 
     fn check(ra_fixture: &str, expect: Expect) {
-        let actual = completion_list(ra_fixture, CompletionKind::Keyword);
+        let actual = filtered_completion_list(ra_fixture, CompletionKind::Keyword);
         expect.assert_eq(&actual)
-    }
-
-    #[test]
-    fn test_keywords_in_use_stmt() {
-        check(
-            r"use $0",
-            expect![[r#"
-                kw crate::
-                kw self
-                kw super::
-            "#]],
-        );
-
-        // FIXME: `self` shouldn't be shown here and the check below
-        check(
-            r"use a::$0",
-            expect![[r#"
-            kw self
-        "#]],
-        );
-
-        check(
-            r"use super::$0",
-            expect![[r#"
-                kw self
-                kw super::
-            "#]],
-        );
-
-        check(
-            r"use a::{b, $0}",
-            expect![[r#"
-            kw self
-        "#]],
-        );
-    }
-
-    #[test]
-    fn test_keywords_at_source_file_level() {
-        check(
-            r"m$0",
-            expect![[r#"
-                kw pub(crate)
-                kw pub
-                kw unsafe
-                kw fn
-                kw const
-                kw type
-                kw use
-                kw impl
-                kw trait
-                kw static
-                kw extern
-                kw mod
-                kw enum
-                kw struct
-                kw union
-            "#]],
-        );
     }
 
     #[test]
@@ -258,11 +228,11 @@ mod tests {
                 kw fn
                 kw const
                 kw type
-                kw use
                 kw impl
+                kw extern
+                kw use
                 kw trait
                 kw static
-                kw extern
                 kw mod
                 kw match
                 kw while
@@ -286,11 +256,11 @@ mod tests {
                 kw fn
                 kw const
                 kw type
-                kw use
                 kw impl
+                kw extern
+                kw use
                 kw trait
                 kw static
-                kw extern
                 kw mod
                 kw match
                 kw while
@@ -314,11 +284,11 @@ mod tests {
                 kw fn
                 kw const
                 kw type
-                kw use
                 kw impl
+                kw extern
+                kw use
                 kw trait
                 kw static
-                kw extern
                 kw mod
                 kw match
                 kw while
@@ -365,49 +335,6 @@ fn quux() -> i32 {
     }
 
     #[test]
-    fn test_keywords_in_trait_def() {
-        check(
-            r"trait My { $0 }",
-            expect![[r#"
-                kw unsafe
-                kw fn
-                kw const
-                kw type
-            "#]],
-        );
-    }
-
-    #[test]
-    fn test_keywords_in_impl_def() {
-        check(
-            r"impl My { $0 }",
-            expect![[r#"
-                kw pub(crate)
-                kw pub
-                kw unsafe
-                kw fn
-                kw const
-                kw type
-            "#]],
-        );
-    }
-
-    #[test]
-    fn test_keywords_in_impl_def_with_attr() {
-        check(
-            r"impl My { #[foo] $0 }",
-            expect![[r#"
-                kw pub(crate)
-                kw pub
-                kw unsafe
-                kw fn
-                kw const
-                kw type
-            "#]],
-        );
-    }
-
-    #[test]
     fn test_keywords_in_loop() {
         check(
             r"fn my() { loop { $0 } }",
@@ -416,11 +343,11 @@ fn quux() -> i32 {
                 kw fn
                 kw const
                 kw type
-                kw use
                 kw impl
+                kw extern
+                kw use
                 kw trait
                 kw static
-                kw extern
                 kw mod
                 kw match
                 kw while
@@ -438,18 +365,6 @@ fn quux() -> i32 {
     }
 
     #[test]
-    fn test_keywords_after_unsafe_in_item_list() {
-        check(
-            r"unsafe $0",
-            expect![[r#"
-                kw fn
-                kw trait
-                kw impl
-            "#]],
-        );
-    }
-
-    #[test]
     fn test_keywords_after_unsafe_in_block_expr() {
         check(
             r"fn my_fn() { unsafe $0 }",
@@ -457,44 +372,6 @@ fn quux() -> i32 {
                 kw fn
                 kw trait
                 kw impl
-            "#]],
-        );
-    }
-
-    #[test]
-    fn test_mut_in_ref_and_in_fn_parameters_list() {
-        check(
-            r"fn my_fn(&$0) {}",
-            expect![[r#"
-                kw mut
-            "#]],
-        );
-        check(
-            r"fn my_fn($0) {}",
-            expect![[r#"
-                kw mut
-            "#]],
-        );
-        check(
-            r"fn my_fn() { let &$0 }",
-            expect![[r#"
-                kw mut
-            "#]],
-        );
-    }
-
-    #[test]
-    fn test_where_keyword() {
-        check(
-            r"trait A $0",
-            expect![[r#"
-                kw where
-            "#]],
-        );
-        check(
-            r"impl A $0",
-            expect![[r#"
-                kw where
             "#]],
         );
     }
@@ -531,17 +408,11 @@ Some multi-line comment$0
     fn test_completion_await_impls_future() {
         check(
             r#"
-//- /main.rs crate:main deps:std
-use std::future::*;
+//- minicore: future
+use core::future::*;
 struct A {}
 impl Future for A {}
 fn foo(a: A) { a.$0 }
-
-//- /std/lib.rs crate:std
-pub mod future {
-    #[lang = "future_trait"]
-    pub trait Future {}
-}
 "#,
             expect![[r#"
                 kw await expr.await
@@ -550,19 +421,11 @@ pub mod future {
 
         check(
             r#"
-//- /main.rs crate:main deps:std
+//- minicore: future
 use std::future::*;
 fn foo() {
     let a = async {};
     a.$0
-}
-
-//- /std/lib.rs crate:std
-pub mod future {
-    #[lang = "future_trait"]
-    pub trait Future {
-        type Output;
-    }
 }
 "#,
             expect![[r#"
@@ -585,22 +448,6 @@ pub mod future {
                 kw if let
                 kw for
                 kw return
-            "#]],
-        )
-    }
-
-    #[test]
-    fn before_field() {
-        check(
-            r#"
-struct Foo {
-    $0
-    pub f: i32,
-}
-"#,
-            expect![[r#"
-                kw pub(crate)
-                kw pub
             "#]],
         )
     }

@@ -5,11 +5,10 @@ use hir::{AsAssocItem, InFile, ModuleDef, Semantics};
 use ide_db::{
     base_db::{AnchoredPath, FileId, FileLoader},
     defs::{Definition, NameClass, NameRefClass},
+    helpers::pick_best_token,
     RootDatabase,
 };
-use syntax::{
-    ast, match_ast, AstNode, AstToken, SyntaxKind::*, SyntaxToken, TextRange, TokenAtOffset, T,
-};
+use syntax::{ast, match_ast, AstNode, AstToken, SyntaxKind::*, SyntaxToken, TextRange, T};
 
 use crate::{
     display::TryToNav,
@@ -34,7 +33,12 @@ pub(crate) fn goto_definition(
 ) -> Option<RangeInfo<Vec<NavigationTarget>>> {
     let sema = Semantics::new(db);
     let file = sema.parse(position.file_id).syntax().clone();
-    let original_token = pick_best(file.token_at_offset(position.offset))?;
+    let original_token =
+        pick_best_token(file.token_at_offset(position.offset), |kind| match kind {
+            IDENT | INT_NUMBER | LIFETIME_IDENT | T![self] | T![super] | T![crate] | COMMENT => 2,
+            kind if kind.is_trivia() => 0,
+            _ => 1,
+        })?;
     let token = sema.descend_into_macros(original_token.clone());
     let parent = token.parent()?;
     if let Some(_) = ast::Comment::cast(token.clone()) {
@@ -43,7 +47,7 @@ pub(crate) fn goto_definition(
         let (docs, doc_mapping) = attributes.docs_with_rangemap(db)?;
         let (_, link, ns) =
             extract_definitions_from_markdown(docs.as_str()).into_iter().find(|(range, ..)| {
-                doc_mapping.map(range.clone()).map_or(false, |InFile { file_id, value: range }| {
+                doc_mapping.map(*range).map_or(false, |InFile { file_id, value: range }| {
                     file_id == position.file_id.into() && range.contains(position.offset)
                 })
             })?;
@@ -57,7 +61,7 @@ pub(crate) fn goto_definition(
             },
             ast::Name(name) => {
                 let def = NameClass::classify(&sema, &name)?.referenced_or_defined(sema.db);
-                try_find_trait_item_definition(&sema.db, &def)
+                try_find_trait_item_definition(sema.db, &def)
                     .or_else(|| def.try_to_nav(sema.db))
             },
             ast::Lifetime(lt) => if let Some(name_class) = NameClass::classify_lifetime(&sema, &lt) {
@@ -128,17 +132,6 @@ fn try_find_trait_item_definition(db: &RootDatabase, def: &Definition) -> Option
         .find_map(|itm| (itm.name(db)? == name).then(|| itm.try_to_nav(db)).flatten())
 }
 
-fn pick_best(tokens: TokenAtOffset<SyntaxToken>) -> Option<SyntaxToken> {
-    return tokens.max_by_key(priority);
-    fn priority(n: &SyntaxToken) -> usize {
-        match n.kind() {
-            IDENT | INT_NUMBER | LIFETIME_IDENT | T![self] | COMMENT => 2,
-            kind if kind.is_trivia() => 0,
-            _ => 1,
-        }
-    }
-}
-
 pub(crate) fn reference_definition(
     sema: &Semantics<RootDatabase>,
     name_ref: Either<&ast::Lifetime, &ast::NameRef>,
@@ -185,7 +178,7 @@ mod tests {
 extern crate std$0;
 //- /std/lib.rs crate:std
 // empty
-//^ file
+//^file
 "#,
         )
     }
@@ -198,7 +191,7 @@ extern crate std$0;
 extern crate std as abc$0;
 //- /std/lib.rs crate:std
 // empty
-//^ file
+//^file
 "#,
         )
     }
@@ -253,7 +246,7 @@ mod $0foo;
 
 //- /foo.rs
 // empty
-//^ file
+//^file
 "#,
         );
 
@@ -264,7 +257,7 @@ mod $0foo;
 
 //- /foo/mod.rs
 // empty
-//^ file
+//^file
 "#,
         );
     }
@@ -395,7 +388,7 @@ use foo as bar$0;
 
 //- /foo/lib.rs crate:foo
 // empty
-//^ file
+//^file
 "#,
         );
     }
@@ -1130,15 +1123,15 @@ fn foo<'foobar>(_: &'foobar ()) {
     }
 
     #[test]
-    #[ignore] // requires the HIR to somehow track these hrtb lifetimes
     fn goto_lifetime_hrtb() {
-        check(
+        // FIXME: requires the HIR to somehow track these hrtb lifetimes
+        check_unresolved(
             r#"trait Foo<T> {}
 fn foo<T>() where for<'a> T: Foo<&'a$0 (u8, u16)>, {}
                     //^^
 "#,
         );
-        check(
+        check_unresolved(
             r#"trait Foo<T> {}
 fn foo<T>() where for<'a$0> T: Foo<&'a (u8, u16)>, {}
                     //^^
@@ -1147,9 +1140,9 @@ fn foo<T>() where for<'a$0> T: Foo<&'a (u8, u16)>, {}
     }
 
     #[test]
-    #[ignore] // requires ForTypes to be implemented
     fn goto_lifetime_hrtb_for_type() {
-        check(
+        // FIXME: requires ForTypes to be implemented
+        check_unresolved(
             r#"trait Foo<T> {}
 fn foo<T>() where T: for<'a> Foo<&'a$0 (u8, u16)>, {}
                        //^^
@@ -1287,7 +1280,7 @@ fn main() {
 }
 //- /foo.txt
 // empty
-//^ file
+//^file
 "#,
         );
     }

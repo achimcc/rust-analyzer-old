@@ -1,6 +1,6 @@
 use expect_test::expect;
 
-use super::{check_infer, check_types};
+use super::{check_infer, check_no_mismatches, check_types};
 
 #[test]
 fn bug_484() {
@@ -418,55 +418,24 @@ fn issue_2705() {
 fn issue_2683_chars_impl() {
     check_types(
         r#"
-//- /main.rs crate:main deps:std
+//- minicore: iterator
+pub struct Chars<'a> {}
+impl<'a> Iterator for Chars<'a> {
+    type Item = char;
+    fn next(&mut self) -> Option<char> { loop {} }
+}
+
 fn test() {
-    let chars: std::str::Chars<'_>;
+    let chars: Chars<'_>;
     (chars.next(), chars.nth(1));
-} //^ (Option<char>, Option<char>)
-
-//- /std.rs crate:std
-#[prelude_import]
-use self::prelude::rust_2018::*;
-pub mod prelude {
-    pub mod rust_2018 {
-        pub use crate::iter::Iterator;
-        pub use crate::option::Option;
-    }
-}
-
-pub mod iter {
-    pub use self::traits::Iterator;
-    pub mod traits {
-        pub use self::iterator::Iterator;
-
-        pub mod iterator {
-            pub trait Iterator {
-                type Item;
-                fn next(&mut self) -> Option<Self::Item>;
-                fn nth(&mut self, n: usize) -> Option<Self::Item> {}
-            }
-        }
-    }
-}
-
-pub mod option {
-    pub enum Option<T> {}
-}
-
-pub mod str {
-    pub struct Chars<'a> {}
-    impl<'a> Iterator for Chars<'a> {
-        type Item = char;
-        fn next(&mut self) -> Option<char> {}
-    }
-}
+} //^^^^^^^^^^^^^^^^^^^^^^^^^^^^ (Option<char>, Option<char>)
 "#,
     );
 }
 
 #[test]
 fn issue_3642_bad_macro_stackover() {
-    check_types(
+    check_no_mismatches(
         r#"
 #[macro_export]
 macro_rules! match_ast {
@@ -483,7 +452,6 @@ macro_rules! match_ast {
 
 fn main() {
     let anchor = match_ast! {
-       //^ ()
         match parent {
             as => {},
             _ => return None
@@ -736,12 +704,8 @@ fn issue_4931() {
 fn issue_4885() {
     check_infer(
         r#"
-        #[lang = "coerce_unsized"]
-        pub trait CoerceUnsized<T> {}
-
-        trait Future {
-            type Output;
-        }
+        //- minicore: coerce_unsized, future
+        use core::future::Future;
         trait Foo<R> {
             type Bar;
         }
@@ -758,13 +722,13 @@ fn issue_4885() {
         }
         "#,
         expect![[r#"
-            136..139 'key': &K
-            198..214 '{     ...key) }': impl Future<Output = <K as Foo<R>>::Bar>
-            204..207 'bar': fn bar<R, K>(&K) -> impl Future<Output = <K as Foo<R>>::Bar>
-            204..212 'bar(key)': impl Future<Output = <K as Foo<R>>::Bar>
-            208..211 'key': &K
-            228..231 'key': &K
-            290..293 '{ }': ()
+            70..73 'key': &K
+            132..148 '{     ...key) }': impl Future<Output = <K as Foo<R>>::Bar>
+            138..141 'bar': fn bar<R, K>(&K) -> impl Future<Output = <K as Foo<R>>::Bar>
+            138..146 'bar(key)': impl Future<Output = <K as Foo<R>>::Bar>
+            142..145 'key': &K
+            162..165 'key': &K
+            224..227 '{ }': ()
         "#]],
     );
 }
@@ -827,6 +791,7 @@ fn issue_4800() {
 fn issue_4966() {
     check_infer(
         r#"
+        //- minicore: deref
         pub trait IntoIterator {
             type Item;
         }
@@ -837,12 +802,7 @@ fn issue_4966() {
 
         struct Vec<T> {}
 
-        #[lang = "deref"]
-        pub trait Deref {
-            type Target;
-        }
-
-        impl<T> Deref for Vec<T> {
+        impl<T> core::ops::Deref for Vec<T> {
             type Target = [T];
         }
 
@@ -859,23 +819,23 @@ fn issue_4966() {
         }
         "#,
         expect![[r#"
-            270..274 'iter': T
-            289..291 '{}': ()
-            303..447 '{     ...r(); }': ()
-            313..318 'inner': Map<|&f64| -> f64>
-            321..345 'Map { ... 0.0 }': Map<|&f64| -> f64>
-            330..343 '|_: &f64| 0.0': |&f64| -> f64
-            331..332 '_': &f64
-            340..343 '0.0': f64
-            356..362 'repeat': Repeat<Map<|&f64| -> f64>>
-            365..390 'Repeat...nner }': Repeat<Map<|&f64| -> f64>>
-            383..388 'inner': Map<|&f64| -> f64>
-            401..404 'vec': Vec<IntoIterator::Item<Repeat<Map<|&f64| -> f64>>>>
-            407..416 'from_iter': fn from_iter<IntoIterator::Item<Repeat<Map<|&f64| -> f64>>>, Repeat<Map<|&f64| -> f64>>>(Repeat<Map<|&f64| -> f64>>) -> Vec<IntoIterator::Item<Repeat<Map<|&f64| -> f64>>>>
-            407..424 'from_i...epeat)': Vec<IntoIterator::Item<Repeat<Map<|&f64| -> f64>>>>
-            417..423 'repeat': Repeat<Map<|&f64| -> f64>>
-            431..434 'vec': Vec<IntoIterator::Item<Repeat<Map<|&f64| -> f64>>>>
-            431..444 'vec.foo_bar()': {unknown}
+            225..229 'iter': T
+            244..246 '{}': ()
+            258..402 '{     ...r(); }': ()
+            268..273 'inner': Map<|&f64| -> f64>
+            276..300 'Map { ... 0.0 }': Map<|&f64| -> f64>
+            285..298 '|_: &f64| 0.0': |&f64| -> f64
+            286..287 '_': &f64
+            295..298 '0.0': f64
+            311..317 'repeat': Repeat<Map<|&f64| -> f64>>
+            320..345 'Repeat...nner }': Repeat<Map<|&f64| -> f64>>
+            338..343 'inner': Map<|&f64| -> f64>
+            356..359 'vec': Vec<IntoIterator::Item<Repeat<Map<|&f64| -> f64>>>>
+            362..371 'from_iter': fn from_iter<IntoIterator::Item<Repeat<Map<|&f64| -> f64>>>, Repeat<Map<|&f64| -> f64>>>(Repeat<Map<|&f64| -> f64>>) -> Vec<IntoIterator::Item<Repeat<Map<|&f64| -> f64>>>>
+            362..379 'from_i...epeat)': Vec<IntoIterator::Item<Repeat<Map<|&f64| -> f64>>>>
+            372..378 'repeat': Repeat<Map<|&f64| -> f64>>
+            386..389 'vec': Vec<IntoIterator::Item<Repeat<Map<|&f64| -> f64>>>>
+            386..399 'vec.foo_bar()': {unknown}
         "#]],
     );
 }
@@ -884,41 +844,37 @@ fn issue_4966() {
 fn issue_6628() {
     check_infer(
         r#"
-        #[lang = "fn_once"]
-        pub trait FnOnce<Args> {
-            type Output;
-        }
-
-        struct S<T>();
-        impl<T> S<T> {
-            fn f(&self, _t: T) {}
-            fn g<F: FnOnce(&T)>(&self, _f: F) {}
-        }
-        fn main() {
-            let s = S();
-            s.g(|_x| {});
-            s.f(10);
-        }
-        "#,
+//- minicore: fn
+struct S<T>();
+impl<T> S<T> {
+    fn f(&self, _t: T) {}
+    fn g<F: FnOnce(&T)>(&self, _f: F) {}
+}
+fn main() {
+    let s = S();
+    s.g(|_x| {});
+    s.f(10);
+}
+"#,
         expect![[r#"
-            105..109 'self': &S<T>
-            111..113 '_t': T
-            118..120 '{}': ()
-            146..150 'self': &S<T>
-            152..154 '_f': F
-            159..161 '{}': ()
-            174..225 '{     ...10); }': ()
-            184..185 's': S<i32>
-            188..189 'S': S<i32>() -> S<i32>
-            188..191 'S()': S<i32>
-            197..198 's': S<i32>
-            197..209 's.g(|_x| {})': ()
-            201..208 '|_x| {}': |&i32| -> ()
-            202..204 '_x': &i32
-            206..208 '{}': ()
-            215..216 's': S<i32>
-            215..222 's.f(10)': ()
-            219..221 '10': i32
+            40..44 'self': &S<T>
+            46..48 '_t': T
+            53..55 '{}': ()
+            81..85 'self': &S<T>
+            87..89 '_f': F
+            94..96 '{}': ()
+            109..160 '{     ...10); }': ()
+            119..120 's': S<i32>
+            123..124 'S': S<i32>() -> S<i32>
+            123..126 'S()': S<i32>
+            132..133 's': S<i32>
+            132..144 's.g(|_x| {})': ()
+            136..143 '|_x| {}': |&i32| -> ()
+            137..139 '_x': &i32
+            141..143 '{}': ()
+            150..151 's': S<i32>
+            150..157 's.f(10)': ()
+            154..156 '10': i32
         "#]],
     );
 }
@@ -927,35 +883,33 @@ fn issue_6628() {
 fn issue_6852() {
     check_infer(
         r#"
-        #[lang = "deref"]
-        pub trait Deref {
-            type Target;
-        }
+//- minicore: deref
+use core::ops::Deref;
 
-        struct BufWriter {}
+struct BufWriter {}
 
-        struct Mutex<T> {}
-        struct MutexGuard<'a, T> {}
-        impl<T> Mutex<T> {
-            fn lock(&self) -> MutexGuard<'_, T> {}
-        }
-        impl<'a, T: 'a> Deref for MutexGuard<'a, T> {
-            type Target = T;
-        }
-        fn flush(&self) {
-            let w: &Mutex<BufWriter>;
-            *(w.lock());
-        }
-        "#,
+struct Mutex<T> {}
+struct MutexGuard<'a, T> {}
+impl<T> Mutex<T> {
+    fn lock(&self) -> MutexGuard<'_, T> {}
+}
+impl<'a, T: 'a> Deref for MutexGuard<'a, T> {
+    type Target = T;
+}
+fn flush(&self) {
+    let w: &Mutex<BufWriter>;
+    *(w.lock());
+}
+"#,
         expect![[r#"
-            156..160 'self': &Mutex<T>
-            183..185 '{}': ()
-            267..271 'self': &{unknown}
-            273..323 '{     ...()); }': ()
-            283..284 'w': &Mutex<BufWriter>
-            309..320 '*(w.lock())': BufWriter
-            311..312 'w': &Mutex<BufWriter>
-            311..319 'w.lock()': MutexGuard<BufWriter>
+            123..127 'self': &Mutex<T>
+            150..152 '{}': ()
+            234..238 'self': &{unknown}
+            240..290 '{     ...()); }': ()
+            250..251 'w': &Mutex<BufWriter>
+            276..287 '*(w.lock())': BufWriter
+            278..279 'w': &Mutex<BufWriter>
+            278..286 'w.lock()': MutexGuard<BufWriter>
         "#]],
     );
 }
@@ -977,37 +931,33 @@ fn param_overrides_fn() {
 fn lifetime_from_chalk_during_deref() {
     check_types(
         r#"
-        #[lang = "deref"]
-        pub trait Deref {
-            type Target;
-        }
+//- minicore: deref
+struct Box<T: ?Sized> {}
+impl<T> core::ops::Deref for Box<T> {
+    type Target = T;
 
-        struct Box<T: ?Sized> {}
-        impl<T> Deref for Box<T> {
-            type Target = T;
+    fn deref(&self) -> &Self::Target {
+        loop {}
+    }
+}
 
-            fn deref(&self) -> &Self::Target {
-                loop {}
-            }
-        }
+trait Iterator {
+    type Item;
+}
 
-        trait Iterator {
-            type Item;
-        }
+pub struct Iter<'a, T: 'a> {
+    inner: Box<dyn IterTrait<'a, T, Item = &'a T> + 'a>,
+}
 
-        pub struct Iter<'a, T: 'a> {
-            inner: Box<dyn IterTrait<'a, T, Item = &'a T> + 'a>,
-        }
+trait IterTrait<'a, T: 'a>: Iterator<Item = &'a T> {
+    fn clone_box(&self);
+}
 
-        trait IterTrait<'a, T: 'a>: Iterator<Item = &'a T> {
-            fn clone_box(&self);
-        }
-
-        fn clone_iter<T>(s: Iter<T>) {
-            s.inner.clone_box();
-          //^^^^^^^^^^^^^^^^^^^ ()
-        }
-        "#,
+fn clone_iter<T>(s: Iter<T>) {
+    s.inner.clone_box();
+  //^^^^^^^^^^^^^^^^^^^ ()
+}
+"#,
     )
 }
 

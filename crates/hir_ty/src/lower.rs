@@ -238,7 +238,7 @@ impl<'a> TyLoweringContext<'a> {
                         // away instead of two.
                         let actual_opaque_type_data = self
                             .with_debruijn(DebruijnIndex::INNERMOST, |ctx| {
-                                ctx.lower_impl_trait(&bounds)
+                                ctx.lower_impl_trait(bounds)
                             });
                         self.opaque_type_data.borrow_mut()[idx as usize] = actual_opaque_type_data;
 
@@ -421,7 +421,7 @@ impl<'a> TyLoweringContext<'a> {
                     let found = self
                         .db
                         .trait_data(trait_ref.hir_trait_id())
-                        .associated_type_by_name(&segment.name);
+                        .associated_type_by_name(segment.name);
                     match found {
                         Some(associated_ty) => {
                             // FIXME handle type parameters on the segment
@@ -505,7 +505,7 @@ impl<'a> TyLoweringContext<'a> {
     pub(crate) fn lower_path(&self, path: &Path) -> (Ty, Option<TypeNs>) {
         // Resolve the path (in type namespace)
         if let Some(type_ref) = path.type_anchor() {
-            let (ty, res) = self.lower_ty_ext(&type_ref);
+            let (ty, res) = self.lower_ty_ext(type_ref);
             return self.lower_ty_relative_path(ty, res, path.segments());
         }
         let (resolution, remaining_index) =
@@ -562,7 +562,7 @@ impl<'a> TyLoweringContext<'a> {
                 },
             );
 
-            ty.unwrap_or(TyKind::Error.intern(&Interner))
+            ty.unwrap_or_else(|| TyKind::Error.intern(&Interner))
         } else {
             TyKind::Error.intern(&Interner)
         }
@@ -784,7 +784,7 @@ impl<'a> TyLoweringContext<'a> {
         let trait_ref = match bound {
             TypeBound::Path(path) => {
                 bindings = self.lower_trait_ref_from_path(path, Some(self_ty));
-                bindings.clone().map(WhereClause::Implemented).map(|b| crate::wrap_empty_binders(b))
+                bindings.clone().map(WhereClause::Implemented).map(crate::wrap_empty_binders)
             }
             TypeBound::Lifetime(_) => None,
             TypeBound::Error => None,
@@ -957,7 +957,7 @@ pub(crate) fn field_types_query(
 /// like `T::Item`.
 ///
 /// See the analogous query in rustc and its comment:
-/// https://github.com/rust-lang/rust/blob/9150f844e2624eb013ec78ca08c1d416e6644026/src/librustc_typeck/astconv.rs#L46
+/// <https://github.com/rust-lang/rust/blob/9150f844e2624eb013ec78ca08c1d416e6644026/src/librustc_typeck/astconv.rs#L46>
 /// This is a query mostly to handle cycles somewhat gracefully; e.g. the
 /// following bounds are disallowed: `T: Foo<U::Item>, U: Foo<T::Item>`, but
 /// these are fine: `T: Foo<U::Item>, U: Foo<()>`.

@@ -68,8 +68,9 @@ impl Sysroot {
     pub fn load(sysroot_src_dir: &AbsPath) -> Result<Sysroot> {
         let mut sysroot = Sysroot { crates: Arena::default() };
 
-        for name in SYSROOT_CRATES.trim().lines() {
-            let root = [format!("{}/src/lib.rs", name), format!("lib{}/lib.rs", name)]
+        for path in SYSROOT_CRATES.trim().lines() {
+            let name = path.split('/').last().unwrap();
+            let root = [format!("{}/src/lib.rs", path), format!("lib{}/lib.rs", path)]
                 .iter()
                 .map(|it| sysroot_src_dir.join(it))
                 .find(|it| it.exists());
@@ -142,12 +143,12 @@ fn discover_sysroot_src_dir(
         log::debug!("RUST_SRC_PATH is set, but is invalid (no core: {:?}), ignoring", core);
     }
 
-    get_rust_src(&sysroot_path)
+    get_rust_src(sysroot_path)
         .or_else(|| {
             let mut rustup = Command::new(toolchain::rustup());
             rustup.current_dir(current_dir).args(&["component", "add", "rust-src"]);
             utf8_stdout(rustup).ok()?;
-            get_rust_src(&sysroot_path)
+            get_rust_src(sysroot_path)
         })
         .ok_or_else(|| {
             format_err!(
@@ -191,9 +192,8 @@ panic_abort
 panic_unwind
 proc_macro
 profiler_builtins
-rtstartup
 std
-stdarch
+stdarch/crates/std_detect
 term
 test
 unwind";
@@ -204,9 +204,8 @@ core
 panic_abort
 panic_unwind
 profiler_builtins
-rtstartup
 proc_macro
-stdarch
+std_detect
 term
 test
 unwind";

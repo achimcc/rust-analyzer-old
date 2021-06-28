@@ -35,11 +35,9 @@ use stdx::impl_from;
 use syntax::SmolStr;
 
 use super::{DomainGoal, InEnvironment, ProjectionTy, TraitEnvironment, TraitRef, Ty};
-use crate::diagnostics_sink::DiagnosticSink;
 use crate::{
-    db::HirDatabase, fold_tys, infer::diagnostics::InferenceDiagnostic,
-    lower::ImplTraitLoweringMode, to_assoc_type_id, AliasEq, AliasTy, Goal, Interner, Substitution,
-    TyBuilder, TyExt, TyKind,
+    db::HirDatabase, fold_tys, lower::ImplTraitLoweringMode, to_assoc_type_id, AliasEq, AliasTy,
+    Goal, Interner, Substitution, TyBuilder, TyExt, TyKind,
 };
 
 // This lint has a false positive here. See the link below for details.
@@ -80,7 +78,7 @@ enum ExprOrPatId {
 impl_from!(ExprId, PatId for ExprOrPatId);
 
 /// Binding modes inferred for patterns.
-/// https://doc.rust-lang.org/reference/patterns.html#binding-modes
+/// <https://doc.rust-lang.org/reference/patterns.html#binding-modes>
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum BindingMode {
     Move,
@@ -111,6 +109,12 @@ pub(crate) struct InferOk {
 pub(crate) struct TypeError;
 pub(crate) type InferResult = Result<InferOk, TypeError>;
 
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum InferenceDiagnostic {
+    NoSuchField { expr: ExprId },
+    BreakOutsideOfLoop { expr: ExprId },
+}
+
 /// A mismatch between an expected and an inferred type.
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub struct TypeMismatch {
@@ -140,7 +144,7 @@ pub struct InferenceResult {
     variant_resolutions: FxHashMap<ExprOrPatId, VariantId>,
     /// For each associated item record what it resolves to
     assoc_resolutions: FxHashMap<ExprOrPatId, AssocItemId>,
-    diagnostics: Vec<InferenceDiagnostic>,
+    pub diagnostics: Vec<InferenceDiagnostic>,
     pub type_of_expr: ArenaMap<ExprId, Ty>,
     /// For each pattern record the type it resolves to.
     ///
@@ -190,14 +194,6 @@ impl InferenceResult {
             ExprOrPatId::PatId(pat) => Some((pat, mismatch)),
             _ => None,
         })
-    }
-    pub fn add_diagnostics(
-        &self,
-        db: &dyn HirDatabase,
-        owner: DefWithBodyId,
-        sink: &mut DiagnosticSink,
-    ) {
-        self.diagnostics.iter().for_each(|it| it.add_to(db, owner, sink))
     }
 }
 
@@ -765,6 +761,38 @@ impl Expectation {
             Expectation::RValueLikeUnsized(_) | Expectation::None => None,
         }
     }
+
+    /// Comment copied from rustc:
+    /// Disregard "castable to" expectations because they
+    /// can lead us astray. Consider for example `if cond
+    /// {22} else {c} as u8` -- if we propagate the
+    /// "castable to u8" constraint to 22, it will pick the
+    /// type 22u8, which is overly constrained (c might not
+    /// be a u8). In effect, the problem is that the
+    /// "castable to" expectation is not the tightest thing
+    /// we can say, so we want to drop it in this case.
+    /// The tightest thing we can say is "must unify with
+    /// else branch". Note that in the case of a "has type"
+    /// constraint, this limitation does not hold.
+    ///
+    /// If the expected type is just a type variable, then don't use
+    /// an expected type. Otherwise, we might write parts of the type
+    /// when checking the 'then' block which are incompatible with the
+    /// 'else' branch.
+    fn adjust_for_branches(&self, table: &mut unify::InferenceTable) -> Expectation {
+        match self {
+            Expectation::HasType(ety) => {
+                let ety = table.resolve_ty_shallow(ety);
+                if !ety.is_ty_var() {
+                    Expectation::HasType(ety)
+                } else {
+                    Expectation::None
+                }
+            }
+            Expectation::RValueLikeUnsized(ety) => Expectation::RValueLikeUnsized(ety.clone()),
+            _ => Expectation::None,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -802,45 +830,5 @@ impl std::ops::BitAndAssign for Diverges {
 impl std::ops::BitOrAssign for Diverges {
     fn bitor_assign(&mut self, other: Self) {
         *self = *self | other;
-    }
-}
-
-mod diagnostics {
-    use hir_def::{expr::ExprId, DefWithBodyId};
-
-    use crate::{
-        db::HirDatabase,
-        diagnostics::{BreakOutsideOfLoop, NoSuchField},
-        diagnostics_sink::DiagnosticSink,
-    };
-
-    #[derive(Debug, PartialEq, Eq, Clone)]
-    pub(super) enum InferenceDiagnostic {
-        NoSuchField { expr: ExprId },
-        BreakOutsideOfLoop { expr: ExprId },
-    }
-
-    impl InferenceDiagnostic {
-        pub(super) fn add_to(
-            &self,
-            db: &dyn HirDatabase,
-            owner: DefWithBodyId,
-            sink: &mut DiagnosticSink,
-        ) {
-            match self {
-                InferenceDiagnostic::NoSuchField { expr } => {
-                    let (_, source_map) = db.body_with_source_map(owner);
-                    let field = source_map.field_syntax(*expr);
-                    sink.push(NoSuchField { file: field.file_id, field: field.value })
-                }
-                InferenceDiagnostic::BreakOutsideOfLoop { expr } => {
-                    let (_, source_map) = db.body_with_source_map(owner);
-                    let ptr = source_map
-                        .expr_syntax(*expr)
-                        .expect("break outside of loop in synthetic syntax");
-                    sink.push(BreakOutsideOfLoop { file: ptr.file_id, expr: ptr.value })
-                }
-            }
-        }
     }
 }

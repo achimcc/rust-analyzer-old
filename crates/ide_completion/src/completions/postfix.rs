@@ -24,7 +24,7 @@ pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
     }
 
     let (dot_receiver, receiver_is_ambiguous_float_literal) = match &ctx.completion_location {
-        Some(ImmediateLocation::MethodCall { receiver: Some(it) }) => (it, false),
+        Some(ImmediateLocation::MethodCall { receiver: Some(it), .. }) => (it, false),
         Some(ImmediateLocation::FieldAccess {
             receiver: Some(it),
             receiver_is_ambiguous_float_literal,
@@ -34,7 +34,7 @@ pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
 
     let receiver_text = get_receiver_text(dot_receiver, receiver_is_ambiguous_float_literal);
 
-    let receiver_ty = match ctx.sema.type_of_expr(&dot_receiver) {
+    let receiver_ty = match ctx.sema.type_of_expr(dot_receiver) {
         Some(it) => it,
         None => return,
     };
@@ -50,7 +50,7 @@ pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
                 postfix_snippet(
                     ctx,
                     cap,
-                    &dot_receiver,
+                    dot_receiver,
                     "ifl",
                     "if let Ok {}",
                     &format!("if let Ok($1) = {} {{\n    $0\n}}", receiver_text),
@@ -60,7 +60,7 @@ pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
                 postfix_snippet(
                     ctx,
                     cap,
-                    &dot_receiver,
+                    dot_receiver,
                     "while",
                     "while let Ok {}",
                     &format!("while let Ok($1) = {} {{\n    $0\n}}", receiver_text),
@@ -71,7 +71,7 @@ pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
                 postfix_snippet(
                     ctx,
                     cap,
-                    &dot_receiver,
+                    dot_receiver,
                     "ifl",
                     "if let Some {}",
                     &format!("if let Some($1) = {} {{\n    $0\n}}", receiver_text),
@@ -81,7 +81,7 @@ pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
                 postfix_snippet(
                     ctx,
                     cap,
-                    &dot_receiver,
+                    dot_receiver,
                     "while",
                     "while let Some {}",
                     &format!("while let Some($1) = {} {{\n    $0\n}}", receiver_text),
@@ -93,7 +93,7 @@ pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
         postfix_snippet(
             ctx,
             cap,
-            &dot_receiver,
+            dot_receiver,
             "if",
             "if expr {}",
             &format!("if {} {{\n    $0\n}}", receiver_text),
@@ -102,22 +102,22 @@ pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
         postfix_snippet(
             ctx,
             cap,
-            &dot_receiver,
+            dot_receiver,
             "while",
             "while expr {}",
             &format!("while {} {{\n    $0\n}}", receiver_text),
         )
         .add_to(acc);
-        postfix_snippet(ctx, cap, &dot_receiver, "not", "!expr", &format!("!{}", receiver_text))
+        postfix_snippet(ctx, cap, dot_receiver, "not", "!expr", &format!("!{}", receiver_text))
             .add_to(acc);
     }
 
-    postfix_snippet(ctx, cap, &dot_receiver, "ref", "&expr", &format!("&{}", receiver_text))
+    postfix_snippet(ctx, cap, dot_receiver, "ref", "&expr", &format!("&{}", receiver_text))
         .add_to(acc);
     postfix_snippet(
         ctx,
         cap,
-        &dot_receiver,
+        dot_receiver,
         "refm",
         "&mut expr",
         &format!("&mut {}", receiver_text),
@@ -307,12 +307,12 @@ mod tests {
     use expect_test::{expect, Expect};
 
     use crate::{
-        test_utils::{check_edit, completion_list},
+        tests::{check_edit, filtered_completion_list},
         CompletionKind,
     };
 
     fn check(ra_fixture: &str, expect: Expect) {
-        let actual = completion_list(ra_fixture, CompletionKind::Postfix);
+        let actual = filtered_completion_list(ra_fixture, CompletionKind::Postfix);
         expect.assert_eq(&actual)
     }
 
@@ -436,18 +436,15 @@ fn main() {
         check_edit(
             "ifl",
             r#"
-enum Option<T> { Some(T), None }
-
+//- minicore: option
 fn main() {
-    let bar = Option::Some(true);
+    let bar = Some(true);
     bar.$0
 }
 "#,
             r#"
-enum Option<T> { Some(T), None }
-
 fn main() {
-    let bar = Option::Some(true);
+    let bar = Some(true);
     if let Some($1) = bar {
     $0
 }
@@ -461,18 +458,15 @@ fn main() {
         check_edit(
             "match",
             r#"
-enum Result<T, E> { Ok(T), Err(E) }
-
+//- minicore: result
 fn main() {
-    let bar = Result::Ok(true);
+    let bar = Ok(true);
     bar.$0
 }
 "#,
             r#"
-enum Result<T, E> { Ok(T), Err(E) }
-
 fn main() {
-    let bar = Result::Ok(true);
+    let bar = Ok(true);
     match bar {
     Ok(${1:_}) => {$2},
     Err(${3:_}) => {$0},
@@ -515,18 +509,15 @@ fn main() {
         check_edit(
             "ifl",
             r#"
-enum Option<T> { Some(T), None }
-
+//- minicore: option
 fn main() {
-    let bar = &Option::Some(true);
+    let bar = &Some(true);
     bar.$0
 }
 "#,
             r#"
-enum Option<T> { Some(T), None }
-
 fn main() {
-    let bar = &Option::Some(true);
+    let bar = &Some(true);
     if let Some($1) = bar {
     $0
 }

@@ -1,7 +1,7 @@
 //! Read both stdout and stderr of child without deadlocks.
 //!
-//! https://github.com/rust-lang/cargo/blob/905af549966f23a9288e9993a85d1249a5436556/crates/cargo-util/src/read2.rs
-//! https://github.com/rust-lang/cargo/blob/58a961314437258065e23cb6316dfc121d96fb71/crates/cargo-util/src/process_builder.rs#L231
+//! <https://github.com/rust-lang/cargo/blob/905af549966f23a9288e9993a85d1249a5436556/crates/cargo-util/src/read2.rs>
+//! <https://github.com/rust-lang/cargo/blob/58a961314437258065e23cb6316dfc121d96fb71/crates/cargo-util/src/process_builder.rs#L231>
 
 use std::{
     io,
@@ -234,5 +234,21 @@ mod imp {
             v.reserve(1);
         }
         slice::from_raw_parts_mut(v.as_mut_ptr().add(v.len()), v.capacity() - v.len())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+mod imp {
+    use std::{
+        io,
+        process::{ChildStderr, ChildStdout},
+    };
+
+    pub(crate) fn read2(
+        _out_pipe: ChildStdout,
+        _err_pipe: ChildStderr,
+        _data: &mut dyn FnMut(bool, &mut Vec<u8>, bool),
+    ) -> io::Result<()> {
+        panic!("no processes on wasm")
     }
 }

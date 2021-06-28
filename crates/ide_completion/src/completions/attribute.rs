@@ -15,18 +15,24 @@ use crate::{
     Completions,
 };
 
+mod cfg;
 mod derive;
 mod lint;
+mod repr;
 
 pub(crate) fn complete_attribute(acc: &mut Completions, ctx: &CompletionContext) -> Option<()> {
     let attribute = ctx.attribute_under_caret.as_ref()?;
     match (attribute.path().and_then(|p| p.as_single_name_ref()), attribute.token_tree()) {
         (Some(path), Some(token_tree)) => match path.text().as_str() {
             "derive" => derive::complete_derive(acc, ctx, token_tree),
+            "repr" => repr::complete_repr(acc, ctx, token_tree),
             "feature" => lint::complete_lint(acc, ctx, token_tree, FEATURES),
             "allow" | "warn" | "deny" | "forbid" => {
                 lint::complete_lint(acc, ctx, token_tree.clone(), DEFAULT_LINTS);
                 lint::complete_lint(acc, ctx, token_tree, CLIPPY_LINTS);
+            }
+            "cfg" => {
+                cfg::complete_cfg(acc, ctx);
             }
             _ => (),
         },
@@ -69,7 +75,7 @@ fn complete_new_attribute(acc: &mut Completions, ctx: &CompletionContext, attrib
         }
 
         if is_inner || !attr_completion.prefer_inner {
-            acc.add(item.build());
+            item.add_to(acc);
         }
     };
 
@@ -96,7 +102,7 @@ fn complete_new_attribute(acc: &mut Completions, ctx: &CompletionContext, attrib
                 if let Some(docs) = mac.docs(ctx.sema.db) {
                     item.documentation(docs);
                 }
-                acc.add(item.build());
+                item.add_to(acc);
             }
         }
     });
@@ -171,7 +177,7 @@ static KIND_TO_ATTRIBUTES: Lazy<FxHashMap<SyntaxKind, &[&str]>> = Lazy::new(|| {
                 "recursion_limit", "type_length_limit", "windows_subsystem"
             ),
         ),
-        (MODULE, attrs!(item, "no_implicit_prelude", "path")),
+        (MODULE, attrs!(item, "macro_use", "no_implicit_prelude", "path")),
         (ITEM_LIST, attrs!(item, "no_implicit_prelude")),
         (MACRO_RULES, attrs!(item, "macro_export", "macro_use")),
         (MACRO_DEF, attrs!(item)),
@@ -219,7 +225,7 @@ static KIND_TO_ATTRIBUTES: Lazy<FxHashMap<SyntaxKind, &[&str]>> = Lazy::new(|| {
 });
 const EXPR_ATTRIBUTES: &[&str] = attrs!();
 
-/// https://doc.rust-lang.org/reference/attributes.html#built-in-attributes-index
+/// <https://doc.rust-lang.org/reference/attributes.html#built-in-attributes-index>
 // Keep these sorted for the binary search!
 const ATTRIBUTES: &[AttrCompletion] = &[
     attr("allow(…)", Some("allow"), Some("allow(${0:lint})")),
@@ -322,7 +328,7 @@ mod tests {
 
     use expect_test::{expect, Expect};
 
-    use crate::{test_utils::completion_list, CompletionKind};
+    use crate::tests::completion_list;
 
     #[test]
     fn attributes_are_sorted() {
@@ -341,7 +347,7 @@ mod tests {
     }
 
     fn check(ra_fixture: &str, expect: Expect) {
-        let actual = completion_list(ra_fixture, CompletionKind::Attribute);
+        let actual = completion_list(ra_fixture);
         expect.assert_eq(&actual);
     }
 
@@ -399,20 +405,21 @@ mod tests {
         check(
             r#"#[$0] mod foo;"#,
             expect![[r#"
-            at allow(…)
-            at cfg(…)
-            at cfg_attr(…)
-            at deny(…)
-            at forbid(…)
-            at warn(…)
-            at deprecated
-            at doc = "…"
-            at doc(hidden)
-            at doc(alias = "…")
-            at must_use
-            at no_mangle
-            at path = "…"
-        "#]],
+                at allow(…)
+                at cfg(…)
+                at cfg_attr(…)
+                at deny(…)
+                at forbid(…)
+                at warn(…)
+                at deprecated
+                at doc = "…"
+                at doc(hidden)
+                at doc(alias = "…")
+                at must_use
+                at no_mangle
+                at macro_use
+                at path = "…"
+            "#]],
         );
         check(
             r#"mod foo {#![$0]}"#,
@@ -792,6 +799,7 @@ mod tests {
 
     #[test]
     fn complete_attribute_on_expr() {
+        cov_mark::check!(no_keyword_completion_in_attr_of_expr);
         check(
             r#"fn main() { #[$0] foo() }"#,
             expect![[r#"
@@ -847,6 +855,17 @@ mod tests {
                 at used
                 at warn(…)
             "#]],
+        );
+    }
+
+    #[test]
+    fn test_cfg() {
+        check(
+            r#"#[cfg(target_endian = $0"#,
+            expect![[r#"
+                at little
+                at big
+"#]],
         );
     }
 }

@@ -16,11 +16,10 @@ use hir::{
 };
 use ide_db::{
     defs::{Definition, NameClass, NameRefClass},
+    helpers::pick_best_token,
     RootDatabase,
 };
-use syntax::{
-    ast, match_ast, AstNode, SyntaxKind::*, SyntaxNode, SyntaxToken, TextRange, TokenAtOffset, T,
-};
+use syntax::{ast, match_ast, AstNode, SyntaxKind::*, SyntaxNode, TextRange, T};
 
 use crate::{FilePosition, Semantics};
 
@@ -102,7 +101,12 @@ pub(crate) fn external_docs(
 ) -> Option<DocumentationLink> {
     let sema = Semantics::new(db);
     let file = sema.parse(position.file_id).syntax().clone();
-    let token = pick_best(file.token_at_offset(position.offset))?;
+    let token = pick_best_token(file.token_at_offset(position.offset), |kind| match kind {
+        IDENT | INT_NUMBER => 3,
+        T!['('] | T![')'] => 2,
+        kind if kind.is_trivia() => 0,
+        _ => 1,
+    })?;
     let token = sema.descend_into_macros(token);
 
     let node = token.parent()?;
@@ -151,18 +155,18 @@ pub(crate) fn resolve_doc_path_for_def(
 ) -> Option<hir::ModuleDef> {
     match def {
         Definition::ModuleDef(def) => match def {
-            hir::ModuleDef::Module(it) => it.resolve_doc_path(db, &link, ns),
-            hir::ModuleDef::Function(it) => it.resolve_doc_path(db, &link, ns),
-            hir::ModuleDef::Adt(it) => it.resolve_doc_path(db, &link, ns),
-            hir::ModuleDef::Variant(it) => it.resolve_doc_path(db, &link, ns),
-            hir::ModuleDef::Const(it) => it.resolve_doc_path(db, &link, ns),
-            hir::ModuleDef::Static(it) => it.resolve_doc_path(db, &link, ns),
-            hir::ModuleDef::Trait(it) => it.resolve_doc_path(db, &link, ns),
-            hir::ModuleDef::TypeAlias(it) => it.resolve_doc_path(db, &link, ns),
+            hir::ModuleDef::Module(it) => it.resolve_doc_path(db, link, ns),
+            hir::ModuleDef::Function(it) => it.resolve_doc_path(db, link, ns),
+            hir::ModuleDef::Adt(it) => it.resolve_doc_path(db, link, ns),
+            hir::ModuleDef::Variant(it) => it.resolve_doc_path(db, link, ns),
+            hir::ModuleDef::Const(it) => it.resolve_doc_path(db, link, ns),
+            hir::ModuleDef::Static(it) => it.resolve_doc_path(db, link, ns),
+            hir::ModuleDef::Trait(it) => it.resolve_doc_path(db, link, ns),
+            hir::ModuleDef::TypeAlias(it) => it.resolve_doc_path(db, link, ns),
             hir::ModuleDef::BuiltinType(_) => None,
         },
-        Definition::Macro(it) => it.resolve_doc_path(db, &link, ns),
-        Definition::Field(it) => it.resolve_doc_path(db, &link, ns),
+        Definition::Macro(it) => it.resolve_doc_path(db, link, ns),
+        Definition::Field(it) => it.resolve_doc_path(db, link, ns),
         Definition::SelfType(_)
         | Definition::Local(_)
         | Definition::GenericParam(_)
@@ -192,7 +196,7 @@ pub(crate) fn doc_attributes(
             ast::TupleField(it)  => sema.to_def(&it).map(|def| (def.attrs(sema.db), Definition::Field(def))),
             ast::Macro(it)       => sema.to_def(&it).map(|def| (def.attrs(sema.db), Definition::Macro(def))),
             // ast::Use(it) => sema.to_def(&it).map(|def| (Box::new(it) as _, def.attrs(sema.db))),
-            _ => return None
+            _ => None
         }
     }
 }
@@ -241,6 +245,10 @@ fn get_doc_link(db: &RootDatabase, definition: Definition) -> Option<String> {
         Definition::ModuleDef(ModuleDef::Module(module)) => module.krate(),
         _ => definition.module(db)?.krate(),
     };
+    // FIXME: using import map doesn't make sense here. What we want here is
+    // canonical path. What import map returns is the shortest path suitable for
+    // import. See this test:
+    cov_mark::hit!(test_reexport_order);
     let import_map = db.import_map(krate.into());
 
     let mut base = krate.display_name(db)?.to_string();
@@ -518,18 +526,6 @@ fn get_symbol_fragment(db: &dyn HirDatabase, field_or_assoc: &FieldOrAssocItem) 
     })
 }
 
-fn pick_best(tokens: TokenAtOffset<SyntaxToken>) -> Option<SyntaxToken> {
-    return tokens.max_by_key(priority);
-    fn priority(n: &SyntaxToken) -> usize {
-        match n.kind() {
-            IDENT | INT_NUMBER => 3,
-            T!['('] | T![')'] => 2,
-            kind if kind.is_trivia() => 0,
-            _ => 1,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use expect_test::{expect, Expect};
@@ -642,13 +638,15 @@ pub mod foo {
         )
     }
 
-    // FIXME: ImportMap will return re-export paths instead of public module
-    // paths. The correct path to documentation will never be a re-export.
-    // This problem stops us from resolving stdlib items included in the prelude
-    // such as `Option::Some` correctly.
-    #[ignore = "ImportMap may return re-exports"]
     #[test]
     fn test_reexport_order() {
+        cov_mark::check!(test_reexport_order);
+        // FIXME: This should return
+        //
+        //    https://docs.rs/test/*/test/wrapper/modulestruct.Item.html
+        //
+        // That is, we should point inside the module, rather than at the
+        // re-export.
         check(
             r#"
 pub mod wrapper {
@@ -663,7 +661,7 @@ fn foo() {
     let bar: wrapper::It$0em;
 }
         "#,
-            expect![[r#"https://docs.rs/test/*/test/wrapper/module/struct.Item.html"#]],
+            expect![[r#"https://docs.rs/test/*/test/wrapper/struct.Item.html"#]],
         )
     }
 }

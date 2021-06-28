@@ -7,25 +7,29 @@ use syntax::AstNode;
 use crate::{CompletionContext, Completions};
 
 pub(crate) fn complete_qualified_path(acc: &mut Completions, ctx: &CompletionContext) {
-    if ctx.is_path_disallowed() || ctx.expects_item() {
+    if ctx.is_path_disallowed() {
         return;
     }
-    let path = match &ctx.path_qual {
-        Some(path) => path.clone(),
+    let path = match ctx.path_qual() {
+        Some(path) => path,
         None => return,
     };
 
-    let resolution = match ctx.sema.resolve_path(&path) {
+    let resolution = match ctx.sema.resolve_path(path) {
         Some(res) => res,
         None => return,
     };
+
     let context_module = ctx.scope.module();
-    if ctx.expects_assoc_item() {
+
+    if ctx.expects_item() || ctx.expects_assoc_item() {
         if let hir::PathResolution::Def(hir::ModuleDef::Module(module)) = resolution {
             let module_scope = module.scope(ctx.db, context_module);
             for (name, def) in module_scope {
                 if let hir::ScopeDef::MacroDef(macro_def) = def {
-                    acc.add_macro(ctx, Some(name.clone()), macro_def);
+                    if macro_def.is_fn_like() {
+                        acc.add_macro(ctx, Some(name.clone()), macro_def);
+                    }
                 }
                 if let hir::ScopeDef::ModuleDef(hir::ModuleDef::Module(_)) = def {
                     acc.add_resolution(ctx, name, &def);
@@ -45,7 +49,7 @@ pub(crate) fn complete_qualified_path(acc: &mut Completions, ctx: &CompletionCon
         hir::PathResolution::Def(hir::ModuleDef::Module(module)) => {
             let module_scope = module.scope(ctx.db, context_module);
             for (name, def) in module_scope {
-                if ctx.use_item_syntax.is_some() {
+                if ctx.in_use_tree() {
                     if let hir::ScopeDef::Unknown = def {
                         if let Some(name_ref) = ctx.name_ref_syntax.as_ref() {
                             if name_ref.syntax().text() == name.to_string().as_str() {
@@ -57,14 +61,37 @@ pub(crate) fn complete_qualified_path(acc: &mut Completions, ctx: &CompletionCon
                     }
                 }
 
-                acc.add_resolution(ctx, name, &def);
+                let add_resolution = match def {
+                    // Don't suggest attribute macros and derives.
+                    hir::ScopeDef::MacroDef(mac) => mac.is_fn_like(),
+                    // no values in type places
+                    hir::ScopeDef::ModuleDef(
+                        hir::ModuleDef::Function(_)
+                        | hir::ModuleDef::Variant(_)
+                        | hir::ModuleDef::Static(_),
+                    )
+                    | hir::ScopeDef::Local(_) => !ctx.expects_type(),
+                    // unless its a constant in a generic arg list position
+                    hir::ScopeDef::ModuleDef(hir::ModuleDef::Const(_)) => {
+                        !ctx.expects_type() || ctx.expects_generic_arg()
+                    }
+                    _ => true,
+                };
+
+                if add_resolution {
+                    acc.add_resolution(ctx, name, &def);
+                }
             }
         }
-        hir::PathResolution::Def(def @ hir::ModuleDef::Adt(_))
-        | hir::PathResolution::Def(def @ hir::ModuleDef::TypeAlias(_))
-        | hir::PathResolution::Def(def @ hir::ModuleDef::BuiltinType(_)) => {
+        hir::PathResolution::Def(
+            def
+            @
+            (hir::ModuleDef::Adt(_)
+            | hir::ModuleDef::TypeAlias(_)
+            | hir::ModuleDef::BuiltinType(_)),
+        ) => {
             if let hir::ModuleDef::Adt(hir::Adt::Enum(e)) = def {
-                add_enum_variants(ctx, acc, e);
+                add_enum_variants(acc, ctx, e);
             }
             let ty = match def {
                 hir::ModuleDef::Adt(adt) => adt.ty(ctx.db),
@@ -72,7 +99,7 @@ pub(crate) fn complete_qualified_path(acc: &mut Completions, ctx: &CompletionCon
                     let ty = a.ty(ctx.db);
                     if let Some(hir::Adt::Enum(e)) = ty.as_adt() {
                         cov_mark::hit!(completes_variant_through_alias);
-                        add_enum_variants(ctx, acc, e);
+                        add_enum_variants(acc, ctx, e);
                     }
                     ty
                 }
@@ -97,11 +124,7 @@ pub(crate) fn complete_qualified_path(acc: &mut Completions, ctx: &CompletionCon
                     if context_module.map_or(false, |m| !item.is_visible_from(ctx.db, m)) {
                         return None;
                     }
-                    match item {
-                        hir::AssocItem::Function(func) => acc.add_function(ctx, func, None),
-                        hir::AssocItem::Const(ct) => acc.add_const(ctx, ct),
-                        hir::AssocItem::TypeAlias(ty) => acc.add_type_alias(ctx, ty),
-                    }
+                    add_assoc_item(acc, ctx, item);
                     None::<()>
                 });
 
@@ -123,11 +146,7 @@ pub(crate) fn complete_qualified_path(acc: &mut Completions, ctx: &CompletionCon
                 if context_module.map_or(false, |m| !item.is_visible_from(ctx.db, m)) {
                     continue;
                 }
-                match item {
-                    hir::AssocItem::Function(func) => acc.add_function(ctx, func, None),
-                    hir::AssocItem::Const(ct) => acc.add_const(ctx, ct),
-                    hir::AssocItem::TypeAlias(ty) => acc.add_type_alias(ctx, ty),
-                }
+                add_assoc_item(acc, ctx, item);
             }
         }
         hir::PathResolution::TypeParam(_) | hir::PathResolution::SelfType(_) => {
@@ -139,7 +158,7 @@ pub(crate) fn complete_qualified_path(acc: &mut Completions, ctx: &CompletionCon
                 };
 
                 if let Some(hir::Adt::Enum(e)) = ty.as_adt() {
-                    add_enum_variants(ctx, acc, e);
+                    add_enum_variants(acc, ctx, e);
                 }
 
                 let traits_in_scope = ctx.scope.traits_in_scope();
@@ -152,11 +171,7 @@ pub(crate) fn complete_qualified_path(acc: &mut Completions, ctx: &CompletionCon
                     // We might iterate candidates of a trait multiple times here, so deduplicate
                     // them.
                     if seen.insert(item) {
-                        match item {
-                            hir::AssocItem::Function(func) => acc.add_function(ctx, func, None),
-                            hir::AssocItem::Const(ct) => acc.add_const(ctx, ct),
-                            hir::AssocItem::TypeAlias(ty) => acc.add_type_alias(ctx, ty),
-                        }
+                        add_assoc_item(acc, ctx, item);
                     }
                     None::<()>
                 });
@@ -166,10 +181,22 @@ pub(crate) fn complete_qualified_path(acc: &mut Completions, ctx: &CompletionCon
     }
 }
 
-fn add_enum_variants(ctx: &CompletionContext, acc: &mut Completions, e: hir::Enum) {
-    for variant in e.variants(ctx.db) {
-        acc.add_enum_variant(ctx, variant, None);
+fn add_assoc_item(acc: &mut Completions, ctx: &CompletionContext, item: hir::AssocItem) {
+    match item {
+        hir::AssocItem::Function(func) if !ctx.expects_type() => acc.add_function(ctx, func, None),
+        hir::AssocItem::Const(ct) if !ctx.expects_type() || ctx.expects_generic_arg() => {
+            acc.add_const(ctx, ct)
+        }
+        hir::AssocItem::TypeAlias(ty) => acc.add_type_alias(ctx, ty),
+        _ => (),
     }
+}
+
+fn add_enum_variants(acc: &mut Completions, ctx: &CompletionContext, e: hir::Enum) {
+    if ctx.expects_type() {
+        return;
+    }
+    e.variants(ctx.db).into_iter().for_each(|variant| acc.add_enum_variant(ctx, variant, None));
 }
 
 #[cfg(test)]
@@ -177,38 +204,18 @@ mod tests {
     use expect_test::{expect, Expect};
 
     use crate::{
-        test_utils::{check_edit, completion_list},
+        tests::{check_edit, filtered_completion_list},
         CompletionKind,
     };
 
     fn check(ra_fixture: &str, expect: Expect) {
-        let actual = completion_list(ra_fixture, CompletionKind::Reference);
+        let actual = filtered_completion_list(ra_fixture, CompletionKind::Reference);
         expect.assert_eq(&actual);
     }
 
     fn check_builtin(ra_fixture: &str, expect: Expect) {
-        let actual = completion_list(ra_fixture, CompletionKind::BuiltinType);
+        let actual = filtered_completion_list(ra_fixture, CompletionKind::BuiltinType);
         expect.assert_eq(&actual);
-    }
-
-    #[test]
-    fn dont_complete_current_use() {
-        cov_mark::check!(dont_complete_current_use);
-        check(r#"use self::foo$0;"#, expect![[""]]);
-    }
-
-    #[test]
-    fn dont_complete_current_use_in_braces_with_glob() {
-        check(
-            r#"
-mod foo { pub struct S; }
-use self::{foo::*, bar$0};
-"#,
-            expect![[r#"
-                st S
-                md foo
-            "#]],
-        );
     }
 
     #[test]
@@ -219,134 +226,6 @@ use self::{foo::*, bar$0};
     #[test]
     fn dont_complete_primitive_in_module_scope() {
         check_builtin(r#"fn foo() { self::$0 }"#, expect![[""]]);
-    }
-
-    #[test]
-    fn completes_primitives() {
-        check_builtin(
-            r#"fn main() { let _: $0 = 92; }"#,
-            expect![[r#"
-                bt u32
-                bt bool
-                bt u8
-                bt isize
-                bt u16
-                bt u64
-                bt u128
-                bt f32
-                bt i128
-                bt i16
-                bt str
-                bt i64
-                bt char
-                bt f64
-                bt i32
-                bt i8
-                bt usize
-            "#]],
-        );
-    }
-
-    #[test]
-    fn completes_mod_with_same_name_as_function() {
-        check(
-            r#"
-use self::my::$0;
-
-mod my { pub struct Bar; }
-fn my() {}
-"#,
-            expect![[r#"
-                st Bar
-            "#]],
-        );
-    }
-
-    #[test]
-    fn filters_visibility() {
-        check(
-            r#"
-use self::my::$0;
-
-mod my {
-    struct Bar;
-    pub struct Foo;
-    pub use Bar as PublicBar;
-}
-"#,
-            expect![[r#"
-                st Foo
-                st PublicBar
-            "#]],
-        );
-    }
-
-    #[test]
-    fn completes_use_item_starting_with_self() {
-        check(
-            r#"
-use self::m::$0;
-
-mod m { pub struct Bar; }
-"#,
-            expect![[r#"
-                st Bar
-            "#]],
-        );
-    }
-
-    #[test]
-    fn completes_use_item_starting_with_crate() {
-        check(
-            r#"
-//- /lib.rs
-mod foo;
-struct Spam;
-//- /foo.rs
-use crate::Sp$0
-"#,
-            expect![[r#"
-                md foo
-                st Spam
-            "#]],
-        );
-    }
-
-    #[test]
-    fn completes_nested_use_tree() {
-        check(
-            r#"
-//- /lib.rs
-mod foo;
-struct Spam;
-//- /foo.rs
-use crate::{Sp$0};
-"#,
-            expect![[r#"
-                md foo
-                st Spam
-            "#]],
-        );
-    }
-
-    #[test]
-    fn completes_deeply_nested_use_tree() {
-        check(
-            r#"
-//- /lib.rs
-mod foo;
-pub mod bar {
-    pub mod baz {
-        pub struct Spam;
-    }
-}
-//- /foo.rs
-use crate::{bar::{baz::Sp$0}};
-"#,
-            expect![[r#"
-                st Spam
-            "#]],
-        );
     }
 
     #[test]
@@ -441,22 +320,6 @@ fn foo() { let _ = U::$0 }
 "#,
             expect![[r#"
                 fn m() fn()
-            "#]],
-        );
-    }
-
-    #[test]
-    fn completes_use_paths_across_crates() {
-        check(
-            r#"
-//- /main.rs crate:main deps:foo
-use foo::$0;
-
-//- /foo/lib.rs crate:foo
-pub mod bar { pub struct S; }
-"#,
-            expect![[r#"
-                md bar
             "#]],
         );
     }
@@ -617,59 +480,28 @@ fn main() { let _ = crate::$0 }
     }
 
     #[test]
-    fn completes_in_assoc_item_list() {
+    fn does_not_complete_non_fn_macros() {
         check(
             r#"
-#[macro_export]
-macro_rules! foo { () => {} }
-mod bar {}
-
-struct MyStruct {}
-impl MyStruct {
-    crate::$0
+mod m {
+    #[rustc_builtin_macro]
+    pub macro Clone {}
 }
+
+fn f() {m::$0}
 "#,
-            expect![[r##"
-                md bar
-                ma foo! #[macro_export] macro_rules! foo
-            "##]],
+            expect![[r#""#]],
         );
-    }
-
-    #[test]
-    #[ignore] // FIXME doesn't complete anything atm
-    fn completes_in_item_list() {
         check(
             r#"
-struct MyStruct {}
-macro_rules! foo {}
-mod bar {}
-
-crate::$0
-"#,
-            expect![[r#"
-                md bar
-                ma foo! macro_rules! foo
-            "#]],
-        )
-    }
-
-    #[test]
-    fn test_super_super_completion() {
-        check(
-            r#"
-mod a {
-    const A: usize = 0;
-    mod b {
-        const B: usize = 0;
-        mod c { use super::super::$0 }
-    }
+mod m {
+    #[rustc_builtin_macro]
+    pub macro bench {}
 }
+
+fn f() {m::$0}
 "#,
-            expect![[r#"
-                md b
-                ct A
-            "#]],
+            expect![[r#""#]],
         );
     }
 

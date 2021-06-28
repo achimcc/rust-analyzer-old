@@ -1,5 +1,5 @@
 //! Based on rust-lang/rust 1.52.0-nightly (25c15cdbe 2021-04-22)
-//! https://github.com/rust-lang/rust/blob/25c15cdbe/compiler/rustc_mir_build/src/thir/pattern/usefulness.rs
+//! <https://github.com/rust-lang/rust/blob/25c15cdbe/compiler/rustc_mir_build/src/thir/pattern/usefulness.rs>
 //!
 //! -----
 //!
@@ -645,7 +645,7 @@ impl SubPatSet {
             (Seq { subpats: s_set }, Seq { subpats: mut o_set }) => {
                 s_set.retain(|i, s_sub_set| {
                     // Missing entries count as full.
-                    let o_sub_set = o_set.remove(&i).unwrap_or(Full);
+                    let o_sub_set = o_set.remove(i).unwrap_or(Full);
                     s_sub_set.union(o_sub_set);
                     // We drop full entries.
                     !s_sub_set.is_full()
@@ -656,7 +656,7 @@ impl SubPatSet {
             (Alt { subpats: s_set, .. }, Alt { subpats: mut o_set, .. }) => {
                 s_set.retain(|i, s_sub_set| {
                     // Missing entries count as empty.
-                    let o_sub_set = o_set.remove(&i).unwrap_or(Empty);
+                    let o_sub_set = o_set.remove(i).unwrap_or(Empty);
                     s_sub_set.union(o_sub_set);
                     // We drop empty entries.
                     !s_sub_set.is_empty()
@@ -898,7 +898,7 @@ impl Usefulness {
                 } else {
                     witnesses
                         .into_iter()
-                        .map(|witness| witness.apply_constructor(pcx, &ctor, ctor_wild_subpatterns))
+                        .map(|witness| witness.apply_constructor(pcx, ctor, ctor_wild_subpatterns))
                         .collect()
                 };
                 WithWitnesses(new_witnesses)

@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use xshell::{cmd, pushd, pushenv, read_file};
 
@@ -81,15 +84,19 @@ Please adjust docs/dev/lsp-extensions.md.
 #[test]
 fn rust_files_are_tidy() {
     let mut tidy_docs = TidyDocs::default();
+    let mut tidy_marks = TidyMarks::default();
     for path in rust_files() {
         let text = read_file(&path).unwrap();
         check_todo(&path, &text);
         check_dbg(&path, &text);
+        check_test_attrs(&path, &text);
         check_trailing_ws(&path, &text);
         deny_clippy(&path, &text);
         tidy_docs.visit(&path, &text);
+        tidy_marks.visit(&path, &text);
     }
     tidy_docs.finish();
+    tidy_marks.finish();
 }
 
 #[test]
@@ -328,13 +335,43 @@ fn check_dbg(path: &Path, text: &str) {
     }
 }
 
+fn check_test_attrs(path: &Path, text: &str) {
+    let ignore_rule =
+        "https://github.com/rust-analyzer/rust-analyzer/blob/master/docs/dev/style.md#ignore";
+    let need_ignore: &[&str] = &[
+        // Special case to run `#[ignore]` tests
+        "ide/src/runnables.rs",
+        // A legit test which needs to be ignored, as it takes too long to run
+        // :(
+        "hir_def/src/nameres/collector.rs",
+        // Obviously needs ignore.
+        "ide_assists/src/handlers/toggle_ignore.rs",
+        // See above.
+        "ide_assists/src/tests/generated.rs",
+    ];
+    if text.contains("#[ignore") && !need_ignore.iter().any(|p| path.ends_with(p)) {
+        panic!("\ndon't `#[ignore]` tests, see:\n\n    {}\n\n   {}\n", ignore_rule, path.display(),)
+    }
+
+    let panic_rule =
+        "https://github.com/rust-analyzer/rust-analyzer/blob/master/docs/dev/style.md#should_panic";
+    let need_panic: &[&str] = &["test_utils/src/fixture.rs"];
+    if text.contains("#[should_panic") && !need_panic.iter().any(|p| path.ends_with(p)) {
+        panic!(
+            "\ndon't add `#[should_panic]` tests, see:\n\n    {}\n\n   {}\n",
+            panic_rule,
+            path.display(),
+        )
+    }
+}
+
 fn check_trailing_ws(path: &Path, text: &str) {
     if is_exclude_dir(path, &["test_data"]) {
         return;
     }
     for (line_number, line) in text.lines().enumerate() {
         if line.chars().last().map(char::is_whitespace) == Some(true) {
-            panic!("Trailing whitespace in {} at line {}", path.display(), line_number)
+            panic!("Trailing whitespace in {} at line {}", path.display(), line_number + 1)
         }
     }
 }
@@ -366,7 +403,10 @@ impl TidyDocs {
                 self.contains_fixme.push(path.to_path_buf());
             }
         } else {
-            if text.contains("// Feature:") || text.contains("// Assist:") {
+            if text.contains("// Feature:")
+                || text.contains("// Assist:")
+                || text.contains("// Diagnostic:")
+            {
                 return;
             }
             self.missing_docs.push(path.display().to_string());
@@ -408,6 +448,39 @@ fn is_exclude_dir(p: &Path, dirs_to_exclude: &[&str]) -> bool {
         .any(|it| dirs_to_exclude.contains(&it))
 }
 
+#[derive(Default)]
+struct TidyMarks {
+    hits: HashSet<String>,
+    checks: HashSet<String>,
+}
+
+impl TidyMarks {
+    fn visit(&mut self, _path: &Path, text: &str) {
+        for line in text.lines() {
+            if let Some(mark) = find_mark(line, "hit") {
+                self.hits.insert(mark.to_string());
+            }
+            if let Some(mark) = find_mark(line, "check") {
+                self.checks.insert(mark.to_string());
+            }
+            if let Some(mark) = find_mark(line, "check_count") {
+                self.checks.insert(mark.to_string());
+            }
+        }
+    }
+
+    fn finish(self) {
+        assert!(!self.hits.is_empty());
+
+        let diff: Vec<_> =
+            self.hits.symmetric_difference(&self.checks).map(|it| it.as_str()).collect();
+
+        if !diff.is_empty() {
+            panic!("unpaired marks: {:?}", diff)
+        }
+    }
+}
+
 #[allow(deprecated)]
 fn stable_hash(text: &str) -> u64 {
     use std::hash::{Hash, Hasher, SipHasher};
@@ -416,4 +489,12 @@ fn stable_hash(text: &str) -> u64 {
     let mut hasher = SipHasher::default();
     text.hash(&mut hasher);
     hasher.finish()
+}
+
+fn find_mark<'a>(text: &'a str, mark: &'static str) -> Option<&'a str> {
+    let idx = text.find(mark)?;
+    let text = text[idx + mark.len()..].strip_prefix("!(")?;
+    let idx = text.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
+    let text = &text[..idx];
+    Some(text)
 }

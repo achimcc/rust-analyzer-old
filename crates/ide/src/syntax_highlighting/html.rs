@@ -23,7 +23,7 @@ pub(crate) fn highlight_as_html(db: &RootDatabase, file_id: FileId, rainbow: boo
     let hl_ranges = highlight(db, file_id, None, false);
     let text = parse.tree().syntax().to_string();
     let mut buf = String::new();
-    buf.push_str(&STYLE);
+    buf.push_str(STYLE);
     buf.push_str("<pre><code>");
     for r in &hl_ranges {
         let chunk = html_escape(&text[r.range]);
@@ -67,6 +67,7 @@ pre                 { color: #DCDCCC; background: #3F3F3F; font-size: 22px; padd
 .field              { color: #94BFF3; }
 .function           { color: #93E0E3; }
 .function.unsafe    { color: #BC8383; }
+.trait.unsafe       { color: #BC8383; }
 .operator.unsafe    { color: #BC8383; }
 .parameter          { color: #94BFF3; }
 .text               { color: #DCDCCC; }

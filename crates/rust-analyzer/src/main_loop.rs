@@ -531,6 +531,7 @@ impl GlobalState {
             .on::<lsp_types::request::OnTypeFormatting>(handlers::handle_on_type_formatting)
             .on::<lsp_types::request::DocumentSymbolRequest>(handlers::handle_document_symbol)
             .on::<lsp_types::request::GotoDefinition>(handlers::handle_goto_definition)
+            .on::<lsp_types::request::GotoDeclaration>(handlers::handle_goto_declaration)
             .on::<lsp_types::request::GotoImplementation>(handlers::handle_goto_implementation)
             .on::<lsp_types::request::GotoTypeDefinition>(handlers::handle_goto_type_definition)
             .on::<lsp_types::request::Completion>(handlers::handle_completion)
@@ -701,7 +702,7 @@ impl GlobalState {
                     },
                 );
 
-                return Ok(());
+                Ok(())
             })?
             .on::<lsp_types::notification::DidChangeWatchedFiles>(|this, params| {
                 for change in params.changes {
@@ -740,7 +741,7 @@ impl GlobalState {
         let subscriptions = self
             .mem_docs
             .keys()
-            .map(|path| self.vfs.read().0.file_id(&path).unwrap())
+            .map(|path| self.vfs.read().0.file_id(path).unwrap())
             .collect::<Vec<_>>();
 
         log::trace!("updating notifications for {:?}", subscriptions);

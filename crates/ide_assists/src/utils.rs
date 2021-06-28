@@ -8,6 +8,7 @@ use ast::TypeBoundsOwner;
 use hir::{Adt, HasSource, Semantics};
 use ide_db::{
     helpers::{FamousDefs, SnippetCap},
+    path_transform::PathTransform,
     RootDatabase,
 };
 use itertools::Itertools;
@@ -22,10 +23,7 @@ use syntax::{
     SyntaxNode, TextSize, T,
 };
 
-use crate::{
-    assist_context::{AssistBuilder, AssistContext},
-    path_transform::PathTransform,
-};
+use crate::assist_context::{AssistBuilder, AssistContext};
 
 pub(crate) fn unwrap_trivial_block(block: ast::BlockExpr) -> ast::Expr {
     extract_trivial_expression(&block)
@@ -492,7 +490,7 @@ pub(crate) fn add_method_to_adt(
     let start_offset = impl_def
         .and_then(|impl_def| find_impl_block_end(impl_def, &mut buf))
         .unwrap_or_else(|| {
-            buf = generate_impl_text(&adt, &buf);
+            buf = generate_impl_text(adt, &buf);
             adt.syntax().text_range().end()
         });
 

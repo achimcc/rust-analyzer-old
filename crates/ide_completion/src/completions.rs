@@ -6,7 +6,6 @@ pub(crate) mod flyimport;
 pub(crate) mod fn_param;
 pub(crate) mod keyword;
 pub(crate) mod lifetime;
-pub(crate) mod macro_in_item_position;
 pub(crate) mod mod_;
 pub(crate) mod pattern;
 pub(crate) mod postfix;
@@ -30,7 +29,7 @@ use crate::{
         macro_::render_macro,
         pattern::{render_struct_pat, render_variant_pat},
         render_field, render_resolution, render_tuple_field,
-        type_alias::render_type_alias,
+        type_alias::{render_type_alias, render_type_alias_with_eq},
         RenderContext,
     },
     CompletionContext, CompletionItem, CompletionItemKind,
@@ -42,9 +41,9 @@ pub struct Completions {
     buf: Vec<CompletionItem>,
 }
 
-impl Into<Vec<CompletionItem>> for Completions {
-    fn into(self) -> Vec<CompletionItem> {
-        self.buf
+impl From<Completions> for Vec<CompletionItem> {
+    fn from(val: Completions) -> Self {
+        val.buf
     }
 }
 
@@ -57,8 +56,14 @@ impl Builder {
 }
 
 impl Completions {
-    pub(crate) fn add(&mut self, item: CompletionItem) {
+    fn add(&mut self, item: CompletionItem) {
         self.buf.push(item)
+    }
+
+    fn add_opt(&mut self, item: Option<CompletionItem>) {
+        if let Some(item) = item {
+            self.buf.push(item)
+        }
     }
 
     pub(crate) fn add_all<I>(&mut self, items: I)
@@ -67,6 +72,83 @@ impl Completions {
         I::Item: Into<CompletionItem>,
     {
         items.into_iter().for_each(|item| self.add(item.into()))
+    }
+
+    pub(crate) fn add_resolution(
+        &mut self,
+        ctx: &CompletionContext,
+        local_name: hir::Name,
+        resolution: &hir::ScopeDef,
+    ) {
+        self.add_opt(render_resolution(RenderContext::new(ctx), local_name, resolution));
+    }
+
+    pub(crate) fn add_macro(
+        &mut self,
+        ctx: &CompletionContext,
+        name: Option<hir::Name>,
+        macro_: hir::MacroDef,
+    ) {
+        let name = match name {
+            Some(it) => it,
+            None => return,
+        };
+        self.add_opt(render_macro(RenderContext::new(ctx), None, name, macro_));
+    }
+
+    pub(crate) fn add_function(
+        &mut self,
+        ctx: &CompletionContext,
+        func: hir::Function,
+        local_name: Option<hir::Name>,
+    ) {
+        self.add_opt(render_fn(RenderContext::new(ctx), None, local_name, func));
+    }
+
+    pub(crate) fn add_method(
+        &mut self,
+        ctx: &CompletionContext,
+        func: hir::Function,
+        receiver: Option<hir::Name>,
+        local_name: Option<hir::Name>,
+    ) {
+        self.add_opt(render_method(RenderContext::new(ctx), None, receiver, local_name, func));
+    }
+
+    pub(crate) fn add_const(&mut self, ctx: &CompletionContext, constant: hir::Const) {
+        self.add_opt(render_const(RenderContext::new(ctx), constant));
+    }
+
+    pub(crate) fn add_type_alias(&mut self, ctx: &CompletionContext, type_alias: hir::TypeAlias) {
+        self.add_opt(render_type_alias(RenderContext::new(ctx), type_alias));
+    }
+
+    pub(crate) fn add_type_alias_with_eq(
+        &mut self,
+        ctx: &CompletionContext,
+        type_alias: hir::TypeAlias,
+    ) {
+        self.add_opt(render_type_alias_with_eq(RenderContext::new(ctx), type_alias));
+    }
+
+    pub(crate) fn add_qualified_enum_variant(
+        &mut self,
+        ctx: &CompletionContext,
+        variant: hir::Variant,
+        path: hir::ModPath,
+    ) {
+        let item = render_variant(RenderContext::new(ctx), None, None, variant, Some(path));
+        self.add(item);
+    }
+
+    pub(crate) fn add_enum_variant(
+        &mut self,
+        ctx: &CompletionContext,
+        variant: hir::Variant,
+        local_name: Option<hir::Name>,
+    ) {
+        let item = render_variant(RenderContext::new(ctx), None, local_name, variant, None);
+        self.add(item);
     }
 
     pub(crate) fn add_field(
@@ -98,65 +180,13 @@ impl Completions {
         self.add(item.build());
     }
 
-    pub(crate) fn add_resolution(
-        &mut self,
-        ctx: &CompletionContext,
-        local_name: hir::Name,
-        resolution: &hir::ScopeDef,
-    ) {
-        if let Some(item) = render_resolution(RenderContext::new(ctx), local_name, resolution) {
-            self.add(item);
-        }
-    }
-
-    pub(crate) fn add_macro(
-        &mut self,
-        ctx: &CompletionContext,
-        name: Option<hir::Name>,
-        macro_: hir::MacroDef,
-    ) {
-        let name = match name {
-            Some(it) => it,
-            None => return,
-        };
-        if let Some(item) = render_macro(RenderContext::new(ctx), None, name, macro_) {
-            self.add(item);
-        }
-    }
-
-    pub(crate) fn add_function(
-        &mut self,
-        ctx: &CompletionContext,
-        func: hir::Function,
-        local_name: Option<hir::Name>,
-    ) {
-        if let Some(item) = render_fn(RenderContext::new(ctx), None, local_name, func) {
-            self.add(item)
-        }
-    }
-
-    pub(crate) fn add_method(
-        &mut self,
-        ctx: &CompletionContext,
-        func: hir::Function,
-        receiver: Option<hir::Name>,
-        local_name: Option<hir::Name>,
-    ) {
-        if let Some(item) = render_method(RenderContext::new(ctx), None, receiver, local_name, func)
-        {
-            self.add(item)
-        }
-    }
-
     pub(crate) fn add_variant_pat(
         &mut self,
         ctx: &CompletionContext,
         variant: hir::Variant,
         local_name: Option<hir::Name>,
     ) {
-        if let Some(item) = render_variant_pat(RenderContext::new(ctx), variant, local_name, None) {
-            self.add(item);
-        }
+        self.add_opt(render_variant_pat(RenderContext::new(ctx), variant, local_name, None));
     }
 
     pub(crate) fn add_qualified_variant_pat(
@@ -165,9 +195,7 @@ impl Completions {
         variant: hir::Variant,
         path: hir::ModPath,
     ) {
-        if let Some(item) = render_variant_pat(RenderContext::new(ctx), variant, None, Some(path)) {
-            self.add(item);
-        }
+        self.add_opt(render_variant_pat(RenderContext::new(ctx), variant, None, Some(path)));
     }
 
     pub(crate) fn add_struct_pat(
@@ -176,62 +204,30 @@ impl Completions {
         strukt: hir::Struct,
         local_name: Option<hir::Name>,
     ) {
-        if let Some(item) = render_struct_pat(RenderContext::new(ctx), strukt, local_name) {
-            self.add(item);
-        }
-    }
-
-    pub(crate) fn add_const(&mut self, ctx: &CompletionContext, constant: hir::Const) {
-        if let Some(item) = render_const(RenderContext::new(ctx), constant) {
-            self.add(item);
-        }
-    }
-
-    pub(crate) fn add_type_alias(&mut self, ctx: &CompletionContext, type_alias: hir::TypeAlias) {
-        if let Some(item) = render_type_alias(RenderContext::new(ctx), type_alias) {
-            self.add(item)
-        }
-    }
-
-    pub(crate) fn add_qualified_enum_variant(
-        &mut self,
-        ctx: &CompletionContext,
-        variant: hir::Variant,
-        path: hir::ModPath,
-    ) {
-        let item = render_variant(RenderContext::new(ctx), None, None, variant, Some(path));
-        self.add(item);
-    }
-
-    pub(crate) fn add_enum_variant(
-        &mut self,
-        ctx: &CompletionContext,
-        variant: hir::Variant,
-        local_name: Option<hir::Name>,
-    ) {
-        let item = render_variant(RenderContext::new(ctx), None, local_name, variant, None);
-        self.add(item);
+        self.add_opt(render_struct_pat(RenderContext::new(ctx), strukt, local_name));
     }
 }
 
-fn complete_enum_variants(
+/// Calls the callback for each variant of the provided enum with the path to the variant.
+/// Skips variants that are visible with single segment paths.
+fn enum_variants_with_paths(
     acc: &mut Completions,
     ctx: &CompletionContext,
-    enum_data: hir::Enum,
+    enum_: hir::Enum,
     cb: impl Fn(&mut Completions, &CompletionContext, hir::Variant, hir::ModPath),
 ) {
-    let variants = enum_data.variants(ctx.db);
+    let variants = enum_.variants(ctx.db);
 
     let module = if let Some(module) = ctx.scope.module() {
         // Compute path from the completion site if available.
         module
     } else {
         // Otherwise fall back to the enum's definition site.
-        enum_data.module(ctx.db)
+        enum_.module(ctx.db)
     };
 
     if let Some(impl_) = ctx.impl_def.as_ref().and_then(|impl_| ctx.sema.to_def(impl_)) {
-        if impl_.self_ty(ctx.db).as_adt() == Some(hir::Adt::Enum(enum_data)) {
+        if impl_.self_ty(ctx.db).as_adt() == Some(hir::Adt::Enum(enum_)) {
             for &variant in &variants {
                 let self_path = hir::ModPath::from_segments(
                     hir::PathKind::Plain,

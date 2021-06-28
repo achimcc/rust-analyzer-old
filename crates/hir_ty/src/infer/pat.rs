@@ -192,7 +192,7 @@ impl<'a> InferenceContext<'a> {
             Pat::Path(path) => {
                 // FIXME use correct resolver for the surrounding expression
                 let resolver = self.resolver.clone();
-                self.infer_path(&resolver, &path, pat.into()).unwrap_or(self.err_ty())
+                self.infer_path(&resolver, path, pat.into()).unwrap_or_else(|| self.err_ty())
             }
             Pat::Bind { mode, name: _, subpat } => {
                 let mode = if mode == &BindingAnnotation::Unannotated {
@@ -275,7 +275,7 @@ impl<'a> InferenceContext<'a> {
         if !self.unify(&ty, &expected) {
             self.result
                 .type_mismatches
-                .insert(pat.into(), TypeMismatch { expected: expected, actual: ty.clone() });
+                .insert(pat.into(), TypeMismatch { expected, actual: ty.clone() });
         }
         self.write_pat_ty(pat, ty.clone());
         ty
@@ -297,10 +297,11 @@ fn is_non_ref_pat(body: &hir_def::body::Body, pat: PatId) -> bool {
             Expr::Literal(Literal::String(..)) => false,
             _ => true,
         },
-        Pat::Bind { mode: BindingAnnotation::Mutable, subpat: Some(subpat), .. }
-        | Pat::Bind { mode: BindingAnnotation::Unannotated, subpat: Some(subpat), .. } => {
-            is_non_ref_pat(body, *subpat)
-        }
+        Pat::Bind {
+            mode: BindingAnnotation::Mutable | BindingAnnotation::Unannotated,
+            subpat: Some(subpat),
+            ..
+        } => is_non_ref_pat(body, *subpat),
         Pat::Wild | Pat::Bind { .. } | Pat::Ref { .. } | Pat::Box { .. } | Pat::Missing => false,
     }
 }

@@ -405,7 +405,7 @@ pub(crate) fn semantic_tokens(
                 text_range =
                     TextRange::new(text_range.start(), text_range.end() - TextSize::of('\n'));
             }
-            let range = range(&line_index, text_range);
+            let range = range(line_index, text_range);
             builder.push(range, token_index, modifier_bitset);
         }
     }
@@ -505,6 +505,7 @@ fn semantic_token_type_and_modifiers(
             HlMod::Consuming => semantic_tokens::CONSUMING,
             HlMod::Async => semantic_tokens::ASYNC,
             HlMod::Library => semantic_tokens::LIBRARY,
+            HlMod::Public => semantic_tokens::PUBLIC,
             HlMod::Unsafe => semantic_tokens::UNSAFE,
             HlMod::Callable => semantic_tokens::CALLABLE,
             HlMod::Static => lsp_types::SemanticTokenModifier::STATIC,
@@ -781,7 +782,7 @@ pub(crate) fn snippet_workspace_edit(
         document_changes.extend_from_slice(&ops);
     }
     for (file_id, edit) in source_change.source_file_edits {
-        let edit = snippet_text_document_edit(&snap, source_change.is_snippet, file_id, edit)?;
+        let edit = snippet_text_document_edit(snap, source_change.is_snippet, file_id, edit)?;
         document_changes.push(lsp_ext::SnippetDocumentChangeOperation::Edit(edit));
     }
     let mut workspace_edit = lsp_ext::SnippetWorkspaceEdit {
@@ -957,7 +958,7 @@ pub(crate) fn code_lens(
             let annotation_range = range(&line_index, annotation.range);
 
             let action = run.action();
-            let r = runnable(&snap, run)?;
+            let r = runnable(snap, run)?;
 
             let command = if debug {
                 command::debug_single(&r)
@@ -1187,6 +1188,7 @@ mod tests {
                         prefix_kind: PrefixKind::Plain,
                         enforce_granularity: true,
                         group: true,
+                        skip_glob_imports: true,
                     },
                 },
                 ide_db::base_db::FilePosition { file_id, offset },
@@ -1236,12 +1238,12 @@ fn main() {
         assert_eq!(folds.len(), 4);
 
         let line_index = LineIndex {
-            index: Arc::new(ide::LineIndex::new(&text)),
+            index: Arc::new(ide::LineIndex::new(text)),
             endings: LineEndings::Unix,
             encoding: OffsetEncoding::Utf16,
         };
         let converted: Vec<lsp_types::FoldingRange> =
-            folds.into_iter().map(|it| folding_range(&text, &line_index, true, it)).collect();
+            folds.into_iter().map(|it| folding_range(text, &line_index, true, it)).collect();
 
         let expected_lines = [(0, 2), (4, 10), (5, 6), (7, 9)];
         assert_eq!(converted.len(), expected_lines.len());

@@ -135,7 +135,7 @@ impl Shift {
 
     /// Shift given TokenTree token id
     fn shift_all(self, tt: &mut tt::Subtree) {
-        for t in tt.token_trees.iter_mut() {
+        for t in &mut tt.token_trees {
             match t {
                 tt::TokenTree::Leaf(leaf) => match leaf {
                     tt::Leaf::Ident(ident) => ident.id = self.shift(ident.id),
@@ -188,7 +188,7 @@ impl MacroRules {
             }
         }
 
-        for rule in rules.iter() {
+        for rule in &rules {
             validate(&rule.lhs)?;
         }
 
@@ -241,7 +241,7 @@ impl MacroDef {
             }
             rules.push(rule);
         }
-        for rule in rules.iter() {
+        for rule in &rules {
             validate(&rule.lhs)?;
         }
 
@@ -268,7 +268,7 @@ impl MacroDef {
 }
 
 impl Rule {
-    fn parse(src: &mut TtIter, expect_arrow: bool) -> Result<Rule, ParseError> {
+    fn parse(src: &mut TtIter, expect_arrow: bool) -> Result<Self, ParseError> {
         let lhs = src
             .expect_subtree()
             .map_err(|()| ParseError::Expected("expected subtree".to_string()))?;
@@ -280,8 +280,8 @@ impl Rule {
             .expect_subtree()
             .map_err(|()| ParseError::Expected("expected subtree".to_string()))?;
 
-        let lhs = MetaTemplate(parse_pattern(&lhs)?);
-        let rhs = MetaTemplate(parse_template(&rhs)?);
+        let lhs = MetaTemplate(parse_pattern(lhs)?);
+        let rhs = MetaTemplate(parse_template(rhs)?);
 
         Ok(crate::Rule { lhs, rhs })
     }
@@ -290,7 +290,7 @@ impl Rule {
 fn validate(pattern: &MetaTemplate) -> Result<(), ParseError> {
     for op in pattern.iter() {
         match op {
-            Op::Subtree { tokens, .. } => validate(&tokens)?,
+            Op::Subtree { tokens, .. } => validate(tokens)?,
             Op::Repeat { tokens: subtree, separator, .. } => {
                 // Checks that no repetition which could match an empty token
                 // https://github.com/rust-lang/rust/blob/a58b1ed44f5e06976de2bdc4d7dc81c36a96934f/src/librustc_expand/mbe/macro_rules.rs#L558
@@ -356,7 +356,7 @@ impl<T> ExpandResult<T> {
     }
 
     pub fn result(self) -> Result<T, ExpandError> {
-        self.err.map(Err).unwrap_or(Ok(self.value))
+        self.err.map_or(Ok(self.value), Err)
     }
 }
 

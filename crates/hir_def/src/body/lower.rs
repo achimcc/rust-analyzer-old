@@ -690,9 +690,7 @@ impl ExprCollector<'_> {
                 }
             }
             ast::Stmt::Item(item) => {
-                if self.check_cfg(&item).is_none() {
-                    return;
-                }
+                self.check_cfg(&item);
             }
         }
     }
@@ -717,7 +715,8 @@ impl ExprCollector<'_> {
         block.statements().for_each(|s| self.collect_stmt(s));
         block.tail_expr().and_then(|e| {
             let expr = self.maybe_collect_expr(e)?;
-            Some(self.statements_in_scope.push(Statement::Expr { expr, has_semi: false }))
+            self.statements_in_scope.push(Statement::Expr { expr, has_semi: false });
+            Some(())
         });
 
         let mut tail = None;
@@ -1000,18 +999,18 @@ impl From<ast::LiteralKind> for Literal {
             // FIXME: these should have actual values filled in, but unsure on perf impact
             LiteralKind::IntNumber(lit) => {
                 if let builtin @ Some(_) = lit.suffix().and_then(BuiltinFloat::from_suffix) {
-                    return Literal::Float(Default::default(), builtin);
+                    Literal::Float(Default::default(), builtin)
                 } else if let builtin @ Some(_) =
-                    lit.suffix().and_then(|it| BuiltinInt::from_suffix(&it))
+                    lit.suffix().and_then(|it| BuiltinInt::from_suffix(it))
                 {
                     Literal::Int(lit.value().unwrap_or(0) as i128, builtin)
                 } else {
-                    let builtin = lit.suffix().and_then(|it| BuiltinUint::from_suffix(&it));
+                    let builtin = lit.suffix().and_then(|it| BuiltinUint::from_suffix(it));
                     Literal::Uint(lit.value().unwrap_or(0), builtin)
                 }
             }
             LiteralKind::FloatNumber(lit) => {
-                let ty = lit.suffix().and_then(|it| BuiltinFloat::from_suffix(&it));
+                let ty = lit.suffix().and_then(|it| BuiltinFloat::from_suffix(it));
                 Literal::Float(Default::default(), ty)
             }
             LiteralKind::ByteString(bs) => {

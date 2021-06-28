@@ -1,6 +1,6 @@
 //! Computes color for a single element.
 
-use hir::{AsAssocItem, Semantics};
+use hir::{AsAssocItem, HasVisibility, Semantics};
 use ide_db::{
     defs::{Definition, NameClass, NameRefClass},
     RootDatabase, SymbolKind,
@@ -48,7 +48,13 @@ pub(super) fn element(
             match name_kind {
                 Some(NameClass::ExternCrate(_)) => SymbolKind::Module.into(),
                 Some(NameClass::Definition(def)) => {
-                    highlight_def(db, krate, def) | HlMod::Definition
+                    let mut h = highlight_def(db, krate, def) | HlMod::Definition;
+                    if let Definition::ModuleDef(hir::ModuleDef::Trait(trait_)) = &def {
+                        if trait_.is_unsafe(db) {
+                            h |= HlMod::Unsafe;
+                        }
+                    }
+                    h
                 }
                 Some(NameClass::ConstReference(def)) => highlight_def(db, krate, def),
                 Some(NameClass::PatFieldShorthand { field_ref, .. }) => {
@@ -87,20 +93,34 @@ pub(super) fn element(
 
                             let mut h = highlight_def(db, krate, def);
 
-                            if let Definition::Local(local) = &def {
-                                if is_consumed_lvalue(name_ref.syntax().clone().into(), local, db) {
+                            match def {
+                                Definition::Local(local)
+                                    if is_consumed_lvalue(
+                                        name_ref.syntax().clone().into(),
+                                        &local,
+                                        db,
+                                    ) =>
+                                {
                                     h |= HlMod::Consuming;
                                 }
-                            }
-
-                            if let Some(parent) = name_ref.syntax().parent() {
-                                if matches!(parent.kind(), FIELD_EXPR | RECORD_PAT_FIELD) {
-                                    if let Definition::Field(field) = def {
-                                        if let hir::VariantDef::Union(_) = field.parent_def(db) {
-                                            h |= HlMod::Unsafe;
+                                Definition::ModuleDef(hir::ModuleDef::Trait(trait_))
+                                    if trait_.is_unsafe(db) =>
+                                {
+                                    if ast::Impl::for_trait_name_ref(&name_ref).is_some() {
+                                        h |= HlMod::Unsafe;
+                                    }
+                                }
+                                Definition::Field(field) => {
+                                    if let Some(parent) = name_ref.syntax().parent() {
+                                        if matches!(parent.kind(), FIELD_EXPR | RECORD_PAT_FIELD) {
+                                            if let hir::VariantDef::Union(_) = field.parent_def(db)
+                                            {
+                                                h |= HlMod::Unsafe;
+                                            }
                                         }
                                     }
                                 }
+                                _ => (),
                             }
 
                             h
@@ -131,6 +151,9 @@ pub(super) fn element(
         }
         STRING | BYTE_STRING => HlTag::StringLiteral.into(),
         ATTR => HlTag::Attribute.into(),
+        INT_NUMBER if element.ancestors().nth(1).map_or(false, |it| it.kind() == FIELD_EXPR) => {
+            SymbolKind::Field.into()
+        }
         INT_NUMBER | FLOAT_NUMBER => HlTag::NumericLiteral.into(),
         BYTE => HlTag::ByteLiteral.into(),
         CHAR => HlTag::CharLiteral.into(),
@@ -351,15 +374,7 @@ fn highlight_def(db: &RootDatabase, krate: Option<hir::Crate>, def: Definition) 
 
                 h
             }
-            hir::ModuleDef::Trait(trait_) => {
-                let mut h = Highlight::new(HlTag::Symbol(SymbolKind::Trait));
-
-                if trait_.is_unsafe(db) {
-                    h |= HlMod::Unsafe;
-                }
-
-                h
-            }
+            hir::ModuleDef::Trait(_) => Highlight::new(HlTag::Symbol(SymbolKind::Trait)),
             hir::ModuleDef::TypeAlias(type_) => {
                 let mut h = Highlight::new(HlTag::Symbol(SymbolKind::TypeAlias));
 
@@ -424,9 +439,12 @@ fn highlight_def(db: &RootDatabase, krate: Option<hir::Crate>, def: Definition) 
 
     let is_from_other_crate = def.module(db).map(hir::Module::krate) != krate;
     let is_builtin_type = matches!(def, Definition::ModuleDef(hir::ModuleDef::BuiltinType(_)));
+    let is_public = def.visibility(db) == Some(hir::Visibility::Public);
 
-    if is_from_other_crate && !is_builtin_type {
-        h |= HlMod::Library;
+    match (is_from_other_crate, is_builtin_type, is_public) {
+        (true, false, _) => h |= HlMod::Library,
+        (false, _, true) => h |= HlMod::Public,
+        _ => {}
     }
 
     h
@@ -446,12 +464,12 @@ fn highlight_method_call(
     krate: Option<hir::Crate>,
     method_call: &ast::MethodCallExpr,
 ) -> Option<Highlight> {
-    let func = sema.resolve_method_call(&method_call)?;
+    let func = sema.resolve_method_call(method_call)?;
 
     let mut h = SymbolKind::Function.into();
     h |= HlMod::Associated;
 
-    if func.is_unsafe(sema.db) || sema.is_unsafe_method_call(&method_call) {
+    if func.is_unsafe(sema.db) || sema.is_unsafe_method_call(method_call) {
         h |= HlMod::Unsafe;
     }
     if func.is_async(sema.db) {
@@ -460,8 +478,14 @@ fn highlight_method_call(
     if func.as_assoc_item(sema.db).and_then(|it| it.containing_trait(sema.db)).is_some() {
         h |= HlMod::Trait;
     }
-    if Some(func.module(sema.db).krate()) != krate {
+
+    let is_from_other_crate = Some(func.module(sema.db).krate()) != krate;
+    let is_public = func.visibility(sema.db) == hir::Visibility::Public;
+
+    if is_from_other_crate {
         h |= HlMod::Library;
+    } else if is_public {
+        h |= HlMod::Public;
     }
 
     if let Some(self_param) = func.self_param(sema.db) {
@@ -523,11 +547,9 @@ fn highlight_name_ref_by_syntax(
     };
 
     match parent.kind() {
-        METHOD_CALL_EXPR => {
-            return ast::MethodCallExpr::cast(parent)
-                .and_then(|it| highlight_method_call(sema, krate, &it))
-                .unwrap_or_else(|| SymbolKind::Function.into());
-        }
+        METHOD_CALL_EXPR => ast::MethodCallExpr::cast(parent)
+            .and_then(|it| highlight_method_call(sema, krate, &it))
+            .unwrap_or_else(|| SymbolKind::Function.into()),
         FIELD_EXPR => {
             let h = HlTag::Symbol(SymbolKind::Field);
             let is_union = ast::FieldExpr::cast(parent)

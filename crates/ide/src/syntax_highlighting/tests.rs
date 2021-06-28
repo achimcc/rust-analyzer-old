@@ -122,6 +122,10 @@ def_fn! {
     }
 }
 
+macro_rules! dont_color_me_braces {
+    () => {0}
+}
+
 macro_rules! noop {
     ($expr:expr) => {
         $expr
@@ -145,6 +149,7 @@ macro without_args {
 // comment
 fn main() {
     println!("Hello, {}!", 92);
+    dont_color_me_braces!();
 
     let mut vec = Vec::new();
     if true {
@@ -184,8 +189,8 @@ fn main() {
     let a = |x| x;
     let bar = Foo::baz;
 
-    let baz = -42;
-    let baz = -baz;
+    let baz = (-42,);
+    let baz = -baz.0;
 
     let _ = !true;
 
@@ -237,6 +242,14 @@ fn use_foo_items() {
     }
 }
 
+pub enum Bool { True, False }
+
+impl Bool {
+    pub const fn to_primitive(self) -> bool {
+        matches!(self, Self::True)
+    }
+}
+const USAGE_OF_BOOL:bool = Bool::True.to_primitive();
 
 //- /foo.rs crate:foo
 pub struct Person {
@@ -385,7 +398,7 @@ struct Foo {
         .highlight_range(FileRange { file_id, range: TextRange::at(45.into(), 1.into()) })
         .unwrap();
 
-    assert_eq!(&highlights[0].highlight.to_string(), "field.declaration");
+    assert_eq!(&highlights[0].highlight.to_string(), "field.declaration.public");
 }
 
 #[test]
@@ -521,6 +534,11 @@ static mut global_mut: TypeForStaticMut = TypeForStaticMut { a: 0 };
 struct Packed {
     a: u16,
 }
+
+unsafe trait UnsafeTrait {}
+unsafe impl UnsafeTrait for Packed {}
+
+fn require_unsafe_trait<T: UnsafeTrait>(_: T) {}
 
 trait DoTheAutoref {
     fn calls_autoref(&self);

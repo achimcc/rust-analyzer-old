@@ -43,7 +43,7 @@ fn add_vis_to_referenced_module_def(acc: &mut Assists, ctx: &AssistContext) -> O
         _ => return None,
     };
 
-    let current_module = ctx.sema.scope(&path.syntax()).module()?;
+    let current_module = ctx.sema.scope(path.syntax()).module()?;
     let target_module = def.module(ctx.db())?;
 
     let vis = target_module.visibility_of(ctx.db(), &def)?;
@@ -361,8 +361,6 @@ pub struct Foo { pub bar: () }
     }
 
     #[test]
-    #[ignore]
-    // FIXME reenable this test when `Semantics::resolve_record_field` works with union fields
     fn fix_visibility_of_union_field() {
         check_assist(
             fix_visibility,
@@ -583,25 +581,25 @@ pub struct Foo { pub(crate) bar: () }
     }
 
     #[test]
-    #[ignore]
-    // FIXME handle reexports properly
     fn fix_visibility_of_reexport() {
+        // FIXME: broken test, this should fix visibility of the re-export
+        // rather than the struct.
         check_assist(
             fix_visibility,
-            r"
-            mod foo {
-                use bar::Baz;
-                mod bar { pub(super) struct Baz; }
-            }
-            foo::Baz$0
-            ",
-            r"
-            mod foo {
-                $0pub(crate) use bar::Baz;
-                mod bar { pub(super) struct Baz; }
-            }
-            foo::Baz
-            ",
+            r#"
+mod foo {
+    use bar::Baz;
+    mod bar { pub(super) struct Baz; }
+}
+foo::Baz$0
+"#,
+            r#"
+mod foo {
+    use bar::Baz;
+    mod bar { $0pub(crate) struct Baz; }
+}
+foo::Baz
+"#,
         )
     }
 }

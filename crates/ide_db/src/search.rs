@@ -8,7 +8,8 @@ use std::{convert::TryInto, mem};
 
 use base_db::{FileId, FileRange, SourceDatabase, SourceDatabaseExt};
 use hir::{
-    DefWithBody, HasAttrs, HasSource, InFile, ModuleDef, ModuleSource, Semantics, Visibility,
+    AsAssocItem, DefWithBody, HasAttrs, HasSource, InFile, ModuleDef, ModuleSource, Semantics,
+    Visibility,
 };
 use once_cell::unsync::Lazy;
 use rustc_hash::FxHashMap;
@@ -303,13 +304,13 @@ impl Definition {
         }
     }
 
-    pub fn usages<'a>(&'a self, sema: &'a Semantics<RootDatabase>) -> FindUsages<'a> {
+    pub fn usages<'a>(self, sema: &'a Semantics<RootDatabase>) -> FindUsages<'a> {
         FindUsages { def: self, sema, scope: None, include_self_kw_refs: None }
     }
 }
 
 pub struct FindUsages<'a> {
-    def: &'a Definition,
+    def: Definition,
     sema: &'a Semantics<'a, RootDatabase>,
     scope: Option<SearchScope>,
     include_self_kw_refs: Option<hir::Type>,
@@ -318,7 +319,7 @@ pub struct FindUsages<'a> {
 impl<'a> FindUsages<'a> {
     /// Enable searching for `Self` when the definition is a type.
     pub fn include_self_refs(mut self) -> FindUsages<'a> {
-        self.include_self_kw_refs = def_to_ty(self.sema, self.def);
+        self.include_self_kw_refs = def_to_ty(self.sema, &self.def);
         self
     }
 
@@ -408,7 +409,7 @@ impl<'a> FindUsages<'a> {
                     if let Some(ast::NameLike::NameRef(name_ref)) =
                         sema.find_node_at_offset_with_descend(&tree, offset)
                     {
-                        if self.found_self_ty_name_ref(&self_ty, &name_ref, sink) {
+                        if self.found_self_ty_name_ref(self_ty, &name_ref, sink) {
                             return;
                         }
                     }
@@ -423,7 +424,7 @@ impl<'a> FindUsages<'a> {
         name_ref: &ast::NameRef,
         sink: &mut dyn FnMut(FileId, FileReference) -> bool,
     ) -> bool {
-        match NameRefClass::classify(self.sema, &name_ref) {
+        match NameRefClass::classify(self.sema, name_ref) {
             Some(NameRefClass::Definition(Definition::SelfType(impl_)))
                 if impl_.self_ty(self.sema.db) == *self_ty =>
             {
@@ -445,7 +446,7 @@ impl<'a> FindUsages<'a> {
         sink: &mut dyn FnMut(FileId, FileReference) -> bool,
     ) -> bool {
         match NameRefClass::classify_lifetime(self.sema, lifetime) {
-            Some(NameRefClass::Definition(def)) if &def == self.def => {
+            Some(NameRefClass::Definition(def)) if def == self.def => {
                 let FileRange { file_id, range } = self.sema.original_range(lifetime.syntax());
                 let reference = FileReference {
                     range,
@@ -463,13 +464,13 @@ impl<'a> FindUsages<'a> {
         name_ref: &ast::NameRef,
         sink: &mut dyn FnMut(FileId, FileReference) -> bool,
     ) -> bool {
-        match NameRefClass::classify(self.sema, &name_ref) {
-            Some(NameRefClass::Definition(def)) if &def == self.def => {
+        match NameRefClass::classify(self.sema, name_ref) {
+            Some(NameRefClass::Definition(def)) if def == self.def => {
                 let FileRange { file_id, range } = self.sema.original_range(name_ref.syntax());
                 let reference = FileReference {
                     range,
                     name: ast::NameLike::NameRef(name_ref.clone()),
-                    access: reference_access(&def, &name_ref),
+                    access: reference_access(&def, name_ref),
                 };
                 sink(file_id, reference)
             }
@@ -479,7 +480,7 @@ impl<'a> FindUsages<'a> {
                     let reference = FileReference {
                         range,
                         name: ast::NameLike::NameRef(name_ref.clone()),
-                        access: reference_access(&def, &name_ref),
+                        access: reference_access(&def, name_ref),
                     };
                     sink(file_id, reference)
                 } else {
@@ -489,11 +490,9 @@ impl<'a> FindUsages<'a> {
             Some(NameRefClass::FieldShorthand { local_ref: local, field_ref: field }) => {
                 let FileRange { file_id, range } = self.sema.original_range(name_ref.syntax());
                 let access = match self.def {
-                    Definition::Field(_) if &field == self.def => {
-                        reference_access(&field, &name_ref)
-                    }
-                    Definition::Local(l) if &local == l => {
-                        reference_access(&Definition::Local(local), &name_ref)
+                    Definition::Field(_) if field == self.def => reference_access(&field, name_ref),
+                    Definition::Local(l) if local == l => {
+                        reference_access(&Definition::Local(local), name_ref)
                     }
                     _ => return false,
                 };
@@ -513,7 +512,7 @@ impl<'a> FindUsages<'a> {
         match NameClass::classify(self.sema, name) {
             Some(NameClass::PatFieldShorthand { local_def: _, field_ref })
                 if matches!(
-                    self.def, Definition::Field(_) if &field_ref == self.def
+                    self.def, Definition::Field(_) if field_ref == self.def
                 ) =>
             {
                 let FileRange { file_id, range } = self.sema.original_range(name.syntax());
@@ -525,11 +524,39 @@ impl<'a> FindUsages<'a> {
                 };
                 sink(file_id, reference)
             }
-            Some(NameClass::ConstReference(def)) if *self.def == def => {
+            Some(NameClass::ConstReference(def)) if self.def == def => {
                 let FileRange { file_id, range } = self.sema.original_range(name.syntax());
                 let reference =
                     FileReference { range, name: ast::NameLike::Name(name.clone()), access: None };
                 sink(file_id, reference)
+            }
+            // Resolve trait impl function definitions to the trait definition's version if self.def is the trait definition's
+            Some(NameClass::Definition(Definition::ModuleDef(mod_def))) => {
+                /* poor man's try block */
+                (|| {
+                    let this = match self.def {
+                        Definition::ModuleDef(this) if this != mod_def => this,
+                        _ => return None,
+                    };
+                    let this_trait = this
+                        .as_assoc_item(self.sema.db)?
+                        .containing_trait_or_trait_impl(self.sema.db)?;
+                    let trait_ = mod_def
+                        .as_assoc_item(self.sema.db)?
+                        .containing_trait_or_trait_impl(self.sema.db)?;
+                    (trait_ == this_trait
+                        && self.def.name(self.sema.db) == mod_def.name(self.sema.db))
+                    .then(|| {
+                        let FileRange { file_id, range } = self.sema.original_range(name.syntax());
+                        let reference = FileReference {
+                            range,
+                            name: ast::NameLike::Name(name.clone()),
+                            access: None,
+                        };
+                        sink(file_id, reference)
+                    })
+                })()
+                .unwrap_or(false)
             }
             _ => false,
         }

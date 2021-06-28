@@ -11,6 +11,7 @@ mod fixture;
 mod assert_linear;
 
 use std::{
+    collections::BTreeMap,
     convert::{TryFrom, TryInto},
     env, fs,
     path::{Path, PathBuf},
@@ -23,7 +24,10 @@ use text_size::{TextRange, TextSize};
 pub use dissimilar::diff as __diff;
 pub use rustc_hash::FxHashMap;
 
-pub use crate::{assert_linear::AssertLinear, fixture::Fixture};
+pub use crate::{
+    assert_linear::AssertLinear,
+    fixture::{Fixture, MiniCore},
+};
 
 pub const CURSOR_MARKER: &str = "$0";
 pub const ESCAPED_CURSOR_MARKER: &str = "\\$0";
@@ -190,22 +194,51 @@ pub fn add_cursor(text: &str, offset: TextSize) -> String {
     res
 }
 
-/// Extracts `//^ some text` annotations
+/// Extracts `//^^^ some text` annotations.
+///
+/// A run of `^^^` can be arbitrary long and points to the corresponding range
+/// in the line above.
+///
+/// The `// ^file text` syntax can be used to attach `text` to the entirety of
+/// the file.
+///
+/// Multiline string values are supported:
+///
+/// // ^^^ first line
+/// //   | second line
+///
+/// Annotations point to the last line that actually was long enough for the
+/// range, not counting annotations themselves. So overlapping annotations are
+/// possible:
+/// ```no_run
+/// // stuff        other stuff
+/// // ^^ 'st'
+/// // ^^^^^ 'stuff'
+/// //              ^^^^^^^^^^^ 'other stuff'
+/// ```
 pub fn extract_annotations(text: &str) -> Vec<(TextRange, String)> {
     let mut res = Vec::new();
-    let mut prev_line_start: Option<TextSize> = None;
+    // map from line length to beginning of last line that had that length
+    let mut line_start_map = BTreeMap::new();
     let mut line_start: TextSize = 0.into();
     let mut prev_line_annotations: Vec<(TextSize, usize)> = Vec::new();
     for line in text.split_inclusive('\n') {
         let mut this_line_annotations = Vec::new();
-        if let Some(idx) = line.find("//") {
+        let line_length = if let Some(idx) = line.find("//") {
             let annotation_offset = TextSize::of(&line[..idx + "//".len()]);
             for annotation in extract_line_annotations(&line[idx + "//".len()..]) {
                 match annotation {
-                    LineAnnotation::Annotation { mut range, content } => {
+                    LineAnnotation::Annotation { mut range, content, file } => {
                         range += annotation_offset;
                         this_line_annotations.push((range.end(), res.len()));
-                        res.push((range + prev_line_start.unwrap(), content))
+                        let range = if file {
+                            TextRange::up_to(TextSize::of(text))
+                        } else {
+                            let line_start = line_start_map.range(range.end()..).next().unwrap();
+
+                            range + line_start.1
+                        };
+                        res.push((range, content))
                     }
                     LineAnnotation::Continuation { mut offset, content } => {
                         offset += annotation_offset;
@@ -219,18 +252,24 @@ pub fn extract_annotations(text: &str) -> Vec<(TextRange, String)> {
                     }
                 }
             }
-        }
+            idx.try_into().unwrap()
+        } else {
+            TextSize::of(line)
+        };
 
-        prev_line_start = Some(line_start);
+        line_start_map = line_start_map.split_off(&line_length);
+        line_start_map.insert(line_length, line_start);
+
         line_start += TextSize::of(line);
 
         prev_line_annotations = this_line_annotations;
     }
+
     res
 }
 
 enum LineAnnotation {
-    Annotation { range: TextRange, content: String },
+    Annotation { range: TextRange, content: String, file: bool },
     Continuation { offset: TextSize, content: String },
 }
 
@@ -251,12 +290,20 @@ fn extract_line_annotations(mut line: &str) -> Vec<LineAnnotation> {
         }
         let range = TextRange::at(offset, len.try_into().unwrap());
         let next = line[len..].find(marker).map_or(line.len(), |it| it + len);
-        let content = line[len..][..next - len].trim().to_string();
+        let mut content = &line[len..][..next - len];
+
+        let mut file = false;
+        if !continuation && content.starts_with("file") {
+            file = true;
+            content = &content["file".len()..]
+        }
+
+        let content = content.trim().to_string();
 
         let annotation = if continuation {
             LineAnnotation::Continuation { offset: range.end(), content }
         } else {
-            LineAnnotation::Annotation { range, content }
+            LineAnnotation::Annotation { range, content, file }
         };
         res.push(annotation);
 
@@ -268,7 +315,7 @@ fn extract_line_annotations(mut line: &str) -> Vec<LineAnnotation> {
 }
 
 #[test]
-fn test_extract_annotations() {
+fn test_extract_annotations_1() {
     let text = stdx::trim_indent(
         r#"
 fn main() {
@@ -277,16 +324,39 @@ fn main() {
     zoo + 1
 } //^^^ type:
   //  | i32
+
+// ^file
     "#,
     );
     let res = extract_annotations(&text)
         .into_iter()
         .map(|(range, ann)| (&text[range], ann))
         .collect::<Vec<_>>();
+
     assert_eq!(
-        res,
-        vec![("x", "def".into()), ("y", "def".into()), ("zoo", "type:\ni32\n".into()),]
+        res[..3],
+        [("x", "def".into()), ("y", "def".into()), ("zoo", "type:\ni32\n".into())]
     );
+    assert_eq!(res[3].0.len(), 115);
+}
+
+#[test]
+fn test_extract_annotations_2() {
+    let text = stdx::trim_indent(
+        r#"
+fn main() {
+    (x,   y);
+   //^ a
+      //  ^ b
+  //^^^^^^^^ c
+}"#,
+    );
+    let res = extract_annotations(&text)
+        .into_iter()
+        .map(|(range, ann)| (&text[range], ann))
+        .collect::<Vec<_>>();
+
+    assert_eq!(res, [("x", "a".into()), ("y", "b".into()), ("(x,   y)", "c".into())]);
 }
 
 /// Returns `false` if slow tests should not run, otherwise returns `true` and

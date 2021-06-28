@@ -1,6 +1,5 @@
 //! Utilities for creating `Analysis` instances for tests.
 use ide_db::base_db::fixture::ChangeFixture;
-use syntax::{TextRange, TextSize};
 use test_utils::extract_annotations;
 
 use crate::{Analysis, AnalysisHost, FileId, FilePosition, FileRange};
@@ -11,14 +10,6 @@ pub(crate) fn file(ra_fixture: &str) -> (Analysis, FileId) {
     let change_fixture = ChangeFixture::parse(ra_fixture);
     host.db.apply_change(change_fixture.change);
     (host.analysis(), change_fixture.files[0])
-}
-
-/// Creates analysis for many files.
-pub(crate) fn files(ra_fixture: &str) -> (Analysis, Vec<FileId>) {
-    let mut host = AnalysisHost::default();
-    let change_fixture = ChangeFixture::parse(ra_fixture);
-    host.db.apply_change(change_fixture.change);
-    (host.analysis(), change_fixture.files)
 }
 
 /// Creates analysis from a multi-file fixture, returns positions marked with $0.
@@ -63,15 +54,8 @@ pub(crate) fn annotations(ra_fixture: &str) -> (Analysis, FilePosition, Vec<(Fil
 
 pub(crate) fn nav_target_annotation(ra_fixture: &str) -> (Analysis, FilePosition, FileRange) {
     let (analysis, position, mut annotations) = annotations(ra_fixture);
-    let (mut expected, data) = annotations.pop().unwrap();
+    let (expected, data) = annotations.pop().unwrap();
     assert!(annotations.is_empty());
-    match data.as_str() {
-        "" => (),
-        "file" => {
-            expected.range =
-                TextRange::up_to(TextSize::of(&*analysis.file_text(expected.file_id).unwrap()))
-        }
-        data => panic!("bad data: {}", data),
-    }
+    assert_eq!(data, "");
     (analysis, position, expected)
 }

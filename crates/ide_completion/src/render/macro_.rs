@@ -5,6 +5,7 @@ use ide_db::SymbolKind;
 use syntax::display::macro_label;
 
 use crate::{
+    context::CallKind,
     item::{CompletionItem, CompletionKind, ImportEdit},
     render::RenderContext,
 };
@@ -68,7 +69,8 @@ impl<'a> MacroRender<'a> {
     }
 
     fn needs_bang(&self) -> bool {
-        self.ctx.completion.use_item_syntax.is_none() && !self.ctx.completion.is_macro_call
+        !self.ctx.completion.in_use_tree()
+            && !matches!(self.ctx.completion.path_call_kind(), Some(CallKind::Mac))
     }
 
     fn label(&self) -> String {
@@ -131,7 +133,7 @@ fn guess_macro_braces(macro_name: &str, docs: &str) -> (&'static str, &'static s
 
 #[cfg(test)]
 mod tests {
-    use crate::test_utils::check_edit;
+    use crate::tests::check_edit;
 
     #[test]
     fn dont_insert_macro_call_parens_unncessary() {
@@ -178,7 +180,7 @@ fn main() { frobnicate!(); }
 /// ```
 macro_rules! vec { () => {} }
 
-fn fn main() { v$0 }
+fn main() { v$0 }
 "#,
             r#"
 /// Creates a [`Vec`] containing the arguments.
@@ -191,7 +193,7 @@ fn fn main() { v$0 }
 /// ```
 macro_rules! vec { () => {} }
 
-fn fn main() { vec![$0] }
+fn main() { vec![$0] }
 "#,
         );
 

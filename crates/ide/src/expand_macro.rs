@@ -1,11 +1,8 @@
 use std::iter;
 
 use hir::Semantics;
-use ide_db::RootDatabase;
-use syntax::{
-    algo::find_node_at_offset, ast, ted, AstNode, NodeOrToken, SyntaxKind, SyntaxKind::*,
-    SyntaxNode, WalkEvent, T,
-};
+use ide_db::{helpers::pick_best_token, RootDatabase};
+use syntax::{ast, ted, AstNode, NodeOrToken, SyntaxKind, SyntaxKind::*, SyntaxNode, WalkEvent, T};
 
 use crate::FilePosition;
 
@@ -28,16 +25,36 @@ pub struct ExpandedMacro {
 pub(crate) fn expand_macro(db: &RootDatabase, position: FilePosition) -> Option<ExpandedMacro> {
     let sema = Semantics::new(db);
     let file = sema.parse(position.file_id);
-    let mac = find_node_at_offset::<ast::MacroCall>(file.syntax(), position.offset)?;
-    let name = mac.path()?.segment()?.name_ref()?;
 
-    let expanded = expand_macro_recur(&sema, &mac)?;
+    let tok = pick_best_token(file.syntax().token_at_offset(position.offset), |kind| match kind {
+        SyntaxKind::IDENT => 1,
+        _ => 0,
+    })?;
+    let mut expanded = None;
+    let mut name = None;
+    for node in tok.ancestors() {
+        if let Some(item) = ast::Item::cast(node.clone()) {
+            expanded = sema.expand_attr_macro(&item);
+            if expanded.is_some() {
+                // FIXME: add the macro name
+                // FIXME: make this recursive too
+                name = Some("?".to_string());
+                break;
+            }
+        }
+
+        if let Some(mac) = ast::MacroCall::cast(node) {
+            name = Some(mac.path()?.segment()?.name_ref()?.to_string());
+            expanded = expand_macro_recur(&sema, &mac);
+            break;
+        }
+    }
 
     // FIXME:
     // macro expansion may lose all white space information
     // But we hope someday we can use ra_fmt for that
-    let expansion = insert_whitespaces(expanded);
-    Some(ExpandedMacro { name: name.to_string(), expansion })
+    let expansion = insert_whitespaces(expanded?);
+    Some(ExpandedMacro { name: name?, expansion })
 }
 
 fn expand_macro_recur(

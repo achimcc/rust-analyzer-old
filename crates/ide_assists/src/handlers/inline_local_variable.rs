@@ -65,32 +65,35 @@ pub(crate) fn inline_local_variable(acc: &mut Assists, ctx: &AssistContext) -> O
                         Some(u) => u,
                         None => return Some(false),
                     };
-
-                    Some(!matches!(
-                        (&initializer_expr, usage_parent),
-                        (ast::Expr::CallExpr(_), _)
-                            | (ast::Expr::IndexExpr(_), _)
-                            | (ast::Expr::MethodCallExpr(_), _)
-                            | (ast::Expr::FieldExpr(_), _)
-                            | (ast::Expr::TryExpr(_), _)
-                            | (ast::Expr::RefExpr(_), _)
-                            | (ast::Expr::Literal(_), _)
-                            | (ast::Expr::TupleExpr(_), _)
-                            | (ast::Expr::ArrayExpr(_), _)
-                            | (ast::Expr::ParenExpr(_), _)
-                            | (ast::Expr::PathExpr(_), _)
-                            | (ast::Expr::BlockExpr(_), _)
-                            | (ast::Expr::EffectExpr(_), _)
-                            | (_, ast::Expr::CallExpr(_))
-                            | (_, ast::Expr::TupleExpr(_))
-                            | (_, ast::Expr::ArrayExpr(_))
-                            | (_, ast::Expr::ParenExpr(_))
-                            | (_, ast::Expr::ForExpr(_))
-                            | (_, ast::Expr::WhileExpr(_))
-                            | (_, ast::Expr::BreakExpr(_))
-                            | (_, ast::Expr::ReturnExpr(_))
-                            | (_, ast::Expr::MatchExpr(_))
-                    ))
+                    Some(
+                        !(matches!(
+                            initializer_expr,
+                            ast::Expr::CallExpr(_)
+                                | ast::Expr::IndexExpr(_)
+                                | ast::Expr::MethodCallExpr(_)
+                                | ast::Expr::FieldExpr(_)
+                                | ast::Expr::TryExpr(_)
+                                | ast::Expr::RefExpr(_)
+                                | ast::Expr::Literal(_)
+                                | ast::Expr::TupleExpr(_)
+                                | ast::Expr::ArrayExpr(_)
+                                | ast::Expr::ParenExpr(_)
+                                | ast::Expr::PathExpr(_)
+                                | ast::Expr::BlockExpr(_)
+                                | ast::Expr::EffectExpr(_),
+                        ) || matches!(
+                            usage_parent,
+                            ast::Expr::CallExpr(_)
+                                | ast::Expr::TupleExpr(_)
+                                | ast::Expr::ArrayExpr(_)
+                                | ast::Expr::ParenExpr(_)
+                                | ast::Expr::ForExpr(_)
+                                | ast::Expr::WhileExpr(_)
+                                | ast::Expr::BreakExpr(_)
+                                | ast::Expr::ReturnExpr(_)
+                                | ast::Expr::MatchExpr(_)
+                        )),
+                    )
                 })
                 .collect::<Option<_>>()
                 .map(|b| (file_id, b))
@@ -182,6 +185,10 @@ fn inline_usage(ctx: &AssistContext) -> Option<InlineData> {
         PathResolution::Local(local) => local,
         _ => return None,
     };
+    if local.is_mut(ctx.sema.db) {
+        cov_mark::hit!(test_not_inline_mut_variable_use);
+        return None;
+    }
 
     let bind_pat = match local.source(ctx.db()).value {
         Either::Left(ident) => ident,
@@ -422,6 +429,19 @@ fn foo() {
 fn foo() {
     let mut a$0 = 1 + 1;
     a + 1;
+}",
+        );
+    }
+
+    #[test]
+    fn test_not_inline_mut_variable_use() {
+        cov_mark::check!(test_not_inline_mut_variable_use);
+        check_assist_not_applicable(
+            inline_local_variable,
+            r"
+fn foo() {
+    let mut a = 1 + 1;
+    a$0 + 1;
 }",
         );
     }

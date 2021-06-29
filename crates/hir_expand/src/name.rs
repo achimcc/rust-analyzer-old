@@ -1,4 +1,4 @@
-//! FIXME: write short doc here
+//! See [`Name`].
 
 use std::fmt;
 
@@ -160,10 +160,11 @@ pub mod known {
         str,
         // Special names
         macro_rules,
-        derive,
         doc,
         cfg,
         cfg_attr,
+        register_attr,
+        register_tool,
         // Components of known path (value or mod name)
         std,
         core,
@@ -174,6 +175,11 @@ pub mod known {
         result,
         boxed,
         option,
+        prelude,
+        rust_2015,
+        rust_2018,
+        rust_2021,
+        v1,
         // Components of known path (type name)
         Iterator,
         IntoIterator,
@@ -212,6 +218,7 @@ pub mod known {
         std_panic,
         stringify,
         concat,
+        concat_idents,
         include,
         include_bytes,
         include_str,
@@ -232,6 +239,14 @@ pub mod known {
         PartialOrd,
         Eq,
         PartialEq,
+        // Builtin attributes
+        bench,
+        cfg_accessible,
+        cfg_eval,
+        derive,
+        global_allocator,
+        test,
+        test_case,
         // Safe intrinsics
         abort,
         size_of,

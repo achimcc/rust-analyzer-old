@@ -1,4 +1,4 @@
-use std::iter;
+use std::iter::{self, Peekable};
 
 use either::Either;
 use hir::{Adt, HasSource, ModuleDef, Semantics};
@@ -31,8 +31,8 @@ use crate::{
 //
 // fn handle(action: Action) {
 //     match action {
-//         $0Action::Move { distance } => {}
-//         Action::Stop => {}
+//         $0Action::Move { distance } => todo!(),
+//         Action::Stop => todo!(),
 //     }
 // }
 // ```
@@ -63,48 +63,61 @@ pub(crate) fn fill_match_arms(acc: &mut Assists, ctx: &AssistContext) -> Option<
 
     let module = ctx.sema.scope(expr.syntax()).module()?;
 
-    let missing_arms: Vec<MatchArm> = if let Some(enum_def) = resolve_enum_def(&ctx.sema, &expr) {
+    let mut missing_pats: Peekable<Box<dyn Iterator<Item = ast::Pat>>> = if let Some(enum_def) =
+        resolve_enum_def(&ctx.sema, &expr)
+    {
         let variants = enum_def.variants(ctx.db());
 
-        let mut variants = variants
+        let missing_pats = variants
             .into_iter()
             .filter_map(|variant| build_pat(ctx.db(), module, variant))
-            .filter(|variant_pat| is_variant_missing(&top_lvl_pats, variant_pat))
-            .map(|pat| make::match_arm(iter::once(pat), make::expr_empty_block()))
-            .collect::<Vec<_>>();
-        if Some(enum_def)
-            == FamousDefs(&ctx.sema, Some(module.krate()))
-                .core_option_Option()
-                .map(|x| lift_enum(x))
+            .filter(|variant_pat| is_variant_missing(&top_lvl_pats, variant_pat));
+
+        let missing_pats: Box<dyn Iterator<Item = _>> = if Some(enum_def)
+            == FamousDefs(&ctx.sema, Some(module.krate())).core_option_Option().map(lift_enum)
         {
             // Match `Some` variant first.
             cov_mark::hit!(option_order);
-            variants.reverse()
-        }
-        variants
+            Box::new(missing_pats.rev())
+        } else {
+            Box::new(missing_pats)
+        };
+        missing_pats.peekable()
     } else if let Some(enum_defs) = resolve_tuple_of_enum_def(&ctx.sema, &expr) {
+        let mut n_arms = 1;
+        let variants_of_enums: Vec<Vec<ExtendedVariant>> = enum_defs
+            .into_iter()
+            .map(|enum_def| enum_def.variants(ctx.db()))
+            .inspect(|variants| n_arms *= variants.len())
+            .collect();
+
         // When calculating the match arms for a tuple of enums, we want
         // to create a match arm for each possible combination of enum
         // values. The `multi_cartesian_product` method transforms
         // Vec<Vec<EnumVariant>> into Vec<(EnumVariant, .., EnumVariant)>
         // where each tuple represents a proposed match arm.
-        enum_defs
+
+        // A number of arms grows very fast on even a small tuple of large enums.
+        // We skip the assist beyond an arbitrary threshold.
+        if n_arms > 256 {
+            return None;
+        }
+        let missing_pats = variants_of_enums
             .into_iter()
-            .map(|enum_def| enum_def.variants(ctx.db()))
             .multi_cartesian_product()
+            .inspect(|_| cov_mark::hit!(fill_match_arms_lazy_computation))
             .map(|variants| {
                 let patterns =
                     variants.into_iter().filter_map(|variant| build_pat(ctx.db(), module, variant));
                 ast::Pat::from(make::tuple_pat(patterns))
             })
-            .filter(|variant_pat| is_variant_missing(&top_lvl_pats, variant_pat))
-            .map(|pat| make::match_arm(iter::once(pat), make::expr_empty_block()))
-            .collect()
+            .filter(|variant_pat| is_variant_missing(&top_lvl_pats, variant_pat));
+        (Box::new(missing_pats) as Box<dyn Iterator<Item = _>>).peekable()
     } else {
         return None;
     };
 
-    if missing_arms.is_empty() {
+    if missing_pats.peek().is_none() {
         return None;
     }
 
@@ -114,10 +127,23 @@ pub(crate) fn fill_match_arms(acc: &mut Assists, ctx: &AssistContext) -> Option<
         "Fill match arms",
         target,
         |builder| {
-            let new_arm_list = match_arm_list.remove_placeholder();
-            let n_old_arms = new_arm_list.arms().count();
-            let new_arm_list = new_arm_list.append_arms(missing_arms);
-            let first_new_arm = new_arm_list.arms().nth(n_old_arms);
+            let new_match_arm_list = match_arm_list.clone_for_update();
+            let missing_arms = missing_pats
+                .map(|pat| make::match_arm(iter::once(pat), make::ext::expr_todo()))
+                .map(|it| it.clone_for_update());
+
+            let catch_all_arm = new_match_arm_list
+                .arms()
+                .find(|arm| matches!(arm.pat(), Some(ast::Pat::WildcardPat(_))));
+            if let Some(arm) = catch_all_arm {
+                arm.remove()
+            }
+            let mut first_new_arm = None;
+            for arm in missing_arms {
+                first_new_arm.get_or_insert_with(|| arm.clone());
+                new_match_arm_list.add_arm(arm);
+            }
+
             let old_range = ctx.sema.original_range(match_arm_list.syntax()).range;
             match (first_new_arm, ctx.config.snippet_cap) {
                 (Some(first_new_arm), Some(cap)) => {
@@ -131,10 +157,10 @@ pub(crate) fn fill_match_arms(acc: &mut Assists, ctx: &AssistContext) -> Option<
                             }
                             None => Cursor::Before(first_new_arm.syntax()),
                         };
-                    let snippet = render_snippet(cap, new_arm_list.syntax(), cursor);
+                    let snippet = render_snippet(cap, new_match_arm_list.syntax(), cursor);
                     builder.replace_snippet(cap, old_range, snippet);
                 }
-                _ => builder.replace(old_range, new_arm_list.to_string()),
+                _ => builder.replace(old_range, new_match_arm_list.to_string()),
             }
         },
     )
@@ -155,13 +181,13 @@ fn does_pat_match_variant(pat: &Pat, var: &Pat) -> bool {
     }
 }
 
-#[derive(Eq, PartialEq, Clone)]
+#[derive(Eq, PartialEq, Clone, Copy)]
 enum ExtendedEnum {
     Bool,
     Enum(hir::Enum),
 }
 
-#[derive(Eq, PartialEq, Clone)]
+#[derive(Eq, PartialEq, Clone, Copy)]
 enum ExtendedVariant {
     True,
     False,
@@ -173,10 +199,10 @@ fn lift_enum(e: hir::Enum) -> ExtendedEnum {
 }
 
 impl ExtendedEnum {
-    fn variants(&self, db: &RootDatabase) -> Vec<ExtendedVariant> {
+    fn variants(self, db: &RootDatabase) -> Vec<ExtendedVariant> {
         match self {
             ExtendedEnum::Enum(e) => {
-                e.variants(db).into_iter().map(|x| ExtendedVariant::Variant(x)).collect::<Vec<_>>()
+                e.variants(db).into_iter().map(ExtendedVariant::Variant).collect::<Vec<_>>()
             }
             ExtendedEnum::Bool => {
                 Vec::<ExtendedVariant>::from([ExtendedVariant::True, ExtendedVariant::False])
@@ -186,7 +212,7 @@ impl ExtendedEnum {
 }
 
 fn resolve_enum_def(sema: &Semantics<RootDatabase>, expr: &ast::Expr) -> Option<ExtendedEnum> {
-    sema.type_of_expr(&expr)?.autoderef(sema.db).find_map(|ty| match ty.as_adt() {
+    sema.type_of_expr(expr)?.autoderef(sema.db).find_map(|ty| match ty.as_adt() {
         Some(Adt::Enum(e)) => Some(ExtendedEnum::Enum(e)),
         _ => {
             if ty.is_bool() {
@@ -202,7 +228,7 @@ fn resolve_tuple_of_enum_def(
     sema: &Semantics<RootDatabase>,
     expr: &ast::Expr,
 ) -> Option<Vec<ExtendedEnum>> {
-    sema.type_of_expr(&expr)?
+    sema.type_of_expr(expr)?
         .tuple_fields(sema.db)
         .iter()
         .map(|ty| {
@@ -252,9 +278,9 @@ fn build_pat(db: &RootDatabase, module: hir::Module, var: ExtendedVariant) -> Op
 
 #[cfg(test)]
 mod tests {
-    use ide_db::helpers::FamousDefs;
-
-    use crate::tests::{check_assist, check_assist_not_applicable, check_assist_target};
+    use crate::tests::{
+        check_assist, check_assist_not_applicable, check_assist_target, check_assist_unresolved,
+    };
 
     use super::fill_match_arms;
 
@@ -263,18 +289,18 @@ mod tests {
         check_assist_not_applicable(
             fill_match_arms,
             r#"
-            enum A {
-                As,
-                Bs{x:i32, y:Option<i32>},
-                Cs(i32, Option<i32>),
-            }
-            fn main() {
-                match A::As$0 {
-                    A::As,
-                    A::Bs{x,y:Some(_)} => {}
-                    A::Cs(_, Some(_)) => {}
-                }
-            }
+enum A {
+    As,
+    Bs{x:i32, y:Option<i32>},
+    Cs(i32, Option<i32>),
+}
+fn main() {
+    match A::As$0 {
+        A::As,
+        A::Bs{x,y:Some(_)} => {}
+        A::Cs(_, Some(_)) => {}
+    }
+}
             "#,
         );
     }
@@ -284,13 +310,13 @@ mod tests {
         check_assist_not_applicable(
             fill_match_arms,
             r#"
-            fn foo(a: bool) {
-                match a$0 {
-                    true => {}
-                    false => {}
-                }
-            }
-            "#,
+fn foo(a: bool) {
+    match a$0 {
+        true => {}
+        false => {}
+    }
+}
+"#,
         )
     }
 
@@ -301,11 +327,11 @@ mod tests {
         check_assist_not_applicable(
             fill_match_arms,
             r#"
-            fn main() {
-                match (0, false)$0 {
-                }
-            }
-            "#,
+fn main() {
+    match (0, false)$0 {
+    }
+}
+"#,
         );
     }
 
@@ -314,19 +340,19 @@ mod tests {
         check_assist(
             fill_match_arms,
             r#"
-            fn foo(a: bool) {
-                match a$0 {
-                }
-            }
-            "#,
+fn foo(a: bool) {
+    match a$0 {
+    }
+}
+"#,
             r#"
-            fn foo(a: bool) {
-                match a {
-                    $0true => {}
-                    false => {}
-                }
-            }
-            "#,
+fn foo(a: bool) {
+    match a {
+        $0true => todo!(),
+        false => todo!(),
+    }
+}
+"#,
         )
     }
 
@@ -335,20 +361,20 @@ mod tests {
         check_assist(
             fill_match_arms,
             r#"
-            fn foo(a: bool) {
-                match a$0 {
-                    true => {}
-                }
-            }
-            "#,
+fn foo(a: bool) {
+    match a$0 {
+        true => {}
+    }
+}
+"#,
             r#"
-            fn foo(a: bool) {
-                match a {
-                    true => {}
-                    $0false => {}
-                }
-            }
-            "#,
+fn foo(a: bool) {
+    match a {
+        true => {}
+        $0false => todo!(),
+    }
+}
+"#,
         )
     }
 
@@ -357,15 +383,15 @@ mod tests {
         check_assist_not_applicable(
             fill_match_arms,
             r#"
-            fn foo(a: bool) {
-                match (a, a)$0 {
-                    (true, true) => {}
-                    (true, false) => {}
-                    (false, true) => {}
-                    (false, false) => {}
-                }
-            }
-            "#,
+fn foo(a: bool) {
+    match (a, a)$0 {
+        (true, true) => {}
+        (true, false) => {}
+        (false, true) => {}
+        (false, false) => {}
+    }
+}
+"#,
         )
     }
 
@@ -374,21 +400,21 @@ mod tests {
         check_assist(
             fill_match_arms,
             r#"
-            fn foo(a: bool) {
-                match (a, a)$0 {
-                }
-            }
-            "#,
+fn foo(a: bool) {
+    match (a, a)$0 {
+    }
+}
+"#,
             r#"
-            fn foo(a: bool) {
-                match (a, a) {
-                    $0(true, true) => {}
-                    (true, false) => {}
-                    (false, true) => {}
-                    (false, false) => {}
-                }
-            }
-            "#,
+fn foo(a: bool) {
+    match (a, a) {
+        $0(true, true) => todo!(),
+        (true, false) => todo!(),
+        (false, true) => todo!(),
+        (false, false) => todo!(),
+    }
+}
+"#,
         )
     }
 
@@ -397,22 +423,22 @@ mod tests {
         check_assist(
             fill_match_arms,
             r#"
-            fn foo(a: bool) {
-                match (a, a)$0 {
-                    (false, true) => {}
-                }
-            }
-            "#,
+fn foo(a: bool) {
+    match (a, a)$0 {
+        (false, true) => {}
+    }
+}
+"#,
             r#"
-            fn foo(a: bool) {
-                match (a, a) {
-                    (false, true) => {}
-                    $0(true, true) => {}
-                    (true, false) => {}
-                    (false, false) => {}
-                }
-            }
-            "#,
+fn foo(a: bool) {
+    match (a, a) {
+        (false, true) => {}
+        $0(true, true) => todo!(),
+        (true, false) => todo!(),
+        (false, false) => todo!(),
+    }
+}
+"#,
         )
     }
 
@@ -421,32 +447,32 @@ mod tests {
         check_assist(
             fill_match_arms,
             r#"
-            enum A {
-                As,
-                Bs { x: i32, y: Option<i32> },
-                Cs(i32, Option<i32>),
-            }
-            fn main() {
-                match A::As$0 {
-                    A::Bs { x, y: Some(_) } => {}
-                    A::Cs(_, Some(_)) => {}
-                }
-            }
-            "#,
+enum A {
+    As,
+    Bs { x: i32, y: Option<i32> },
+    Cs(i32, Option<i32>),
+}
+fn main() {
+    match A::As$0 {
+        A::Bs { x, y: Some(_) } => {}
+        A::Cs(_, Some(_)) => {}
+    }
+}
+"#,
             r#"
-            enum A {
-                As,
-                Bs { x: i32, y: Option<i32> },
-                Cs(i32, Option<i32>),
-            }
-            fn main() {
-                match A::As {
-                    A::Bs { x, y: Some(_) } => {}
-                    A::Cs(_, Some(_)) => {}
-                    $0A::As => {}
-                }
-            }
-            "#,
+enum A {
+    As,
+    Bs { x: i32, y: Option<i32> },
+    Cs(i32, Option<i32>),
+}
+fn main() {
+    match A::As {
+        A::Bs { x, y: Some(_) } => {}
+        A::Cs(_, Some(_)) => {}
+        $0A::As => todo!(),
+    }
+}
+"#,
         );
     }
 
@@ -455,26 +481,21 @@ mod tests {
         check_assist(
             fill_match_arms,
             r#"
-enum Option<T> { Some(T), None }
-use Option::*;
-
+//- minicore: option
 fn main() {
     match None$0 {
         None => {}
     }
 }
-            "#,
+"#,
             r#"
-enum Option<T> { Some(T), None }
-use Option::*;
-
 fn main() {
     match None {
         None => {}
-        Some(${0:_}) => {}
+        Some(${0:_}) => todo!(),
     }
 }
-            "#,
+"#,
         );
     }
 
@@ -495,7 +516,7 @@ enum A { As, Bs, Cs(Option<i32>) }
 fn main() {
     match A::As {
         A::Cs(_) | A::Bs => {}
-        $0A::As => {}
+        $0A::As => todo!(),
     }
 }
 "#,
@@ -525,8 +546,8 @@ fn main() {
         A::Bs if 0 < 1 => {}
         A::Ds(_value) => { let x = 1; }
         A::Es(B::Xs) => (),
-        $0A::As => {}
-        A::Cs => {}
+        $0A::As => todo!(),
+        A::Cs => todo!(),
     }
 }
 "#,
@@ -552,7 +573,7 @@ fn main() {
     match A::As {
         A::As(_) => {}
         a @ A::Bs(_) => {}
-        A::Cs(${0:_}) => {}
+        A::Cs(${0:_}) => todo!(),
     }
 }
 "#,
@@ -577,11 +598,11 @@ enum A { As, Bs, Cs(String), Ds(String, String), Es { x: usize, y: usize } }
 fn main() {
     let a = A::As;
     match a {
-        $0A::As => {}
-        A::Bs => {}
-        A::Cs(_) => {}
-        A::Ds(_, _) => {}
-        A::Es { x, y } => {}
+        $0A::As => todo!(),
+        A::Bs => todo!(),
+        A::Cs(_) => todo!(),
+        A::Ds(_, _) => todo!(),
+        A::Es { x, y } => todo!(),
     }
 }
 "#,
@@ -593,30 +614,30 @@ fn main() {
         check_assist(
             fill_match_arms,
             r#"
-            enum A { One, Two }
-            enum B { One, Two }
+enum A { One, Two }
+enum B { One, Two }
 
-            fn main() {
-                let a = A::One;
-                let b = B::One;
-                match (a$0, b) {}
-            }
-            "#,
+fn main() {
+    let a = A::One;
+    let b = B::One;
+    match (a$0, b) {}
+}
+"#,
             r#"
-            enum A { One, Two }
-            enum B { One, Two }
+enum A { One, Two }
+enum B { One, Two }
 
-            fn main() {
-                let a = A::One;
-                let b = B::One;
-                match (a, b) {
-                    $0(A::One, B::One) => {}
-                    (A::One, B::Two) => {}
-                    (A::Two, B::One) => {}
-                    (A::Two, B::Two) => {}
-                }
-            }
-            "#,
+fn main() {
+    let a = A::One;
+    let b = B::One;
+    match (a, b) {
+        $0(A::One, B::One) => todo!(),
+        (A::One, B::Two) => todo!(),
+        (A::Two, B::One) => todo!(),
+        (A::Two, B::Two) => todo!(),
+    }
+}
+"#,
         );
     }
 
@@ -625,30 +646,30 @@ fn main() {
         check_assist(
             fill_match_arms,
             r#"
-            enum A { One, Two }
-            enum B { One, Two }
+enum A { One, Two }
+enum B { One, Two }
 
-            fn main() {
-                let a = A::One;
-                let b = B::One;
-                match (&a$0, &b) {}
-            }
-            "#,
+fn main() {
+    let a = A::One;
+    let b = B::One;
+    match (&a$0, &b) {}
+}
+"#,
             r#"
-            enum A { One, Two }
-            enum B { One, Two }
+enum A { One, Two }
+enum B { One, Two }
 
-            fn main() {
-                let a = A::One;
-                let b = B::One;
-                match (&a, &b) {
-                    $0(A::One, B::One) => {}
-                    (A::One, B::Two) => {}
-                    (A::Two, B::One) => {}
-                    (A::Two, B::Two) => {}
-                }
-            }
-            "#,
+fn main() {
+    let a = A::One;
+    let b = B::One;
+    match (&a, &b) {
+        $0(A::One, B::One) => todo!(),
+        (A::One, B::Two) => todo!(),
+        (A::Two, B::One) => todo!(),
+        (A::Two, B::Two) => todo!(),
+    }
+}
+"#,
         );
     }
 
@@ -677,9 +698,9 @@ fn main() {
     let b = B::One;
     match (a, b) {
         (A::Two, B::One) => {}
-        $0(A::One, B::One) => {}
-        (A::One, B::Two) => {}
-        (A::Two, B::Two) => {}
+        $0(A::One, B::One) => todo!(),
+        (A::One, B::Two) => todo!(),
+        (A::Two, B::Two) => todo!(),
     }
 }
 "#,
@@ -688,7 +709,10 @@ fn main() {
 
     #[test]
     fn fill_match_arms_tuple_of_enum_partial_with_wildcards() {
-        let ra_fixture = r#"
+        check_assist(
+            fill_match_arms,
+            r#"
+//- minicore: option
 fn main() {
     let a = Some(1);
     let b = Some(());
@@ -697,10 +721,7 @@ fn main() {
         (None, Some(_)) => {}
     }
 }
-"#;
-        check_assist(
-            fill_match_arms,
-            &format!("//- /main.rs crate:main deps:core{}{}", ra_fixture, FamousDefs::FIXTURE),
+"#,
             r#"
 fn main() {
     let a = Some(1);
@@ -708,7 +729,7 @@ fn main() {
     match (a, b) {
         (Some(_), _) => {}
         (None, Some(_)) => {}
-        $0(None, None) => {}
+        $0(None, None) => todo!(),
     }
 }
 "#,
@@ -718,17 +739,17 @@ fn main() {
     #[test]
     fn fill_match_arms_partial_with_deep_pattern() {
         // Fixme: cannot handle deep patterns
-        let ra_fixture = r#"
+        check_assist_not_applicable(
+            fill_match_arms,
+            r#"
+//- minicore: option
 fn main() {
     match $0Some(true) {
         Some(true) => {}
         None => {}
     }
 }
-"#;
-        check_assist_not_applicable(
-            fill_match_arms,
-            &format!("//- /main.rs crate:main deps:core{}{}", ra_fixture, FamousDefs::FIXTURE),
+"#,
         );
     }
 
@@ -737,20 +758,20 @@ fn main() {
         check_assist_not_applicable(
             fill_match_arms,
             r#"
-            enum A { One, Two }
-            enum B { One, Two }
+enum A { One, Two }
+enum B { One, Two }
 
-            fn main() {
-                let a = A::One;
-                let b = B::One;
-                match (a$0, b) {
-                    (A::Two, B::One) => {}
-                    (A::One, B::One) => {}
-                    (A::One, B::Two) => {}
-                    (A::Two, B::Two) => {}
-                }
-            }
-            "#,
+fn main() {
+    let a = A::One;
+    let b = B::One;
+    match (a$0, b) {
+        (A::Two, B::One) => {}
+        (A::One, B::One) => {}
+        (A::One, B::Two) => {}
+        (A::Two, B::Two) => {}
+    }
+}
+"#,
         );
     }
 
@@ -759,25 +780,25 @@ fn main() {
         check_assist(
             fill_match_arms,
             r#"
-            enum A { One, Two }
+enum A { One, Two }
 
-            fn main() {
-                let a = A::One;
-                match (a$0, ) {
-                }
-            }
-            "#,
+fn main() {
+    let a = A::One;
+    match (a$0, ) {
+    }
+}
+"#,
             r#"
-            enum A { One, Two }
+enum A { One, Two }
 
-            fn main() {
-                let a = A::One;
-                match (a, ) {
-                    $0(A::One,) => {}
-                    (A::Two,) => {}
-                }
-            }
-            "#,
+fn main() {
+    let a = A::One;
+    match (a, ) {
+        $0(A::One,) => todo!(),
+        (A::Two,) => todo!(),
+    }
+}
+"#,
         );
     }
 
@@ -786,47 +807,47 @@ fn main() {
         check_assist(
             fill_match_arms,
             r#"
-            enum A { As }
+enum A { As }
 
-            fn foo(a: &A) {
-                match a$0 {
-                }
-            }
-            "#,
+fn foo(a: &A) {
+    match a$0 {
+    }
+}
+"#,
             r#"
-            enum A { As }
+enum A { As }
 
-            fn foo(a: &A) {
-                match a {
-                    $0A::As => {}
-                }
-            }
-            "#,
+fn foo(a: &A) {
+    match a {
+        $0A::As => todo!(),
+    }
+}
+"#,
         );
 
         check_assist(
             fill_match_arms,
             r#"
-            enum A {
-                Es { x: usize, y: usize }
-            }
+enum A {
+    Es { x: usize, y: usize }
+}
 
-            fn foo(a: &mut A) {
-                match a$0 {
-                }
-            }
-            "#,
+fn foo(a: &mut A) {
+    match a$0 {
+    }
+}
+"#,
             r#"
-            enum A {
-                Es { x: usize, y: usize }
-            }
+enum A {
+    Es { x: usize, y: usize }
+}
 
-            fn foo(a: &mut A) {
-                match a {
-                    $0A::Es { x, y } => {}
-                }
-            }
-            "#,
+fn foo(a: &mut A) {
+    match a {
+        $0A::Es { x, y } => todo!(),
+    }
+}
+"#,
         );
     }
 
@@ -835,12 +856,12 @@ fn main() {
         check_assist_target(
             fill_match_arms,
             r#"
-            enum E { X, Y }
+enum E { X, Y }
 
-            fn main() {
-                match E::X$0 {}
-            }
-            "#,
+fn main() {
+    match E::X$0 {}
+}
+"#,
             "match E::X {}",
         );
     }
@@ -850,24 +871,24 @@ fn main() {
         check_assist(
             fill_match_arms,
             r#"
-            enum E { X, Y }
+enum E { X, Y }
 
-            fn main() {
-                match E::X {
-                    $0_ => {}
-                }
-            }
-            "#,
+fn main() {
+    match E::X {
+        $0_ => {}
+    }
+}
+"#,
             r#"
-            enum E { X, Y }
+enum E { X, Y }
 
-            fn main() {
-                match E::X {
-                    $0E::X => {}
-                    E::Y => {}
-                }
-            }
-            "#,
+fn main() {
+    match E::X {
+        $0E::X => todo!(),
+        E::Y => todo!(),
+    }
+}
+"#,
         );
     }
 
@@ -876,26 +897,26 @@ fn main() {
         check_assist(
             fill_match_arms,
             r#"
-            mod foo { pub enum E { X, Y } }
-            use foo::E::X;
+mod foo { pub enum E { X, Y } }
+use foo::E::X;
 
-            fn main() {
-                match X {
-                    $0
-                }
-            }
-            "#,
+fn main() {
+    match X {
+        $0
+    }
+}
+"#,
             r#"
-            mod foo { pub enum E { X, Y } }
-            use foo::E::X;
+mod foo { pub enum E { X, Y } }
+use foo::E::X;
 
-            fn main() {
-                match X {
-                    $0X => {}
-                    foo::E::Y => {}
-                }
-            }
-            "#,
+fn main() {
+    match X {
+        $0X => todo!(),
+        foo::E::Y => todo!(),
+    }
+}
+"#,
         );
     }
 
@@ -904,26 +925,26 @@ fn main() {
         check_assist(
             fill_match_arms,
             r#"
-            enum A { One, Two }
-            fn foo(a: A) {
-                match a {
-                    // foo bar baz$0
-                    A::One => {}
-                    // This is where the rest should be
-                }
-            }
-            "#,
+enum A { One, Two }
+fn foo(a: A) {
+    match a {
+        // foo bar baz$0
+        A::One => {}
+        // This is where the rest should be
+    }
+}
+"#,
             r#"
-            enum A { One, Two }
-            fn foo(a: A) {
-                match a {
-                    // foo bar baz
-                    A::One => {}
-                    // This is where the rest should be
-                    $0A::Two => {}
-                }
-            }
-            "#,
+enum A { One, Two }
+fn foo(a: A) {
+    match a {
+        // foo bar baz
+        A::One => {}
+        $0A::Two => todo!(),
+        // This is where the rest should be
+    }
+}
+"#,
         );
     }
 
@@ -932,23 +953,23 @@ fn main() {
         check_assist(
             fill_match_arms,
             r#"
-            enum A { One, Two }
-            fn foo(a: A) {
-                match a {
-                    // foo bar baz$0
-                }
-            }
-            "#,
+enum A { One, Two }
+fn foo(a: A) {
+    match a {
+        // foo bar baz$0
+    }
+}
+"#,
             r#"
-            enum A { One, Two }
-            fn foo(a: A) {
-                match a {
-                    // foo bar baz
-                    $0A::One => {}
-                    A::Two => {}
-                }
-            }
-            "#,
+enum A { One, Two }
+fn foo(a: A) {
+    match a {
+        $0A::One => todo!(),
+        A::Two => todo!(),
+        // foo bar baz
+    }
+}
+"#,
         );
     }
 
@@ -957,44 +978,42 @@ fn main() {
         check_assist(
             fill_match_arms,
             r#"
-            enum A { One, Two, }
-            fn foo(a: A) {
-                match a$0 {
-                    _ => (),
-                }
-            }
-            "#,
+enum A { One, Two, }
+fn foo(a: A) {
+    match a$0 {
+        _ => (),
+    }
+}
+"#,
             r#"
-            enum A { One, Two, }
-            fn foo(a: A) {
-                match a {
-                    $0A::One => {}
-                    A::Two => {}
-                }
-            }
-            "#,
+enum A { One, Two, }
+fn foo(a: A) {
+    match a {
+        $0A::One => todo!(),
+        A::Two => todo!(),
+    }
+}
+"#,
         );
     }
 
     #[test]
     fn option_order() {
         cov_mark::check!(option_order);
-        let before = r#"
+        check_assist(
+            fill_match_arms,
+            r#"
+//- minicore: option
 fn foo(opt: Option<i32>) {
     match opt$0 {
     }
 }
-"#;
-        let before = &format!("//- /main.rs crate:main deps:core{}{}", before, FamousDefs::FIXTURE);
-
-        check_assist(
-            fill_match_arms,
-            before,
+"#,
             r#"
 fn foo(opt: Option<i32>) {
     match opt {
-        Some(${0:_}) => {}
-        None => {}
+        Some(${0:_}) => todo!(),
+        None => todo!(),
     }
 }
 "#,
@@ -1016,7 +1035,8 @@ enum Test {
 fn foo(t: Test) {
     m!(match t$0 {});
 }"#,
-            r#"macro_rules! m { ($expr:expr) => {$expr}}
+            r#"
+macro_rules! m { ($expr:expr) => {$expr}}
 enum Test {
     A,
     B,
@@ -1025,10 +1045,65 @@ enum Test {
 
 fn foo(t: Test) {
     m!(match t {
-    $0Test::A => {}
-    Test::B => {}
-    Test::C => {}
+    $0Test::A => todo!(),
+    Test::B => todo!(),
+    Test::C => todo!(),
 });
+}"#,
+        );
+    }
+
+    #[test]
+    fn lazy_computation() {
+        // Computing a single missing arm is enough to determine applicability of the assist.
+        cov_mark::check_count!(fill_match_arms_lazy_computation, 1);
+        check_assist_unresolved(
+            fill_match_arms,
+            r#"
+enum A { One, Two, }
+fn foo(tuple: (A, A)) {
+    match $0tuple {};
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn adds_comma_before_new_arms() {
+        check_assist(
+            fill_match_arms,
+            r#"
+fn foo(t: bool) {
+    match $0t {
+        true => 1 + 2
+    }
+}"#,
+            r#"
+fn foo(t: bool) {
+    match t {
+        true => 1 + 2,
+        $0false => todo!(),
+    }
+}"#,
+        );
+    }
+
+    #[test]
+    fn does_not_add_extra_comma() {
+        check_assist(
+            fill_match_arms,
+            r#"
+fn foo(t: bool) {
+    match $0t {
+        true => 1 + 2,
+    }
+}"#,
+            r#"
+fn foo(t: bool) {
+    match t {
+        true => 1 + 2,
+        $0false => todo!(),
+    }
 }"#,
         );
     }

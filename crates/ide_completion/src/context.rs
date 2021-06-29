@@ -1,29 +1,64 @@
 //! See `CompletionContext` structure.
 
 use hir::{Local, ScopeDef, Semantics, SemanticsScope, Type};
-use ide_db::base_db::{FilePosition, SourceDatabase};
-use ide_db::{call_info::ActiveParameter, RootDatabase};
+use ide_db::{
+    base_db::{FilePosition, SourceDatabase},
+    call_info::ActiveParameter,
+    RootDatabase,
+};
 use syntax::{
     algo::find_node_at_offset,
     ast::{self, NameOrNameRef, NameOwner},
     match_ast, AstNode, NodeOrToken,
-    SyntaxKind::*,
-    SyntaxNode, SyntaxToken, TextRange, TextSize,
+    SyntaxKind::{self, *},
+    SyntaxNode, SyntaxToken, TextRange, TextSize, T,
 };
-
 use text_edit::Indel;
 
 use crate::{
     patterns::{
-        fn_is_prev, for_is_prev2, has_bind_pat_parent, has_block_expr_parent,
-        has_field_list_parent, has_impl_as_prev_sibling, has_impl_parent,
-        has_item_list_or_source_file_parent, has_ref_parent, has_trait_as_prev_sibling,
-        has_trait_parent, if_is_prev, inside_impl_trait_block, is_in_loop_body, is_match_arm,
-        unsafe_is_prev,
+        determine_location, determine_prev_sibling, for_is_prev2, inside_impl_trait_block,
+        is_in_loop_body, previous_token, ImmediateLocation, ImmediatePrevSibling,
     },
     CompletionConfig,
 };
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PatternRefutability {
+    Refutable,
+    Irrefutable,
+}
+
+#[derive(Debug)]
+pub(super) enum PathKind {
+    Expr,
+    Type,
+}
+
+#[derive(Debug)]
+pub(crate) struct PathCompletionContext {
+    /// If this is a call with () already there
+    call_kind: Option<CallKind>,
+    /// A single-indent path, like `foo`. `::foo` should not be considered a trivial path.
+    pub(super) is_trivial_path: bool,
+    /// If not a trivial path, the prefix (qualifier).
+    pub(super) qualifier: Option<ast::Path>,
+    /// Whether the qualifier comes from a use tree parent or not
+    pub(super) use_tree_parent: bool,
+    pub(super) kind: Option<PathKind>,
+    /// Whether the path segment has type args or not.
+    pub(super) has_type_args: bool,
+    /// `true` if we are a statement or a last expr in the block.
+    pub(super) can_be_stmt: bool,
+    pub(super) in_loop_body: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CallKind {
+    Pat,
+    Mac,
+    Expr,
+}
 /// `CompletionContext` is created early during completion to figure out, where
 /// exactly is the cursor, syntax-wise.
 #[derive(Debug)]
@@ -40,66 +75,35 @@ pub(crate) struct CompletionContext<'a> {
     pub(super) krate: Option<hir::Crate>,
     pub(super) expected_name: Option<NameOrNameRef>,
     pub(super) expected_type: Option<Type>,
+
+    /// The parent function of the cursor position if it exists.
+    pub(super) function_def: Option<ast::Fn>,
+    /// The parent impl of the cursor position if it exists.
+    pub(super) impl_def: Option<ast::Impl>,
     pub(super) name_ref_syntax: Option<ast::NameRef>,
+
+    // potentially set if we are completing a lifetime
     pub(super) lifetime_syntax: Option<ast::Lifetime>,
     pub(super) lifetime_param_syntax: Option<ast::LifetimeParam>,
-    pub(super) function_syntax: Option<ast::Fn>,
-    pub(super) use_item_syntax: Option<ast::Use>,
-    pub(super) record_lit_syntax: Option<ast::RecordExpr>,
-    pub(super) record_pat_syntax: Option<ast::RecordPat>,
-    pub(super) record_field_syntax: Option<ast::RecordExprField>,
-    pub(super) impl_def: Option<ast::Impl>,
     pub(super) lifetime_allowed: bool,
-    /// FIXME: `ActiveParameter` is string-based, which is very very wrong
-    pub(super) active_parameter: Option<ActiveParameter>,
-    pub(super) is_param: bool,
     pub(super) is_label_ref: bool,
-    /// If a name-binding or reference to a const in a pattern.
-    /// Irrefutable patterns (like let) are excluded.
-    pub(super) is_pat_binding_or_const: bool,
-    pub(super) is_irrefutable_pat_binding: bool,
-    /// A single-indent path, like `foo`. `::foo` should not be considered a trivial path.
-    pub(super) is_trivial_path: bool,
-    /// If not a trivial path, the prefix (qualifier).
-    pub(super) path_qual: Option<ast::Path>,
-    pub(super) after_if: bool,
-    /// `true` if we are a statement or a last expr in the block.
-    pub(super) can_be_stmt: bool,
-    /// `true` if we expect an expression at the cursor position.
-    pub(super) is_expr: bool,
-    /// Something is typed at the "top" level, in module or impl/trait.
-    pub(super) is_new_item: bool,
-    /// The receiver if this is a field or method access, i.e. writing something.$0
-    pub(super) dot_receiver: Option<ast::Expr>,
-    pub(super) dot_receiver_is_ambiguous_float_literal: bool,
-    /// If this is a call (method or function) in particular, i.e. the () are already there.
-    pub(super) is_call: bool,
-    /// Like `is_call`, but for tuple patterns.
-    pub(super) is_pattern_call: bool,
-    /// If this is a macro call, i.e. the () are already there.
-    pub(super) is_macro_call: bool,
-    pub(super) is_path_type: bool,
-    pub(super) has_type_args: bool,
+
+    // potentially set if we are completing a name
+    pub(super) is_pat_or_const: Option<PatternRefutability>,
+    pub(super) is_param: bool,
+
+    pub(super) completion_location: Option<ImmediateLocation>,
+    pub(super) prev_sibling: Option<ImmediatePrevSibling>,
     pub(super) attribute_under_caret: Option<ast::Attr>,
-    pub(super) mod_declaration_under_caret: Option<ast::Module>,
-    pub(super) unsafe_is_prev: bool,
-    pub(super) if_is_prev: bool,
-    pub(super) block_expr_parent: bool,
-    pub(super) bind_pat_parent: bool,
-    pub(super) ref_pat_parent: bool,
-    pub(super) in_loop_body: bool,
-    pub(super) has_trait_parent: bool,
-    pub(super) has_impl_parent: bool,
-    pub(super) inside_impl_trait_block: bool,
-    pub(super) has_field_list_parent: bool,
-    pub(super) trait_as_prev_sibling: bool,
-    pub(super) impl_as_prev_sibling: bool,
-    pub(super) is_match_arm: bool,
-    pub(super) has_item_list_or_source_file_parent: bool,
-    pub(super) for_is_prev2: bool,
-    pub(super) fn_is_prev: bool,
-    pub(super) incomplete_let: bool,
+    pub(super) previous_token: Option<SyntaxToken>,
+
+    pub(super) path_context: Option<PathCompletionContext>,
+    pub(super) active_parameter: Option<ActiveParameter>,
     pub(super) locals: Vec<(String, Local)>,
+
+    pub(super) incomplete_let: bool,
+
+    no_completion_required: bool,
 }
 
 impl<'a> CompletionContext<'a> {
@@ -143,99 +147,68 @@ impl<'a> CompletionContext<'a> {
             original_token,
             token,
             krate,
-            lifetime_allowed: false,
             expected_name: None,
             expected_type: None,
+            function_def: None,
+            impl_def: None,
             name_ref_syntax: None,
             lifetime_syntax: None,
             lifetime_param_syntax: None,
-            function_syntax: None,
-            use_item_syntax: None,
-            record_lit_syntax: None,
-            record_pat_syntax: None,
-            record_field_syntax: None,
-            impl_def: None,
-            active_parameter: ActiveParameter::at(db, position),
+            lifetime_allowed: false,
             is_label_ref: false,
+            is_pat_or_const: None,
             is_param: false,
-            is_pat_binding_or_const: false,
-            is_irrefutable_pat_binding: false,
-            is_trivial_path: false,
-            path_qual: None,
-            after_if: false,
-            can_be_stmt: false,
-            is_expr: false,
-            is_new_item: false,
-            dot_receiver: None,
-            dot_receiver_is_ambiguous_float_literal: false,
-            is_call: false,
-            is_pattern_call: false,
-            is_macro_call: false,
-            is_path_type: false,
-            has_type_args: false,
+            completion_location: None,
+            prev_sibling: None,
             attribute_under_caret: None,
-            mod_declaration_under_caret: None,
-            unsafe_is_prev: false,
-            if_is_prev: false,
-            block_expr_parent: false,
-            bind_pat_parent: false,
-            ref_pat_parent: false,
-            in_loop_body: false,
-            has_trait_parent: false,
-            has_impl_parent: false,
-            inside_impl_trait_block: false,
-            has_field_list_parent: false,
-            trait_as_prev_sibling: false,
-            impl_as_prev_sibling: false,
-            is_match_arm: false,
-            has_item_list_or_source_file_parent: false,
-            for_is_prev2: false,
-            fn_is_prev: false,
-            incomplete_let: false,
+            previous_token: None,
+            path_context: None,
+            active_parameter: ActiveParameter::at(db, position),
             locals,
+            incomplete_let: false,
+            no_completion_required: false,
         };
 
         let mut original_file = original_file.syntax().clone();
-        let mut hypothetical_file = file_with_fake_ident.syntax().clone();
+        let mut speculative_file = file_with_fake_ident.syntax().clone();
         let mut offset = position.offset;
         let mut fake_ident_token = fake_ident_token;
 
         // Are we inside a macro call?
         while let (Some(actual_macro_call), Some(macro_call_with_fake_ident)) = (
             find_node_at_offset::<ast::MacroCall>(&original_file, offset),
-            find_node_at_offset::<ast::MacroCall>(&hypothetical_file, offset),
+            find_node_at_offset::<ast::MacroCall>(&speculative_file, offset),
         ) {
             if actual_macro_call.path().as_ref().map(|s| s.syntax().text())
                 != macro_call_with_fake_ident.path().as_ref().map(|s| s.syntax().text())
             {
                 break;
             }
-            let hypothetical_args = match macro_call_with_fake_ident.token_tree() {
+            let speculative_args = match macro_call_with_fake_ident.token_tree() {
                 Some(tt) => tt,
                 None => break,
             };
-            if let (Some(actual_expansion), Some(hypothetical_expansion)) = (
+            if let (Some(actual_expansion), Some(speculative_expansion)) = (
                 ctx.sema.expand(&actual_macro_call),
                 ctx.sema.speculative_expand(
                     &actual_macro_call,
-                    &hypothetical_args,
+                    &speculative_args,
                     fake_ident_token,
                 ),
             ) {
-                let new_offset = hypothetical_expansion.1.text_range().start();
+                let new_offset = speculative_expansion.1.text_range().start();
                 if new_offset > actual_expansion.text_range().end() {
                     break;
                 }
                 original_file = actual_expansion;
-                hypothetical_file = hypothetical_expansion.0;
-                fake_ident_token = hypothetical_expansion.1;
+                speculative_file = speculative_expansion.0;
+                fake_ident_token = speculative_expansion.1;
                 offset = new_offset;
             } else {
                 break;
             }
         }
-        ctx.fill_keyword_patterns(&hypothetical_file, offset);
-        ctx.fill(&original_file, hypothetical_file, offset);
+        ctx.fill(&original_file, speculative_file, offset);
         Some(ctx)
     }
 
@@ -245,7 +218,7 @@ impl<'a> CompletionContext<'a> {
     ///   Exception for this case is `impl Trait for Foo`, where we would like to hint trait method names.
     /// - `for _ i$0` -- obviously, it'll be "in" keyword.
     pub(crate) fn no_completion_required(&self) -> bool {
-        (self.fn_is_prev && !self.inside_impl_trait_block) || self.for_is_prev2
+        self.no_completion_required
     }
 
     /// The range of the identifier that is being completed.
@@ -264,33 +237,124 @@ impl<'a> CompletionContext<'a> {
         }
     }
 
-    fn fill_keyword_patterns(&mut self, file_with_fake_ident: &SyntaxNode, offset: TextSize) {
-        let fake_ident_token = file_with_fake_ident.token_at_offset(offset).right_biased().unwrap();
-        let syntax_element = NodeOrToken::Token(fake_ident_token);
-        self.block_expr_parent = has_block_expr_parent(syntax_element.clone());
-        self.unsafe_is_prev = unsafe_is_prev(syntax_element.clone());
-        self.if_is_prev = if_is_prev(syntax_element.clone());
-        self.bind_pat_parent = has_bind_pat_parent(syntax_element.clone());
-        self.ref_pat_parent = has_ref_parent(syntax_element.clone());
-        self.in_loop_body = is_in_loop_body(syntax_element.clone());
-        self.has_trait_parent = has_trait_parent(syntax_element.clone());
-        self.has_impl_parent = has_impl_parent(syntax_element.clone());
-        self.inside_impl_trait_block = inside_impl_trait_block(syntax_element.clone());
-        self.has_field_list_parent = has_field_list_parent(syntax_element.clone());
-        self.impl_as_prev_sibling = has_impl_as_prev_sibling(syntax_element.clone());
-        self.trait_as_prev_sibling = has_trait_as_prev_sibling(syntax_element.clone());
-        self.is_match_arm = is_match_arm(syntax_element.clone());
-        self.has_item_list_or_source_file_parent =
-            has_item_list_or_source_file_parent(syntax_element.clone());
-        self.mod_declaration_under_caret =
-            find_node_at_offset::<ast::Module>(&file_with_fake_ident, offset)
-                .filter(|module| module.item_list().is_none());
-        self.for_is_prev2 = for_is_prev2(syntax_element.clone());
-        self.fn_is_prev = fn_is_prev(syntax_element.clone());
-        self.incomplete_let =
-            syntax_element.ancestors().take(6).find_map(ast::LetStmt::cast).map_or(false, |it| {
-                it.syntax().text_range().end() == syntax_element.text_range().end()
-            });
+    pub(crate) fn previous_token_is(&self, kind: SyntaxKind) -> bool {
+        self.previous_token.as_ref().map_or(false, |tok| tok.kind() == kind)
+    }
+
+    pub(crate) fn expects_assoc_item(&self) -> bool {
+        matches!(self.completion_location, Some(ImmediateLocation::Trait | ImmediateLocation::Impl))
+    }
+
+    pub(crate) fn has_dot_receiver(&self) -> bool {
+        matches!(
+            &self.completion_location,
+            Some(ImmediateLocation::FieldAccess { receiver, .. } | ImmediateLocation::MethodCall { receiver,.. })
+                if receiver.is_some()
+        )
+    }
+
+    pub(crate) fn dot_receiver(&self) -> Option<&ast::Expr> {
+        match &self.completion_location {
+            Some(
+                ImmediateLocation::MethodCall { receiver, .. }
+                | ImmediateLocation::FieldAccess { receiver, .. },
+            ) => receiver.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn expects_non_trait_assoc_item(&self) -> bool {
+        matches!(self.completion_location, Some(ImmediateLocation::Impl))
+    }
+
+    pub(crate) fn expects_item(&self) -> bool {
+        matches!(self.completion_location, Some(ImmediateLocation::ItemList))
+    }
+
+    pub(crate) fn expects_generic_arg(&self) -> bool {
+        matches!(self.completion_location, Some(ImmediateLocation::GenericArgList(_)))
+    }
+
+    pub(crate) fn has_block_expr_parent(&self) -> bool {
+        matches!(self.completion_location, Some(ImmediateLocation::BlockExpr))
+    }
+
+    pub(crate) fn expects_ident_pat_or_ref_expr(&self) -> bool {
+        matches!(
+            self.completion_location,
+            Some(ImmediateLocation::IdentPat | ImmediateLocation::RefExpr)
+        )
+    }
+
+    pub(crate) fn expect_field(&self) -> bool {
+        matches!(
+            self.completion_location,
+            Some(ImmediateLocation::RecordField | ImmediateLocation::TupleField)
+        )
+    }
+
+    pub(crate) fn in_use_tree(&self) -> bool {
+        matches!(
+            self.completion_location,
+            Some(ImmediateLocation::Use | ImmediateLocation::UseTree)
+        )
+    }
+
+    pub(crate) fn has_impl_or_trait_prev_sibling(&self) -> bool {
+        matches!(
+            self.prev_sibling,
+            Some(ImmediatePrevSibling::ImplDefType | ImmediatePrevSibling::TraitDefName)
+        )
+    }
+
+    pub(crate) fn has_impl_prev_sibling(&self) -> bool {
+        matches!(self.prev_sibling, Some(ImmediatePrevSibling::ImplDefType))
+    }
+
+    pub(crate) fn has_visibility_prev_sibling(&self) -> bool {
+        matches!(self.prev_sibling, Some(ImmediatePrevSibling::Visibility))
+    }
+
+    pub(crate) fn after_if(&self) -> bool {
+        matches!(self.prev_sibling, Some(ImmediatePrevSibling::IfExpr))
+    }
+
+    pub(crate) fn is_path_disallowed(&self) -> bool {
+        self.attribute_under_caret.is_some()
+            || self.previous_token_is(T![unsafe])
+            || matches!(
+                self.prev_sibling,
+                Some(ImmediatePrevSibling::Attribute | ImmediatePrevSibling::Visibility)
+            )
+            || matches!(
+                self.completion_location,
+                Some(
+                    ImmediateLocation::Attribute(_)
+                        | ImmediateLocation::ModDeclaration(_)
+                        | ImmediateLocation::RecordPat(_)
+                        | ImmediateLocation::RecordExpr(_)
+                )
+            )
+    }
+
+    pub(crate) fn expects_expression(&self) -> bool {
+        matches!(self.path_context, Some(PathCompletionContext { kind: Some(PathKind::Expr), .. }))
+    }
+
+    pub(crate) fn expects_type(&self) -> bool {
+        matches!(self.path_context, Some(PathCompletionContext { kind: Some(PathKind::Type), .. }))
+    }
+
+    pub(crate) fn path_call_kind(&self) -> Option<CallKind> {
+        self.path_context.as_ref().and_then(|it| it.call_kind)
+    }
+
+    pub(crate) fn is_trivial_path(&self) -> bool {
+        matches!(self.path_context, Some(PathCompletionContext { is_trivial_path: true, .. }))
+    }
+
+    pub(crate) fn path_qual(&self) -> Option<&ast::Path> {
+        self.path_context.as_ref().and_then(|it| it.qualifier.as_ref())
     }
 
     fn fill_impl_def(&mut self) {
@@ -301,167 +365,154 @@ impl<'a> CompletionContext<'a> {
             .find_map(ast::Impl::cast);
     }
 
+    fn expected_type_and_name(&self) -> (Option<Type>, Option<NameOrNameRef>) {
+        let mut node = match self.token.parent() {
+            Some(it) => it,
+            None => return (None, None),
+        };
+        loop {
+            break match_ast! {
+                match node {
+                    ast::LetStmt(it) => {
+                        cov_mark::hit!(expected_type_let_with_leading_char);
+                        cov_mark::hit!(expected_type_let_without_leading_char);
+                        let ty = it.pat()
+                            .and_then(|pat| self.sema.type_of_pat(&pat))
+                            .or_else(|| it.initializer().and_then(|it| self.sema.type_of_expr(&it)));
+                        let name = if let Some(ast::Pat::IdentPat(ident)) = it.pat() {
+                            ident.name().map(NameOrNameRef::Name)
+                        } else {
+                            None
+                        };
+
+                        (ty, name)
+                    },
+                    ast::ArgList(_it) => {
+                        cov_mark::hit!(expected_type_fn_param);
+                        ActiveParameter::at_token(
+                            &self.sema,
+                            self.token.clone(),
+                        ).map(|ap| {
+                            let name = ap.ident().map(NameOrNameRef::Name);
+                            let ty = if has_ref(&self.token) {
+                                cov_mark::hit!(expected_type_fn_param_ref);
+                                ap.ty.remove_ref()
+                            } else {
+                                Some(ap.ty)
+                            };
+                            (ty, name)
+                        })
+                        .unwrap_or((None, None))
+                    },
+                    ast::RecordExprFieldList(_it) => {
+                        cov_mark::hit!(expected_type_struct_field_without_leading_char);
+                        // wouldn't try {} be nice...
+                        (|| {
+                            let expr_field = self.token.prev_sibling_or_token()?
+                                      .into_node()
+                                      .and_then(ast::RecordExprField::cast)?;
+                            let (_, _, ty) = self.sema.resolve_record_field(&expr_field)?;
+                            Some((
+                                Some(ty),
+                                expr_field.field_name().map(NameOrNameRef::NameRef),
+                            ))
+                        })().unwrap_or((None, None))
+                    },
+                    ast::RecordExprField(it) => {
+                        cov_mark::hit!(expected_type_struct_field_with_leading_char);
+                        (
+                            it.expr().as_ref().and_then(|e| self.sema.type_of_expr(e)),
+                            it.field_name().map(NameOrNameRef::NameRef),
+                        )
+                    },
+                    ast::MatchExpr(it) => {
+                        cov_mark::hit!(expected_type_match_arm_without_leading_char);
+                        let ty = it.expr()
+                            .and_then(|e| self.sema.type_of_expr(&e));
+                        (ty, None)
+                    },
+                    ast::IfExpr(it) => {
+                        cov_mark::hit!(expected_type_if_let_without_leading_char);
+                        let ty = it.condition()
+                            .and_then(|cond| cond.expr())
+                            .and_then(|e| self.sema.type_of_expr(&e));
+                        (ty, None)
+                    },
+                    ast::IdentPat(it) => {
+                        cov_mark::hit!(expected_type_if_let_with_leading_char);
+                        cov_mark::hit!(expected_type_match_arm_with_leading_char);
+                        let ty = self.sema.type_of_pat(&ast::Pat::from(it));
+                        (ty, None)
+                    },
+                    ast::Fn(it) => {
+                        cov_mark::hit!(expected_type_fn_ret_with_leading_char);
+                        cov_mark::hit!(expected_type_fn_ret_without_leading_char);
+                        let def = self.sema.to_def(&it);
+                        (def.map(|def| def.ret_type(self.db)), None)
+                    },
+                    ast::ClosureExpr(it) => {
+                        let ty = self.sema.type_of_expr(&it.into());
+                        ty.and_then(|ty| ty.as_callable(self.db))
+                            .map(|c| (Some(c.return_type()), None))
+                            .unwrap_or((None, None))
+                    },
+                    ast::Stmt(_it) => (None, None),
+                    _ => {
+                        match node.parent() {
+                            Some(n) => {
+                                node = n;
+                                continue;
+                            },
+                            None => (None, None),
+                        }
+                    },
+                }
+            };
+        }
+    }
+
     fn fill(
         &mut self,
         original_file: &SyntaxNode,
         file_with_fake_ident: SyntaxNode,
         offset: TextSize,
     ) {
-        let (expected_type, expected_name) = {
-            let mut node = match self.token.parent() {
-                Some(it) => it,
-                None => return,
-            };
-            loop {
-                break match_ast! {
-                    match node {
-                        ast::LetStmt(it) => {
-                            cov_mark::hit!(expected_type_let_with_leading_char);
-                            cov_mark::hit!(expected_type_let_without_leading_char);
-                            let ty = it.pat()
-                                .and_then(|pat| self.sema.type_of_pat(&pat));
-                            let name = if let Some(ast::Pat::IdentPat(ident)) = it.pat() {
-                                ident.name().map(NameOrNameRef::Name)
-                            } else {
-                                None
-                            };
-
-                            (ty, name)
-                        },
-                        ast::ArgList(_it) => {
-                            cov_mark::hit!(expected_type_fn_param_with_leading_char);
-                            cov_mark::hit!(expected_type_fn_param_without_leading_char);
-                            ActiveParameter::at_token(
-                                &self.sema,
-                                self.token.clone(),
-                            ).map(|ap| {
-                                let name = ap.ident().map(NameOrNameRef::Name);
-                                (Some(ap.ty), name)
-                            })
-                            .unwrap_or((None, None))
-                        },
-                        ast::RecordExprFieldList(_it) => {
-                            cov_mark::hit!(expected_type_struct_field_without_leading_char);
-                            self.token.prev_sibling_or_token()
-                                .and_then(|se| se.into_node())
-                                .and_then(|node| ast::RecordExprField::cast(node))
-                                .and_then(|rf| self.sema.resolve_record_field(&rf).zip(Some(rf)))
-                                .map(|(f, rf)|(
-                                    Some(f.0.ty(self.db)),
-                                    rf.field_name().map(NameOrNameRef::NameRef),
-                                ))
-                                .unwrap_or((None, None))
-                        },
-                        ast::RecordExprField(it) => {
-                            cov_mark::hit!(expected_type_struct_field_with_leading_char);
-                            self.sema
-                                .resolve_record_field(&it)
-                                .map(|f|(
-                                    Some(f.0.ty(self.db)),
-                                    it.field_name().map(NameOrNameRef::NameRef),
-                                ))
-                                .unwrap_or((None, None))
-                        },
-                        ast::MatchExpr(it) => {
-                            cov_mark::hit!(expected_type_match_arm_without_leading_char);
-                            let ty = it.expr()
-                                .and_then(|e| self.sema.type_of_expr(&e));
-
-                            (ty, None)
-                        },
-                        ast::IdentPat(it) => {
-                            cov_mark::hit!(expected_type_if_let_with_leading_char);
-                            cov_mark::hit!(expected_type_match_arm_with_leading_char);
-                            let ty = self.sema.type_of_pat(&ast::Pat::from(it));
-
-                            (ty, None)
-                        },
-                        ast::Fn(_it) => {
-                            cov_mark::hit!(expected_type_fn_ret_with_leading_char);
-                            cov_mark::hit!(expected_type_fn_ret_without_leading_char);
-                            let ty = self.token.ancestors()
-                                .find_map(|ancestor| ast::Expr::cast(ancestor))
-                                .and_then(|expr| self.sema.type_of_expr(&expr));
-
-                            (ty, None)
-                        },
-                        _ => {
-                            match node.parent() {
-                                Some(n) => {
-                                    node = n;
-                                    continue;
-                                },
-                                None => (None, None),
-                            }
-                        },
-                    }
-                };
-            }
+        let fake_ident_token = file_with_fake_ident.token_at_offset(offset).right_biased().unwrap();
+        let syntax_element = NodeOrToken::Token(fake_ident_token);
+        self.previous_token = previous_token(syntax_element.clone());
+        self.attribute_under_caret = syntax_element.ancestors().find_map(ast::Attr::cast);
+        self.no_completion_required = {
+            let inside_impl_trait_block = inside_impl_trait_block(syntax_element.clone());
+            let fn_is_prev = self.previous_token_is(T![fn]);
+            let for_is_prev2 = for_is_prev2(syntax_element.clone());
+            (fn_is_prev && !inside_impl_trait_block) || for_is_prev2
         };
+
+        self.incomplete_let =
+            syntax_element.ancestors().take(6).find_map(ast::LetStmt::cast).map_or(false, |it| {
+                it.syntax().text_range().end() == syntax_element.text_range().end()
+            });
+
+        let (expected_type, expected_name) = self.expected_type_and_name();
         self.expected_type = expected_type;
         self.expected_name = expected_name;
-        self.attribute_under_caret = find_node_at_offset(&file_with_fake_ident, offset);
 
-        if let Some(lifetime) = find_node_at_offset::<ast::Lifetime>(&file_with_fake_ident, offset)
-        {
-            self.classify_lifetime(original_file, lifetime, offset);
-        }
-
-        // First, let's try to complete a reference to some declaration.
-        if let Some(name_ref) = find_node_at_offset::<ast::NameRef>(&file_with_fake_ident, offset) {
-            // Special case, `trait T { fn foo(i_am_a_name_ref) {} }`.
-            // See RFC#1685.
-            if is_node::<ast::Param>(name_ref.syntax()) {
-                self.is_param = true;
-                return;
+        let name_like = match find_node_at_offset(&file_with_fake_ident, offset) {
+            Some(it) => it,
+            None => return,
+        };
+        self.completion_location =
+            determine_location(&self.sema, original_file, offset, &name_like);
+        self.prev_sibling = determine_prev_sibling(&name_like);
+        match name_like {
+            ast::NameLike::Lifetime(lifetime) => {
+                self.classify_lifetime(original_file, lifetime, offset);
             }
-            // FIXME: remove this (V) duplication and make the check more precise
-            if name_ref.syntax().ancestors().find_map(ast::RecordPatFieldList::cast).is_some() {
-                self.record_pat_syntax =
-                    self.sema.find_node_at_offset_with_macros(&original_file, offset);
+            ast::NameLike::NameRef(name_ref) => {
+                self.classify_name_ref(original_file, name_ref);
             }
-            self.classify_name_ref(original_file, name_ref, offset);
-        }
-
-        // Otherwise, see if this is a declaration. We can use heuristics to
-        // suggest declaration names, see `CompletionKind::Magic`.
-        if let Some(name) = find_node_at_offset::<ast::Name>(&file_with_fake_ident, offset) {
-            if let Some(bind_pat) = name.syntax().ancestors().find_map(ast::IdentPat::cast) {
-                self.is_pat_binding_or_const = true;
-                if bind_pat.at_token().is_some()
-                    || bind_pat.ref_token().is_some()
-                    || bind_pat.mut_token().is_some()
-                {
-                    self.is_pat_binding_or_const = false;
-                }
-                if bind_pat.syntax().parent().and_then(ast::RecordPatFieldList::cast).is_some() {
-                    self.is_pat_binding_or_const = false;
-                }
-                if let Some(Some(pat)) = bind_pat.syntax().ancestors().find_map(|node| {
-                    match_ast! {
-                        match node {
-                            ast::LetStmt(it) => Some(it.pat()),
-                            ast::Param(it) => Some(it.pat()),
-                            _ => None,
-                        }
-                    }
-                }) {
-                    if pat.syntax().text_range().contains_range(bind_pat.syntax().text_range()) {
-                        self.is_pat_binding_or_const = false;
-                        self.is_irrefutable_pat_binding = true;
-                    }
-                }
-
-                self.fill_impl_def();
-            }
-            if is_node::<ast::Param>(name.syntax()) {
-                self.is_param = true;
-                return;
-            }
-            // FIXME: remove this (^) duplication and make the check more precise
-            if name.syntax().ancestors().find_map(ast::RecordPatFieldList::cast).is_some() {
-                self.record_pat_syntax =
-                    self.sema.find_node_at_offset_with_macros(&original_file, offset);
+            ast::NameLike::Name(name) => {
+                self.classify_name(name);
             }
         }
     }
@@ -495,76 +546,104 @@ impl<'a> CompletionContext<'a> {
         }
     }
 
-    fn classify_name_ref(
-        &mut self,
-        original_file: &SyntaxNode,
-        name_ref: ast::NameRef,
-        offset: TextSize,
-    ) {
-        self.name_ref_syntax =
-            find_node_at_offset(original_file, name_ref.syntax().text_range().start());
-        let name_range = name_ref.syntax().text_range();
-        if ast::RecordExprField::for_field_name(&name_ref).is_some() {
-            self.record_lit_syntax =
-                self.sema.find_node_at_offset_with_macros(original_file, offset);
+    fn classify_name(&mut self, name: ast::Name) {
+        if let Some(bind_pat) = name.syntax().parent().and_then(ast::IdentPat::cast) {
+            self.is_pat_or_const = Some(PatternRefutability::Refutable);
+            // if any of these is here our bind pat can't be a const pat anymore
+            let complex_ident_pat = bind_pat.at_token().is_some()
+                || bind_pat.ref_token().is_some()
+                || bind_pat.mut_token().is_some();
+            if complex_ident_pat {
+                self.is_pat_or_const = None;
+            } else {
+                let irrefutable_pat = bind_pat.syntax().ancestors().find_map(|node| {
+                    match_ast! {
+                        match node {
+                            ast::LetStmt(it) => Some(it.pat()),
+                            ast::Param(it) => Some(it.pat()),
+                            _ => None,
+                        }
+                    }
+                });
+                if let Some(Some(pat)) = irrefutable_pat {
+                    // This check is here since we could be inside a pattern in the initializer expression of the let statement.
+                    if pat.syntax().text_range().contains_range(bind_pat.syntax().text_range()) {
+                        self.is_pat_or_const = Some(PatternRefutability::Irrefutable);
+                    }
+                }
+
+                let is_name_in_field_pat = bind_pat
+                    .syntax()
+                    .parent()
+                    .and_then(ast::RecordPatField::cast)
+                    .map_or(false, |pat_field| pat_field.name_ref().is_none());
+                if is_name_in_field_pat {
+                    self.is_pat_or_const = None;
+                }
+            }
+
+            self.fill_impl_def();
         }
 
+        self.is_param |= is_node::<ast::Param>(name.syntax());
+    }
+
+    fn classify_name_ref(&mut self, original_file: &SyntaxNode, name_ref: ast::NameRef) {
         self.fill_impl_def();
 
-        let top_node = name_ref
-            .syntax()
-            .ancestors()
-            .take_while(|it| it.text_range() == name_range)
-            .last()
-            .unwrap();
+        self.name_ref_syntax =
+            find_node_at_offset(original_file, name_ref.syntax().text_range().start());
 
-        match top_node.parent().map(|it| it.kind()) {
-            Some(SOURCE_FILE) | Some(ITEM_LIST) => {
-                self.is_new_item = true;
-                return;
-            }
-            _ => (),
-        }
-
-        self.use_item_syntax =
-            self.sema.token_ancestors_with_macros(self.token.clone()).find_map(ast::Use::cast);
-
-        self.function_syntax = self
+        self.function_def = self
             .sema
             .token_ancestors_with_macros(self.token.clone())
             .take_while(|it| it.kind() != SOURCE_FILE && it.kind() != MODULE)
             .find_map(ast::Fn::cast);
-
-        self.record_field_syntax = self
-            .sema
-            .token_ancestors_with_macros(self.token.clone())
-            .take_while(|it| {
-                it.kind() != SOURCE_FILE && it.kind() != MODULE && it.kind() != CALL_EXPR
-            })
-            .find_map(ast::RecordExprField::cast);
 
         let parent = match name_ref.syntax().parent() {
             Some(it) => it,
             None => return,
         };
 
-        if let Some(segment) = ast::PathSegment::cast(parent.clone()) {
+        if let Some(segment) = ast::PathSegment::cast(parent) {
+            let path_ctx = self.path_context.get_or_insert(PathCompletionContext {
+                call_kind: None,
+                is_trivial_path: false,
+                qualifier: None,
+                has_type_args: false,
+                can_be_stmt: false,
+                in_loop_body: false,
+                use_tree_parent: false,
+                kind: None,
+            });
+            path_ctx.in_loop_body = is_in_loop_body(name_ref.syntax());
             let path = segment.parent_path();
-            self.is_call = path
-                .syntax()
-                .parent()
-                .and_then(ast::PathExpr::cast)
-                .and_then(|it| it.syntax().parent().and_then(ast::CallExpr::cast))
-                .is_some();
-            self.is_macro_call = path.syntax().parent().and_then(ast::MacroCall::cast).is_some();
-            self.is_pattern_call =
-                path.syntax().parent().and_then(ast::TupleStructPat::cast).is_some();
 
-            self.is_path_type = path.syntax().parent().and_then(ast::PathType::cast).is_some();
-            self.has_type_args = segment.generic_arg_list().is_some();
+            if let Some(p) = path.syntax().parent() {
+                path_ctx.call_kind = match_ast! {
+                    match p {
+                        ast::PathExpr(it) => it.syntax().parent().and_then(ast::CallExpr::cast).map(|_| CallKind::Expr),
+                        ast::MacroCall(it) => it.excl_token().and(Some(CallKind::Mac)),
+                        ast::TupleStructPat(_it) => Some(CallKind::Pat),
+                        _ => None
+                    }
+                };
+            }
 
-            if let Some(path) = path_or_use_tree_qualifier(&path) {
-                self.path_qual = path
+            if let Some(parent) = path.syntax().parent() {
+                path_ctx.kind = match_ast! {
+                    match parent {
+                        ast::PathType(_it) => Some(PathKind::Type),
+                        ast::PathExpr(_it) => Some(PathKind::Expr),
+                        _ => None,
+                    }
+                };
+            }
+            path_ctx.has_type_args = segment.generic_arg_list().is_some();
+
+            if let Some((path, use_tree_parent)) = path_or_use_tree_qualifier(&path) {
+                path_ctx.use_tree_parent = use_tree_parent;
+                path_ctx.qualifier = path
                     .segment()
                     .and_then(|it| {
                         find_node_with_range::<ast::PathSegment>(
@@ -582,11 +661,11 @@ impl<'a> CompletionContext<'a> {
                 }
             }
 
-            self.is_trivial_path = true;
+            path_ctx.is_trivial_path = true;
 
             // Find either enclosing expr statement (thing with `;`) or a
             // block. If block, check that we are the last expr.
-            self.can_be_stmt = name_ref
+            path_ctx.can_be_stmt = name_ref
                 .syntax()
                 .ancestors()
                 .find_map(|node| {
@@ -602,43 +681,6 @@ impl<'a> CompletionContext<'a> {
                     None
                 })
                 .unwrap_or(false);
-            self.is_expr = path.syntax().parent().and_then(ast::PathExpr::cast).is_some();
-
-            if let Some(off) = name_ref.syntax().text_range().start().checked_sub(2.into()) {
-                if let Some(if_expr) =
-                    self.sema.find_node_at_offset_with_macros::<ast::IfExpr>(original_file, off)
-                {
-                    if if_expr.syntax().text_range().end() < name_ref.syntax().text_range().start()
-                    {
-                        self.after_if = true;
-                    }
-                }
-            }
-        }
-        if let Some(field_expr) = ast::FieldExpr::cast(parent.clone()) {
-            // The receiver comes before the point of insertion of the fake
-            // ident, so it should have the same range in the non-modified file
-            self.dot_receiver = field_expr
-                .expr()
-                .map(|e| e.syntax().text_range())
-                .and_then(|r| find_node_with_range(original_file, r));
-            self.dot_receiver_is_ambiguous_float_literal =
-                if let Some(ast::Expr::Literal(l)) = &self.dot_receiver {
-                    match l.kind() {
-                        ast::LiteralKind::FloatNumber { .. } => l.token().text().ends_with('.'),
-                        _ => false,
-                    }
-                } else {
-                    false
-                };
-        }
-        if let Some(method_call_expr) = ast::MethodCallExpr::cast(parent) {
-            // As above
-            self.dot_receiver = method_call_expr
-                .receiver()
-                .map(|e| e.syntax().text_range())
-                .and_then(|r| find_node_with_range(original_file, r));
-            self.is_call = true;
         }
     }
 }
@@ -654,13 +696,26 @@ fn is_node<N: AstNode>(node: &SyntaxNode) -> bool {
     }
 }
 
-fn path_or_use_tree_qualifier(path: &ast::Path) -> Option<ast::Path> {
+fn path_or_use_tree_qualifier(path: &ast::Path) -> Option<(ast::Path, bool)> {
     if let Some(qual) = path.qualifier() {
-        return Some(qual);
+        return Some((qual, false));
     }
     let use_tree_list = path.syntax().ancestors().find_map(ast::UseTreeList::cast)?;
     let use_tree = use_tree_list.syntax().parent().and_then(ast::UseTree::cast)?;
-    use_tree.path()
+    use_tree.path().zip(Some(true))
+}
+
+fn has_ref(token: &SyntaxToken) -> bool {
+    let mut token = token.clone();
+    for skip in [WHITESPACE, IDENT, T![mut]] {
+        if token.kind() == skip {
+            token = match token.prev_token() {
+                Some(it) => it,
+                None => return false,
+            }
+        }
+    }
+    token.kind() == T![&]
 }
 
 #[cfg(test)]
@@ -668,7 +723,7 @@ mod tests {
     use expect_test::{expect, Expect};
     use hir::HirDisplay;
 
-    use crate::test_utils::{position, TEST_CONFIG};
+    use crate::tests::{position, TEST_CONFIG};
 
     use super::CompletionContext;
 
@@ -715,14 +770,38 @@ fn foo() {
     }
 
     #[test]
-    fn expected_type_fn_param_without_leading_char() {
-        cov_mark::check!(expected_type_fn_param_without_leading_char);
+    fn expected_type_let_pat() {
         check_expected_type_and_name(
             r#"
 fn foo() {
-    bar($0);
+    let x$0 = 0u32;
 }
+"#,
+            expect![[r#"ty: u32, name: ?"#]],
+        );
+        check_expected_type_and_name(
+            r#"
+fn foo() {
+    let $0 = 0u32;
+}
+"#,
+            expect![[r#"ty: u32, name: ?"#]],
+        );
+    }
 
+    #[test]
+    fn expected_type_fn_param() {
+        cov_mark::check!(expected_type_fn_param);
+        check_expected_type_and_name(
+            r#"
+fn foo() { bar($0); }
+fn bar(x: u32) {}
+"#,
+            expect![[r#"ty: u32, name: x"#]],
+        );
+        check_expected_type_and_name(
+            r#"
+fn foo() { bar(c$0); }
 fn bar(x: u32) {}
 "#,
             expect![[r#"ty: u32, name: x"#]],
@@ -730,16 +809,27 @@ fn bar(x: u32) {}
     }
 
     #[test]
-    fn expected_type_fn_param_with_leading_char() {
-        cov_mark::check!(expected_type_fn_param_with_leading_char);
+    fn expected_type_fn_param_ref() {
+        cov_mark::check!(expected_type_fn_param_ref);
         check_expected_type_and_name(
             r#"
-fn foo() {
-    bar(c$0);
-}
-
-fn bar(x: u32) {}
+fn foo() { bar(&$0); }
+fn bar(x: &u32) {}
 "#,
+            expect![[r#"ty: u32, name: x"#]],
+        );
+        check_expected_type_and_name(
+            r#"
+fn foo() { bar(&mut $0); }
+fn bar(x: &mut u32) {}
+"#,
+            expect![[r#"ty: u32, name: x"#]],
+        );
+        check_expected_type_and_name(
+            r#"
+fn foo() { bar(&c$0); }
+fn bar(x: &u32) {}
+        "#,
             expect![[r#"ty: u32, name: x"#]],
         );
     }
@@ -752,6 +842,19 @@ fn bar(x: u32) {}
 struct Foo { a: u32 }
 fn foo() {
     Foo { a: $0 };
+}
+"#,
+            expect![[r#"ty: u32, name: a"#]],
+        )
+    }
+
+    #[test]
+    fn expected_type_generic_struct_field() {
+        check_expected_type_and_name(
+            r#"
+struct Foo<T> { a: T }
+fn foo() -> Foo<u32> {
+    Foo { a: $0 }
 }
 "#,
             expect![[r#"ty: u32, name: a"#]],
@@ -802,6 +905,7 @@ fn foo() {
 
     #[test]
     fn expected_type_if_let_without_leading_char() {
+        cov_mark::check!(expected_type_if_let_without_leading_char);
         check_expected_type_and_name(
             r#"
 enum Foo { Bar, Baz, Quux }
@@ -811,8 +915,8 @@ fn foo() {
     if let $0 = f { }
 }
 "#,
-            expect![[r#"ty: (), name: ?"#]],
-        ) // FIXME should be `ty: u32, name: ?`
+            expect![[r#"ty: Foo, name: ?"#]],
+        )
     }
 
     #[test]
@@ -840,8 +944,8 @@ fn foo() -> u32 {
     $0
 }
 "#,
-            expect![[r#"ty: (), name: ?"#]],
-        ) // FIXME this should be `ty: u32, name: ?`
+            expect![[r#"ty: u32, name: ?"#]],
+        )
     }
 
     #[test]
@@ -855,5 +959,64 @@ fn foo() -> u32 {
 "#,
             expect![[r#"ty: u32, name: ?"#]],
         )
+    }
+
+    #[test]
+    fn expected_type_fn_ret_fn_ref_fully_typed() {
+        check_expected_type_and_name(
+            r#"
+fn foo() -> u32 {
+    foo$0
+}
+"#,
+            expect![[r#"ty: u32, name: ?"#]],
+        )
+    }
+
+    #[test]
+    fn expected_type_closure_param_return() {
+        // FIXME: make this work with `|| $0`
+        check_expected_type_and_name(
+            r#"
+//- minicore: fn
+fn foo() {
+    bar(|| a$0);
+}
+
+fn bar(f: impl FnOnce() -> u32) {}
+"#,
+            expect![[r#"ty: u32, name: ?"#]],
+        );
+    }
+
+    #[test]
+    fn expected_type_generic_function() {
+        check_expected_type_and_name(
+            r#"
+fn foo() {
+    bar::<u32>($0);
+}
+
+fn bar<T>(t: T) {}
+"#,
+            expect![[r#"ty: u32, name: t"#]],
+        );
+    }
+
+    #[test]
+    fn expected_type_generic_method() {
+        check_expected_type_and_name(
+            r#"
+fn foo() {
+    S(1u32).bar($0);
+}
+
+struct S<T>(T);
+impl<T> S<T> {
+    fn bar(self, t: T) {}
+}
+"#,
+            expect![[r#"ty: u32, name: t"#]],
+        );
     }
 }

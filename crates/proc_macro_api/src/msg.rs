@@ -59,7 +59,7 @@ pub trait Message: Serialize + DeserializeOwned {
         Ok(match read_json(inp, buf)? {
             None => None,
             Some(text) => {
-                let mut deserializer = serde_json::Deserializer::from_str(&text);
+                let mut deserializer = serde_json::Deserializer::from_str(text);
                 // Note that some proc-macro generate very deep syntax tree
                 // We have to disable the current limit of serde here
                 deserializer.disable_recursion_limit();
@@ -92,7 +92,7 @@ fn read_json<'a>(
 
         // Some ill behaved macro try to use stdout for debugging
         // We ignore it here
-        if !buf.starts_with("{") {
+        if !buf.starts_with('{') {
             log::error!("proc-macro tried to print : {}", buf);
             continue;
         }

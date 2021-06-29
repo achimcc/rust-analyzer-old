@@ -1,5 +1,3 @@
-//! FIXME: write short doc here
-
 use super::*;
 
 pub(super) fn inner_attrs(p: &mut Parser) {
@@ -15,6 +13,7 @@ pub(super) fn outer_attrs(p: &mut Parser) {
 }
 
 pub(super) fn meta(p: &mut Parser) {
+    let meta = p.start();
     paths::use_path(p);
 
     match p.current() {
@@ -27,6 +26,8 @@ pub(super) fn meta(p: &mut Parser) {
         T!['('] | T!['['] | T!['{'] => items::token_tree(p),
         _ => {}
     }
+
+    meta.complete(p, META);
 }
 
 fn attr(p: &mut Parser, inner: bool) {

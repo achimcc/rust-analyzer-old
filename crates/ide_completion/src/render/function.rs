@@ -1,6 +1,6 @@
 //! Renderer for function calls.
 
-use hir::{HasSource, HirDisplay, Type};
+use hir::{HasSource, HirDisplay};
 use ide_db::SymbolKind;
 use itertools::Itertools;
 use syntax::ast::Fn;
@@ -16,27 +16,29 @@ use crate::{
 pub(crate) fn render_fn<'a>(
     ctx: RenderContext<'a>,
     import_to_add: Option<ImportEdit>,
-    local_name: Option<String>,
+    local_name: Option<hir::Name>,
     fn_: hir::Function,
 ) -> Option<CompletionItem> {
     let _p = profile::span("render_fn");
-    Some(FunctionRender::new(ctx, local_name, fn_, false)?.render(import_to_add))
+    Some(FunctionRender::new(ctx, None, local_name, fn_, false)?.render(import_to_add))
 }
 
 pub(crate) fn render_method<'a>(
     ctx: RenderContext<'a>,
     import_to_add: Option<ImportEdit>,
-    local_name: Option<String>,
+    receiver: Option<hir::Name>,
+    local_name: Option<hir::Name>,
     fn_: hir::Function,
 ) -> Option<CompletionItem> {
     let _p = profile::span("render_method");
-    Some(FunctionRender::new(ctx, local_name, fn_, true)?.render(import_to_add))
+    Some(FunctionRender::new(ctx, receiver, local_name, fn_, true)?.render(import_to_add))
 }
 
 #[derive(Debug)]
 struct FunctionRender<'a> {
     ctx: RenderContext<'a>,
     name: String,
+    receiver: Option<hir::Name>,
     func: hir::Function,
     ast_node: Fn,
     is_method: bool,
@@ -45,36 +47,40 @@ struct FunctionRender<'a> {
 impl<'a> FunctionRender<'a> {
     fn new(
         ctx: RenderContext<'a>,
-        local_name: Option<String>,
+        receiver: Option<hir::Name>,
+        local_name: Option<hir::Name>,
         fn_: hir::Function,
         is_method: bool,
     ) -> Option<FunctionRender<'a>> {
-        let name = local_name.unwrap_or_else(|| fn_.name(ctx.db()).to_string());
+        let name = local_name.unwrap_or_else(|| fn_.name(ctx.db())).to_string();
         let ast_node = fn_.source(ctx.db())?.value;
 
-        Some(FunctionRender { ctx, name, func: fn_, ast_node, is_method })
+        Some(FunctionRender { ctx, name, receiver, func: fn_, ast_node, is_method })
     }
 
     fn render(self, import_to_add: Option<ImportEdit>) -> CompletionItem {
         let params = self.params();
-        let mut item = CompletionItem::new(
-            CompletionKind::Reference,
-            self.ctx.source_range(),
-            self.name.clone(),
-        );
+        let call = if let Some(receiver) = &self.receiver {
+            format!("{}.{}", receiver, &self.name)
+        } else {
+            self.name.clone()
+        };
+        let mut item =
+            CompletionItem::new(CompletionKind::Reference, self.ctx.source_range(), call.clone());
         item.kind(self.kind())
             .set_documentation(self.ctx.docs(self.func))
             .set_deprecated(
                 self.ctx.is_deprecated(self.func) || self.ctx.is_deprecated_assoc_item(self.func),
             )
             .detail(self.detail())
-            .add_call_parens(self.ctx.completion, self.name.clone(), params)
-            .add_import(import_to_add);
+            .add_call_parens(self.ctx.completion, call.clone(), params)
+            .add_import(import_to_add)
+            .lookup_by(self.name);
 
         let ret_type = self.func.ret_type(self.ctx.db());
         item.set_relevance(CompletionRelevance {
             type_match: compute_type_match(self.ctx.completion, &ret_type),
-            exact_name_match: compute_exact_name_match(self.ctx.completion, self.name.clone()),
+            exact_name_match: compute_exact_name_match(self.ctx.completion, &call),
             ..CompletionRelevance::default()
         });
 
@@ -129,7 +135,7 @@ impl<'a> FunctionRender<'a> {
         format!("-> {}", ret_ty.display(self.ctx.db()))
     }
 
-    fn add_arg(&self, arg: &str, ty: &Type) -> String {
+    fn add_arg(&self, arg: &str, ty: &hir::Type) -> String {
         if let Some(derefed_ty) = ty.remove_ref() {
             for (name, local) in self.ctx.completion.locals.iter() {
                 if name == arg && local.ty(self.ctx.db()) == derefed_ty {
@@ -148,7 +154,7 @@ impl<'a> FunctionRender<'a> {
         };
 
         let mut params_pats = Vec::new();
-        let params_ty = if self.ctx.completion.dot_receiver.is_some() {
+        let params_ty = if self.ctx.completion.has_dot_receiver() || self.receiver.is_some() {
             self.func.method_params(self.ctx.db()).unwrap_or_default()
         } else {
             if let Some(s) = ast_params.self_param() {
@@ -185,7 +191,7 @@ impl<'a> FunctionRender<'a> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        test_utils::{check_edit, check_edit_with_config, TEST_CONFIG},
+        tests::{check_edit, check_edit_with_config, TEST_CONFIG},
         CompletionConfig,
     };
 
@@ -252,6 +258,26 @@ impl S {
 }
 fn bar(s: &S) {
     s.foo(${1:x})$0
+}
+"#,
+        );
+
+        check_edit(
+            "foo",
+            r#"
+struct S {}
+impl S {
+    fn foo(&self, x: i32) {
+        $0
+    }
+}
+"#,
+            r#"
+struct S {}
+impl S {
+    fn foo(&self, x: i32) {
+        self.foo(${1:x})$0
+    }
 }
 "#,
         );

@@ -96,7 +96,7 @@ fn get_chaining_hints(
     }
 
     let krate = sema.scope(expr.syntax()).module().map(|it| it.krate());
-    let famous_defs = FamousDefs(&sema, krate);
+    let famous_defs = FamousDefs(sema, krate);
 
     let mut tokens = expr
         .syntax()
@@ -150,17 +150,11 @@ fn get_param_name_hints(
         return None;
     }
 
-    let args = match &expr {
-        ast::Expr::CallExpr(expr) => expr.arg_list()?.args(),
-        ast::Expr::MethodCallExpr(expr) => expr.arg_list()?.args(),
-        _ => return None,
-    };
-
-    let callable = get_callable(sema, &expr)?;
+    let (callable, arg_list) = get_callable(sema, &expr)?;
     let hints = callable
         .params(sema.db)
         .into_iter()
-        .zip(args)
+        .zip(arg_list.args())
         .filter_map(|((param, _ty), arg)| {
             let param_name = match param? {
                 Either::Left(_) => "self".to_string(),
@@ -171,7 +165,7 @@ fn get_param_name_hints(
             };
             Some((param_name, arg))
         })
-        .filter(|(param_name, arg)| should_show_param_name_hint(sema, &callable, param_name, &arg))
+        .filter(|(param_name, arg)| !should_hide_param_name_hint(sema, &callable, param_name, arg))
         .map(|(param_name, arg)| InlayHint {
             range: arg.syntax().text_range(),
             kind: InlayKind::ParameterHint,
@@ -193,7 +187,7 @@ fn get_bind_pat_hints(
     }
 
     let krate = sema.scope(pat.syntax()).module().map(|it| it.krate());
-    let famous_defs = FamousDefs(&sema, krate);
+    let famous_defs = FamousDefs(sema, krate);
 
     let ty = sema.type_of_pat(&pat.clone().into())?;
 
@@ -218,17 +212,17 @@ fn hint_iterator(
     ty: &hir::Type,
 ) -> Option<SmolStr> {
     let db = sema.db;
-    let strukt = std::iter::successors(Some(ty.clone()), |ty| ty.remove_ref())
-        .last()
-        .and_then(|strukt| strukt.as_adt())?;
-    let krate = strukt.krate(db);
+    let strukt = ty.strip_references().as_adt()?;
+    let krate = strukt.module(db).krate();
     if krate != famous_defs.core()? {
         return None;
     }
     let iter_trait = famous_defs.core_iter_Iterator()?;
     let iter_mod = famous_defs.core_iter()?;
-    // assert this struct comes from `core::iter`
+
+    // Assert that this struct comes from `core::iter`.
     iter_mod.visibility_of(db, &strukt.into()).filter(|&vis| vis == hir::Visibility::Public)?;
+
     if ty.impls_trait(db, iter_trait, &[]) {
         let assoc_type_item = iter_trait.items(db).into_iter().find_map(|item| match item {
             hir::AssocItem::TypeAlias(alias) if alias.name(db) == known::Item => Some(alias),
@@ -289,15 +283,9 @@ fn should_not_display_type_hint(
     for node in bind_pat.syntax().ancestors() {
         match_ast! {
             match node {
-                ast::LetStmt(it) => {
-                    return it.ty().is_some()
-                },
-                ast::Param(it) => {
-                    return it.ty().is_some()
-                },
-                ast::MatchArm(_it) => {
-                    return pat_is_enum_variant(db, bind_pat, pat_ty);
-                },
+                ast::LetStmt(it) => return it.ty().is_some(),
+                ast::Param(it) => return it.ty().is_some(),
+                ast::MatchArm(_it) => return pat_is_enum_variant(db, bind_pat, pat_ty),
                 ast::IfExpr(it) => {
                     return it.condition().and_then(|condition| condition.pat()).is_some()
                         && pat_is_enum_variant(db, bind_pat, pat_ty);
@@ -311,9 +299,8 @@ fn should_not_display_type_hint(
                     // Type of expr should be iterable.
                     return it.in_token().is_none() ||
                         it.iterable()
-                            .and_then(|iterable_expr|sema.type_of_expr(&iterable_expr))
-                            .map(|iterable_ty| iterable_ty.is_unknown() || iterable_ty.is_unit())
-                            .unwrap_or(true)
+                            .and_then(|iterable_expr| sema.type_of_expr(&iterable_expr))
+                            .map_or(true, |iterable_ty| iterable_ty.is_unknown() || iterable_ty.is_unit())
                 },
                 _ => (),
             }
@@ -322,76 +309,66 @@ fn should_not_display_type_hint(
     false
 }
 
-fn should_show_param_name_hint(
+fn should_hide_param_name_hint(
     sema: &Semantics<RootDatabase>,
     callable: &hir::Callable,
     param_name: &str,
     argument: &ast::Expr,
 ) -> bool {
+    // These are to be tested in the `parameter_hint_heuristics` test
+    // hide when:
+    // - the parameter name is a suffix of the function's name
+    // - the argument is an enum whose name is equal to the parameter
+    // - exact argument<->parameter match(ignoring leading underscore) or parameter is a prefix/suffix
+    //   of argument with _ splitting it off
+    // - param starts with `ra_fixture`
+    // - param is a well known name in an unary function
+
     let param_name = param_name.trim_start_matches('_');
-    let fn_name = match callable.kind() {
-        hir::CallableKind::Function(it) => Some(it.name(sema.db).to_string()),
-        hir::CallableKind::TupleStruct(_)
-        | hir::CallableKind::TupleEnumVariant(_)
-        | hir::CallableKind::Closure => None,
-    };
-
-    if param_name.is_empty()
-        || Some(param_name) == fn_name.as_ref().map(|s| s.trim_start_matches('_'))
-        || is_argument_similar_to_param_name(sema, argument, param_name)
-        || is_param_name_similar_to_fn_name(param_name, callable, fn_name.as_ref())
-        || param_name.starts_with("ra_fixture")
-    {
-        return false;
-    }
-
-    // avoid displaying hints for common functions like map, filter, etc.
-    // or other obvious words used in std
-    !(callable.n_params() == 1 && is_obvious_param(param_name))
-}
-
-fn is_argument_similar_to_param_name(
-    sema: &Semantics<RootDatabase>,
-    argument: &ast::Expr,
-    param_name: &str,
-) -> bool {
-    if is_enum_name_similar_to_param_name(sema, argument, param_name) {
+    if param_name.is_empty() {
         return true;
     }
-    match get_string_representation(argument) {
-        None => false,
-        Some(argument_string) => {
-            let num_leading_underscores =
-                argument_string.bytes().take_while(|&c| c == b'_').count();
 
-            // Does the argument name begin with the parameter name? Ignore leading underscores.
-            let mut arg_bytes = argument_string.bytes().skip(num_leading_underscores);
-            let starts_with_pattern = param_name.bytes().all(
-                |expected| matches!(arg_bytes.next(), Some(actual) if expected.eq_ignore_ascii_case(&actual)),
-            );
-
-            if starts_with_pattern {
-                return true;
-            }
-
-            // Does the argument name end with the parameter name?
-            let mut arg_bytes = argument_string.bytes().skip(num_leading_underscores);
-            param_name.bytes().rev().all(
-                |expected| matches!(arg_bytes.next_back(), Some(actual) if expected.eq_ignore_ascii_case(&actual)),
-            )
-        }
-    }
+    let fn_name = match callable.kind() {
+        hir::CallableKind::Function(it) => Some(it.name(sema.db).to_string()),
+        _ => None,
+    };
+    let fn_name = fn_name.as_deref();
+    is_param_name_suffix_of_fn_name(param_name, callable, fn_name)
+        || is_enum_name_similar_to_param_name(sema, argument, param_name)
+        || is_argument_similar_to_param_name(argument, param_name)
+        || param_name.starts_with("ra_fixture")
+        || (callable.n_params() == 1 && is_obvious_param(param_name))
 }
 
-fn is_param_name_similar_to_fn_name(
+fn is_argument_similar_to_param_name(argument: &ast::Expr, param_name: &str) -> bool {
+    // check whether param_name and argument are the same or
+    // whether param_name is a prefix/suffix of argument(split at `_`)
+    let argument = match get_string_representation(argument) {
+        Some(argument) => argument,
+        None => return false,
+    };
+
+    let param_name = param_name.trim_start_matches('_');
+    let argument = argument.trim_start_matches('_');
+    if argument.strip_prefix(param_name).map_or(false, |s| s.starts_with('_')) {
+        return true;
+    }
+    if argument.strip_suffix(param_name).map_or(false, |s| s.ends_with('_')) {
+        return true;
+    }
+    argument == param_name
+}
+
+/// Hide the parameter name of an unary function if it is a `_` - prefixed suffix of the function's name, or equal.
+///
+/// `fn strip_suffix(suffix)` will be hidden.
+/// `fn stripsuffix(suffix)` will not be hidden.
+fn is_param_name_suffix_of_fn_name(
     param_name: &str,
     callable: &Callable,
-    fn_name: Option<&String>,
+    fn_name: Option<&str>,
 ) -> bool {
-    // if it's the only parameter, don't show it if:
-    // - is the same as the function name, or
-    // - the function ends with '_' + param_name
-
     match (callable.n_params(), fn_name) {
         (1, Some(function)) => {
             function == param_name
@@ -419,12 +396,12 @@ fn get_string_representation(expr: &ast::Expr) -> Option<String> {
         ast::Expr::MethodCallExpr(method_call_expr) => {
             let name_ref = method_call_expr.name_ref()?;
             match name_ref.text().as_str() {
-                "clone" => method_call_expr.receiver().map(|rec| rec.to_string()),
+                "clone" | "as_ref" => method_call_expr.receiver().map(|rec| rec.to_string()),
                 name_ref => Some(name_ref.to_owned()),
             }
         }
         ast::Expr::FieldExpr(field_expr) => Some(field_expr.name_ref()?.to_string()),
-        ast::Expr::PathExpr(path_expr) => Some(path_expr.to_string()),
+        ast::Expr::PathExpr(path_expr) => Some(path_expr.path()?.segment()?.to_string()),
         ast::Expr::PrefixExpr(prefix_expr) => get_string_representation(&prefix_expr.expr()?),
         ast::Expr::RefExpr(ref_expr) => get_string_representation(&ref_expr.expr()?),
         _ => None,
@@ -432,15 +409,24 @@ fn get_string_representation(expr: &ast::Expr) -> Option<String> {
 }
 
 fn is_obvious_param(param_name: &str) -> bool {
+    // avoid displaying hints for common functions like map, filter, etc.
+    // or other obvious words used in std
     let is_obvious_param_name =
         matches!(param_name, "predicate" | "value" | "pat" | "rhs" | "other");
     param_name.len() == 1 || is_obvious_param_name
 }
 
-fn get_callable(sema: &Semantics<RootDatabase>, expr: &ast::Expr) -> Option<hir::Callable> {
+fn get_callable(
+    sema: &Semantics<RootDatabase>,
+    expr: &ast::Expr,
+) -> Option<(hir::Callable, ast::ArgList)> {
     match expr {
-        ast::Expr::CallExpr(expr) => sema.type_of_expr(&expr.expr()?)?.as_callable(sema.db),
-        ast::Expr::MethodCallExpr(expr) => sema.resolve_method_call_as_callable(expr),
+        ast::Expr::CallExpr(expr) => {
+            sema.type_of_expr(&expr.expr()?)?.as_callable(sema.db).zip(expr.arg_list())
+        }
+        ast::Expr::MethodCallExpr(expr) => {
+            sema.resolve_method_call_as_callable(expr).zip(expr.arg_list())
+        }
         _ => None,
     }
 }
@@ -448,7 +434,6 @@ fn get_callable(sema: &Semantics<RootDatabase>, expr: &ast::Expr) -> Option<hir:
 #[cfg(test)]
 mod tests {
     use expect_test::{expect, Expect};
-    use ide_db::helpers::FamousDefs;
     use test_utils::extract_annotations;
 
     use crate::{fixture, inlay_hints::InlayHintsConfig};
@@ -464,9 +449,43 @@ mod tests {
         check_with_config(TEST_CONFIG, ra_fixture);
     }
 
+    fn check_params(ra_fixture: &str) {
+        check_with_config(
+            InlayHintsConfig {
+                parameter_hints: true,
+                type_hints: false,
+                chaining_hints: false,
+                max_length: None,
+            },
+            ra_fixture,
+        );
+    }
+
+    fn check_types(ra_fixture: &str) {
+        check_with_config(
+            InlayHintsConfig {
+                parameter_hints: false,
+                type_hints: true,
+                chaining_hints: false,
+                max_length: None,
+            },
+            ra_fixture,
+        );
+    }
+
+    fn check_chains(ra_fixture: &str) {
+        check_with_config(
+            InlayHintsConfig {
+                parameter_hints: false,
+                type_hints: false,
+                chaining_hints: true,
+                max_length: None,
+            },
+            ra_fixture,
+        );
+    }
+
     fn check_with_config(config: InlayHintsConfig, ra_fixture: &str) {
-        let ra_fixture =
-            format!("//- /main.rs crate:main deps:core\n{}\n{}", ra_fixture, FamousDefs::FIXTURE);
         let (analysis, file_id) = fixture::file(&ra_fixture);
         let expected = extract_annotations(&*analysis.file_text(file_id).unwrap());
         let inlay_hints = analysis.inlay_hints(file_id, &config).unwrap();
@@ -476,115 +495,9 @@ mod tests {
     }
 
     fn check_expect(config: InlayHintsConfig, ra_fixture: &str, expect: Expect) {
-        let ra_fixture =
-            format!("//- /main.rs crate:main deps:core\n{}\n{}", ra_fixture, FamousDefs::FIXTURE);
         let (analysis, file_id) = fixture::file(&ra_fixture);
         let inlay_hints = analysis.inlay_hints(file_id, &config).unwrap();
         expect.assert_debug_eq(&inlay_hints)
-    }
-
-    #[test]
-    fn param_hints_only() {
-        check_with_config(
-            InlayHintsConfig {
-                parameter_hints: true,
-                type_hints: false,
-                chaining_hints: false,
-                max_length: None,
-            },
-            r#"
-fn foo(a: i32, b: i32) -> i32 { a + b }
-fn main() {
-    let _x = foo(
-        4,
-      //^ a
-        4,
-      //^ b
-    );
-}"#,
-        );
-    }
-
-    #[test]
-    fn param_name_similar_to_fn_name_still_hints() {
-        check_with_config(
-            InlayHintsConfig {
-                parameter_hints: true,
-                type_hints: false,
-                chaining_hints: false,
-                max_length: None,
-            },
-            r#"
-fn max(x: i32, y: i32) -> i32 { x + y }
-fn main() {
-    let _x = max(
-        4,
-      //^ x
-        4,
-      //^ y
-    );
-}"#,
-        );
-    }
-
-    #[test]
-    fn param_name_similar_to_fn_name() {
-        check_with_config(
-            InlayHintsConfig {
-                parameter_hints: true,
-                type_hints: false,
-                chaining_hints: false,
-                max_length: None,
-            },
-            r#"
-fn param_with_underscore(with_underscore: i32) -> i32 { with_underscore }
-fn main() {
-    let _x = param_with_underscore(
-        4,
-    );
-}"#,
-        );
-    }
-
-    #[test]
-    fn param_name_same_as_fn_name() {
-        check_with_config(
-            InlayHintsConfig {
-                parameter_hints: true,
-                type_hints: false,
-                chaining_hints: false,
-                max_length: None,
-            },
-            r#"
-fn foo(foo: i32) -> i32 { foo }
-fn main() {
-    let _x = foo(
-        4,
-    );
-}"#,
-        );
-    }
-
-    #[test]
-    fn never_hide_param_when_multiple_params() {
-        check_with_config(
-            InlayHintsConfig {
-                parameter_hints: true,
-                type_hints: false,
-                chaining_hints: false,
-                max_length: None,
-            },
-            r#"
-fn foo(bar: i32, baz: i32) -> i32 { bar + baz }
-fn main() {
-    let _x = foo(
-        4,
-      //^ bar
-        8,
-      //^ baz
-    );
-}"#,
-        );
     }
 
     #[test]
@@ -604,15 +517,275 @@ fn main() {
         );
     }
 
+    // Parameter hint tests
+
+    #[test]
+    fn param_hints_only() {
+        check_params(
+            r#"
+fn foo(a: i32, b: i32) -> i32 { a + b }
+fn main() {
+    let _x = foo(
+        4,
+      //^ a
+        4,
+      //^ b
+    );
+}"#,
+        );
+    }
+
+    #[test]
+    fn param_name_similar_to_fn_name_still_hints() {
+        check_params(
+            r#"
+fn max(x: i32, y: i32) -> i32 { x + y }
+fn main() {
+    let _x = max(
+        4,
+      //^ x
+        4,
+      //^ y
+    );
+}"#,
+        );
+    }
+
+    #[test]
+    fn param_name_similar_to_fn_name() {
+        check_params(
+            r#"
+fn param_with_underscore(with_underscore: i32) -> i32 { with_underscore }
+fn main() {
+    let _x = param_with_underscore(
+        4,
+    );
+}"#,
+        );
+        check_params(
+            r#"
+fn param_with_underscore(underscore: i32) -> i32 { underscore }
+fn main() {
+    let _x = param_with_underscore(
+        4,
+    );
+}"#,
+        );
+    }
+
+    #[test]
+    fn param_name_same_as_fn_name() {
+        check_params(
+            r#"
+fn foo(foo: i32) -> i32 { foo }
+fn main() {
+    let _x = foo(
+        4,
+    );
+}"#,
+        );
+    }
+
+    #[test]
+    fn never_hide_param_when_multiple_params() {
+        check_params(
+            r#"
+fn foo(foo: i32, bar: i32) -> i32 { bar + baz }
+fn main() {
+    let _x = foo(
+        4,
+      //^ foo
+        8,
+      //^ bar
+    );
+}"#,
+        );
+    }
+
+    #[test]
+    fn param_hints_look_through_as_ref_and_clone() {
+        check_params(
+            r#"
+fn foo(bar: i32, baz: f32) {}
+
+fn main() {
+    let bar = 3;
+    let baz = &"baz";
+    let fez = 1.0;
+    foo(bar.clone(), bar.clone());
+                   //^^^^^^^^^^^ baz
+    foo(bar.as_ref(), bar.as_ref());
+                    //^^^^^^^^^^^^ baz
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn self_param_hints() {
+        check_params(
+            r#"
+struct Foo;
+
+impl Foo {
+    fn foo(self: Self) {}
+    fn bar(self: &Self) {}
+}
+
+fn main() {
+    Foo::foo(Foo);
+           //^^^ self
+    Foo::bar(&Foo);
+           //^^^^ self
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn param_name_hints_show_for_literals() {
+        check_params(
+            r#"pub fn test(a: i32, b: i32) -> [i32; 2] { [a, b] }
+fn main() {
+    test(
+        0xa_b,
+      //^^^^^ a
+        0xa_b,
+      //^^^^^ b
+    );
+}"#,
+        )
+    }
+
+    #[test]
+    fn function_call_parameter_hint() {
+        check_params(
+            r#"
+//- minicore: option
+struct FileId {}
+struct SmolStr {}
+
+struct TextRange {}
+struct SyntaxKind {}
+struct NavigationTarget {}
+
+struct Test {}
+
+impl Test {
+    fn method(&self, mut param: i32) -> i32 { param * 2 }
+
+    fn from_syntax(
+        file_id: FileId,
+        name: SmolStr,
+        focus_range: Option<TextRange>,
+        full_range: TextRange,
+        kind: SyntaxKind,
+        docs: Option<String>,
+    ) -> NavigationTarget {
+        NavigationTarget {}
+    }
+}
+
+fn test_func(mut foo: i32, bar: i32, msg: &str, _: i32, last: i32) -> i32 {
+    foo + bar
+}
+
+fn main() {
+    let not_literal = 1;
+    let _: i32 = test_func(1,    2,      "hello", 3,  not_literal);
+                         //^ foo ^ bar   ^^^^^^^ msg  ^^^^^^^^^^^ last
+    let t: Test = Test {};
+    t.method(123);
+           //^^^ param
+    Test::method(&t,      3456);
+               //^^ self  ^^^^ param
+    Test::from_syntax(
+        FileId {},
+      //^^^^^^^^^ file_id
+        "impl".into(),
+      //^^^^^^^^^^^^^ name
+        None,
+      //^^^^ focus_range
+        TextRange {},
+      //^^^^^^^^^^^^ full_range
+        SyntaxKind {},
+      //^^^^^^^^^^^^^ kind
+        None,
+      //^^^^ docs
+    );
+}"#,
+        );
+    }
+
+    #[test]
+    fn parameter_hint_heuristics() {
+        check_params(
+            r#"
+fn check(ra_fixture_thing: &str) {}
+
+fn map(f: i32) {}
+fn filter(predicate: i32) {}
+
+fn strip_suffix(suffix: &str) {}
+fn stripsuffix(suffix: &str) {}
+fn same(same: u32) {}
+fn same2(_same2: u32) {}
+
+fn enum_matches_param_name(completion_kind: CompletionKind) {}
+
+fn foo(param: u32) {}
+fn bar(param_eter: u32) {}
+
+enum CompletionKind {
+    Keyword,
+}
+
+fn non_ident_pat((a, b): (u32, u32)) {}
+
+fn main() {
+    check("");
+
+    map(0);
+    filter(0);
+
+    strip_suffix("");
+    stripsuffix("");
+              //^^ suffix
+    same(0);
+    same2(0);
+
+    enum_matches_param_name(CompletionKind::Keyword);
+
+    let param = 0;
+    foo(param);
+    let param_end = 0;
+    foo(param_end);
+    let start_param = 0;
+    foo(start_param);
+    let param2 = 0;
+    foo(param2);
+      //^^^^^^ param
+
+    let param_eter = 0;
+    bar(param_eter);
+    let param_eter_end = 0;
+    bar(param_eter_end);
+    let start_param_eter = 0;
+    bar(start_param_eter);
+    let param_eter2 = 0;
+    bar(param_eter2);
+      //^^^^^^^^^^^ param_eter
+
+    non_ident_pat((0, 0));
+}"#,
+        );
+    }
+
+    // Type-Hint tests
+
     #[test]
     fn type_hints_only() {
-        check_with_config(
-            InlayHintsConfig {
-                type_hints: true,
-                parameter_hints: false,
-                chaining_hints: false,
-                max_length: None,
-            },
+        check_types(
             r#"
 fn foo(a: i32, b: i32) -> i32 { a + b }
 fn main() {
@@ -640,8 +813,113 @@ fn main() {
     }
 
     #[test]
+    fn shorten_iterators_in_associated_params() {
+        check_types(
+            r#"
+//- minicore: iterators
+use core::iter;
+
+pub struct SomeIter<T> {}
+
+impl<T> SomeIter<T> {
+    pub fn new() -> Self { SomeIter {} }
+    pub fn push(&mut self, t: T) {}
+}
+
+impl<T> Iterator for SomeIter<T> {
+    type Item = T;
+    fn next(&mut self) -> Option<Self::Item> {
+        None
+    }
+}
+
+fn main() {
+    let mut some_iter = SomeIter::new();
+      //^^^^^^^^^^^^^ SomeIter<Take<Repeat<i32>>>
+      some_iter.push(iter::repeat(2).take(2));
+    let iter_of_iters = some_iter.take(2);
+      //^^^^^^^^^^^^^ impl Iterator<Item = impl Iterator<Item = i32>>
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn infer_call_method_return_associated_types_with_generic() {
+        check_types(
+            r#"
+            pub trait Default {
+                fn default() -> Self;
+            }
+            pub trait Foo {
+                type Bar: Default;
+            }
+
+            pub fn quux<T: Foo>() -> T::Bar {
+                let y = Default::default();
+                  //^ <T as Foo>::Bar
+
+                y
+            }
+            "#,
+        );
+    }
+
+    #[test]
+    fn fn_hints() {
+        check_types(
+            r#"
+//- minicore: fn, sized
+fn foo() -> impl Fn() { loop {} }
+fn foo1() -> impl Fn(f64) { loop {} }
+fn foo2() -> impl Fn(f64, f64) { loop {} }
+fn foo3() -> impl Fn(f64, f64) -> u32 { loop {} }
+fn foo4() -> &'static dyn Fn(f64, f64) -> u32 { loop {} }
+fn foo5() -> &'static dyn Fn(&'static dyn Fn(f64, f64) -> u32, f64) -> u32 { loop {} }
+fn foo6() -> impl Fn(f64, f64) -> u32 + Sized { loop {} }
+fn foo7() -> *const (impl Fn(f64, f64) -> u32 + Sized) { loop {} }
+
+fn main() {
+    let foo = foo();
+     // ^^^ impl Fn()
+    let foo = foo1();
+     // ^^^ impl Fn(f64)
+    let foo = foo2();
+     // ^^^ impl Fn(f64, f64)
+    let foo = foo3();
+     // ^^^ impl Fn(f64, f64) -> u32
+    let foo = foo4();
+     // ^^^ &dyn Fn(f64, f64) -> u32
+    let foo = foo5();
+     // ^^^ &dyn Fn(&dyn Fn(f64, f64) -> u32, f64) -> u32
+    let foo = foo6();
+     // ^^^ impl Fn(f64, f64) -> u32 + Sized
+    let foo = foo7();
+     // ^^^ *const (impl Fn(f64, f64) -> u32 + Sized)
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn unit_structs_have_no_type_hints() {
+        check_types(
+            r#"
+//- minicore: result
+struct SyntheticSyntax;
+
+fn main() {
+    match Ok(()) {
+        Ok(_) => (),
+        Err(SyntheticSyntax) => (),
+    }
+}"#,
+        );
+    }
+
+    #[test]
     fn let_statement() {
-        check(
+        check_types(
             r#"
 #[derive(PartialEq)]
 enum Option<T> { None, Some(T) }
@@ -676,38 +954,10 @@ fn main() {
     }
 
     #[test]
-    fn closure_parameters() {
-        check(
-            r#"
-fn main() {
-    let mut start = 0;
-      //^^^^^^^^^ i32
-    (0..2).for_each(|increment| { start += increment; });
-                   //^^^^^^^^^ i32
-
-    let multiply =
-      //^^^^^^^^ |…| -> i32
-      | a,     b| a * b
-      //^ i32  ^ i32
-    ;
-
-    let _: i32 = multiply(1, 2);
-    let multiply_ref = &multiply;
-      //^^^^^^^^^^^^ &|…| -> i32
-
-    let return_42 = || 42;
-      //^^^^^^^^^ || -> i32
-}"#,
-        );
-    }
-
-    #[test]
     fn if_expr() {
-        check(
+        check_types(
             r#"
-enum Option<T> { None, Some(T) }
-use Option::*;
-
+//- minicore: option
 struct Test { a: Option<u32>, b: u8 }
 
 fn main() {
@@ -735,11 +985,9 @@ fn main() {
 
     #[test]
     fn while_expr() {
-        check(
+        check_types(
             r#"
-enum Option<T> { None, Some(T) }
-use Option::*;
-
+//- minicore: option
 struct Test { a: Option<u32>, b: u8 }
 
 fn main() {
@@ -753,11 +1001,9 @@ fn main() {
 
     #[test]
     fn match_arm_list() {
-        check(
+        check_types(
             r#"
-enum Option<T> { None, Some(T) }
-use Option::*;
-
+//- minicore: option
 struct Test { a: Option<u32>, b: u8 }
 
 fn main() {
@@ -769,6 +1015,156 @@ fn main() {
                           //^ u32  ^ u8
         _ => {}
     }
+}"#,
+        );
+    }
+
+    #[test]
+    fn incomplete_for_no_hint() {
+        check_types(
+            r#"
+fn main() {
+    let data = &[1i32, 2, 3];
+      //^^^^ &[i32; 3]
+    for i
+}"#,
+        );
+        check(
+            r#"
+pub struct Vec<T> {}
+
+impl<T> Vec<T> {
+    pub fn new() -> Self { Vec {} }
+    pub fn push(&mut self, t: T) {}
+}
+
+impl<T> IntoIterator for Vec<T> {
+    type Item=T;
+}
+
+fn main() {
+    let mut data = Vec::new();
+      //^^^^^^^^ Vec<&str>
+    data.push("foo");
+    for i in
+
+    println!("Unit expr");
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn complete_for_hint() {
+        check_types(
+            r#"
+//- minicore: iterator
+pub struct Vec<T> {}
+
+impl<T> Vec<T> {
+    pub fn new() -> Self { Vec {} }
+    pub fn push(&mut self, t: T) {}
+}
+
+impl<T> IntoIterator for Vec<T> {
+    type Item=T;
+}
+
+fn main() {
+    let mut data = Vec::new();
+      //^^^^^^^^ Vec<&str>
+    data.push("foo");
+    for i in data {
+      //^ &str
+      let z = i;
+        //^ &str
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn multi_dyn_trait_bounds() {
+        check_types(
+            r#"
+pub struct Vec<T> {}
+
+impl<T> Vec<T> {
+    pub fn new() -> Self { Vec {} }
+}
+
+pub struct Box<T> {}
+
+trait Display {}
+trait Sync {}
+
+fn main() {
+    let _v = Vec::<Box<&(dyn Display + Sync)>>::new();
+      //^^ Vec<Box<&(dyn Display + Sync)>>
+    let _v = Vec::<Box<*const (dyn Display + Sync)>>::new();
+      //^^ Vec<Box<*const (dyn Display + Sync)>>
+    let _v = Vec::<Box<dyn Display + Sync>>::new();
+      //^^ Vec<Box<dyn Display + Sync>>
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn shorten_iterator_hints() {
+        check_types(
+            r#"
+//- minicore: iterators
+use core::iter;
+
+struct MyIter;
+
+impl Iterator for MyIter {
+    type Item = ();
+    fn next(&mut self) -> Option<Self::Item> {
+        None
+    }
+}
+
+fn main() {
+    let _x = MyIter;
+      //^^ MyIter
+    let _x = iter::repeat(0);
+      //^^ impl Iterator<Item = i32>
+    fn generic<T: Clone>(t: T) {
+        let _x = iter::repeat(t);
+          //^^ impl Iterator<Item = T>
+        let _chained = iter::repeat(t).take(10);
+          //^^^^^^^^ impl Iterator<Item = T>
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn closures() {
+        check(
+            r#"
+fn main() {
+    let mut start = 0;
+      //^^^^^^^^^ i32
+    (0..2).for_each(|increment| { start += increment; });
+                   //^^^^^^^^^ i32
+
+    let multiply =
+      //^^^^^^^^ |…| -> i32
+      | a,     b| a * b
+      //^ i32  ^ i32
+    ;
+
+    let _: i32 = multiply(1, 2);
+    let multiply_ref = &multiply;
+      //^^^^^^^^^^^^ &|…| -> i32
+
+    let return_42 = || 42;
+      //^^^^^^^^^ || -> i32
 }"#,
         );
     }
@@ -793,183 +1189,7 @@ fn main() {
         );
     }
 
-    #[test]
-    fn function_call_parameter_hint() {
-        check(
-            r#"
-enum Option<T> { None, Some(T) }
-use Option::*;
-
-struct FileId {}
-struct SmolStr {}
-
-struct TextRange {}
-struct SyntaxKind {}
-struct NavigationTarget {}
-
-struct Test {}
-
-impl Test {
-    fn method(&self, mut param: i32) -> i32 { param * 2 }
-
-    fn from_syntax(
-        file_id: FileId,
-        name: SmolStr,
-        focus_range: Option<TextRange>,
-        full_range: TextRange,
-        kind: SyntaxKind,
-        docs: Option<String>,
-    ) -> NavigationTarget {
-        NavigationTarget {}
-    }
-}
-
-fn test_func(mut foo: i32, bar: i32, msg: &str, _: i32, last: i32) -> i32 {
-    foo + bar
-}
-
-fn main() {
-    let not_literal = 1;
-      //^^^^^^^^^^^ i32
-    let _: i32 = test_func(1,    2,      "hello", 3,  not_literal);
-                         //^ foo ^ bar   ^^^^^^^ msg  ^^^^^^^^^^^ last
-    let t: Test = Test {};
-    t.method(123);
-           //^^^ param
-    Test::method(&t,      3456);
-               //^^ self  ^^^^ param
-    Test::from_syntax(
-        FileId {},
-      //^^^^^^^^^ file_id
-        "impl".into(),
-      //^^^^^^^^^^^^^ name
-        None,
-      //^^^^ focus_range
-        TextRange {},
-      //^^^^^^^^^^^^ full_range
-        SyntaxKind {},
-      //^^^^^^^^^^^^^ kind
-        None,
-      //^^^^ docs
-    );
-}"#,
-        );
-    }
-
-    #[test]
-    fn omitted_parameters_hints_heuristics() {
-        check_with_config(
-            InlayHintsConfig { max_length: Some(8), ..TEST_CONFIG },
-            r#"
-fn map(f: i32) {}
-fn filter(predicate: i32) {}
-
-struct TestVarContainer {
-    test_var: i32,
-}
-
-impl TestVarContainer {
-    fn test_var(&self) -> i32 {
-        self.test_var
-    }
-}
-
-struct Test {}
-
-impl Test {
-    fn map(self, f: i32) -> Self {
-        self
-    }
-
-    fn filter(self, predicate: i32) -> Self {
-        self
-    }
-
-    fn field(self, value: i32) -> Self {
-        self
-    }
-
-    fn no_hints_expected(&self, _: i32, test_var: i32) {}
-
-    fn frob(&self, frob: bool) {}
-}
-
-struct Param {}
-
-fn different_order(param: &Param) {}
-fn different_order_mut(param: &mut Param) {}
-fn has_underscore(_param: bool) {}
-fn enum_matches_param_name(completion_kind: CompletionKind) {}
-fn param_destructuring_omitted_1((a, b): (u32, u32)) {}
-fn param_destructuring_omitted_2(TestVarContainer { test_var: _ }: TestVarContainer) {}
-
-fn twiddle(twiddle: bool) {}
-fn doo(_doo: bool) {}
-
-enum CompletionKind {
-    Keyword,
-}
-
-fn main() {
-    let container: TestVarContainer = TestVarContainer { test_var: 42 };
-    let test: Test = Test {};
-
-    map(22);
-    filter(33);
-
-    let test_processed: Test = test.map(1).filter(2).field(3);
-
-    let test_var: i32 = 55;
-    test_processed.no_hints_expected(22, test_var);
-    test_processed.no_hints_expected(33, container.test_var);
-    test_processed.no_hints_expected(44, container.test_var());
-    test_processed.frob(false);
-
-    twiddle(true);
-    doo(true);
-
-    const TWIDDLE_UPPERCASE: bool = true;
-    twiddle(TWIDDLE_UPPERCASE);
-
-    let mut param_begin: Param = Param {};
-    different_order(&param_begin);
-    different_order(&mut param_begin);
-
-    let param: bool = true;
-    has_underscore(param);
-
-    enum_matches_param_name(CompletionKind::Keyword);
-
-    let a: f64 = 7.0;
-    let b: f64 = 4.0;
-    let _: f64 = a.div_euclid(b);
-    let _: f64 = a.abs_sub(b);
-
-    let range: (u32, u32) = (3, 5);
-    param_destructuring_omitted_1(range);
-    param_destructuring_omitted_2(container);
-}"#,
-        );
-    }
-
-    #[test]
-    fn unit_structs_have_no_type_hints() {
-        check_with_config(
-            InlayHintsConfig { max_length: Some(8), ..TEST_CONFIG },
-            r#"
-enum Result<T, E> { Ok(T), Err(E) }
-use Result::*;
-
-struct SyntheticSyntax;
-
-fn main() {
-    match Ok(()) {
-        Ok(_) => (),
-        Err(SyntheticSyntax) => (),
-    }
-}"#,
-        );
-    }
+    // Chaining hint tests
 
     #[test]
     fn chaining_hints_ignore_comments() {
@@ -997,12 +1217,12 @@ fn main() {
             expect![[r#"
                 [
                     InlayHint {
-                        range: 148..173,
+                        range: 147..172,
                         kind: ChainingHint,
                         label: "B",
                     },
                     InlayHint {
-                        range: 148..155,
+                        range: 147..154,
                         kind: ChainingHint,
                         label: "A",
                     },
@@ -1013,13 +1233,7 @@ fn main() {
 
     #[test]
     fn chaining_hints_without_newlines() {
-        check_with_config(
-            InlayHintsConfig {
-                parameter_hints: false,
-                type_hints: false,
-                chaining_hints: true,
-                max_length: None,
-            },
+        check_chains(
             r#"
 struct A(B);
 impl A { fn into_b(self) -> B { self.0 } }
@@ -1063,12 +1277,12 @@ fn main() {
             expect![[r#"
                 [
                     InlayHint {
-                        range: 144..191,
+                        range: 143..190,
                         kind: ChainingHint,
                         label: "C",
                     },
                     InlayHint {
-                        range: 144..180,
+                        range: 143..179,
                         kind: ChainingHint,
                         label: "B",
                     },
@@ -1108,151 +1322,17 @@ fn main() {
             expect![[r#"
                 [
                     InlayHint {
-                        range: 247..284,
+                        range: 246..283,
                         kind: ChainingHint,
                         label: "B<X<i32, bool>>",
                     },
                     InlayHint {
-                        range: 247..266,
+                        range: 246..265,
                         kind: ChainingHint,
                         label: "A<X<i32, bool>>",
                     },
                 ]
             "#]],
-        );
-    }
-
-    #[test]
-    fn incomplete_for_no_hint() {
-        check(
-            r#"
-fn main() {
-    let data = &[1i32, 2, 3];
-      //^^^^ &[i32; _]
-    for i
-}"#,
-        );
-        check(
-            r#"
-pub struct Vec<T> {}
-
-impl<T> Vec<T> {
-    pub fn new() -> Self { Vec {} }
-    pub fn push(&mut self, t: T) {}
-}
-
-impl<T> IntoIterator for Vec<T> {
-    type Item=T;
-}
-
-fn main() {
-    let mut data = Vec::new();
-      //^^^^^^^^ Vec<&str>
-    data.push("foo");
-    for i in
-
-    println!("Unit expr");
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn complete_for_hint() {
-        check(
-            r#"
-pub struct Vec<T> {}
-
-impl<T> Vec<T> {
-    pub fn new() -> Self { Vec {} }
-    pub fn push(&mut self, t: T) {}
-}
-
-impl<T> IntoIterator for Vec<T> {
-    type Item=T;
-}
-
-fn main() {
-    let mut data = Vec::new();
-      //^^^^^^^^ Vec<&str>
-    data.push("foo");
-    for i in data {
-      //^ &str
-      let z = i;
-        //^ &str
-    }
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn multi_dyn_trait_bounds() {
-        check_with_config(
-            InlayHintsConfig {
-                type_hints: true,
-                parameter_hints: false,
-                chaining_hints: false,
-                max_length: None,
-            },
-            r#"
-pub struct Vec<T> {}
-
-impl<T> Vec<T> {
-    pub fn new() -> Self { Vec {} }
-}
-
-pub struct Box<T> {}
-
-trait Display {}
-trait Sync {}
-
-fn main() {
-    let _v = Vec::<Box<&(dyn Display + Sync)>>::new();
-      //^^ Vec<Box<&(dyn Display + Sync)>>
-    let _v = Vec::<Box<*const (dyn Display + Sync)>>::new();
-      //^^ Vec<Box<*const (dyn Display + Sync)>>
-    let _v = Vec::<Box<dyn Display + Sync>>::new();
-      //^^ Vec<Box<dyn Display + Sync>>
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn shorten_iterator_hints() {
-        check_with_config(
-            InlayHintsConfig {
-                parameter_hints: false,
-                type_hints: true,
-                chaining_hints: false,
-                max_length: None,
-            },
-            r#"
-use core::iter;
-
-struct MyIter;
-
-impl Iterator for MyIter {
-    type Item = ();
-    fn next(&mut self) -> Option<Self::Item> {
-        None
-    }
-}
-
-fn main() {
-    let _x = MyIter;
-      //^^ MyIter
-    let _x = iter::repeat(0);
-      //^^ impl Iterator<Item = i32>
-    fn generic<T: Clone>(t: T) {
-        let _x = iter::repeat(t);
-          //^^ impl Iterator<Item = T>
-        let _chained = iter::repeat(t).take(10);
-          //^^^^^^^^ impl Iterator<Item = T>
-    }
-}
-"#,
         );
     }
 
@@ -1266,6 +1346,7 @@ fn main() {
                 max_length: None,
             },
             r#"
+//- minicore: iterators
 use core::iter;
 
 struct MyIter;
@@ -1288,181 +1369,27 @@ fn main() {
             expect![[r#"
                 [
                     InlayHint {
-                        range: 175..242,
+                        range: 174..241,
                         kind: ChainingHint,
                         label: "impl Iterator<Item = ()>",
                     },
                     InlayHint {
-                        range: 175..225,
+                        range: 174..224,
                         kind: ChainingHint,
                         label: "impl Iterator<Item = ()>",
                     },
                     InlayHint {
-                        range: 175..207,
+                        range: 174..206,
                         kind: ChainingHint,
                         label: "impl Iterator<Item = ()>",
                     },
                     InlayHint {
-                        range: 175..190,
+                        range: 174..189,
                         kind: ChainingHint,
                         label: "&mut MyIter",
                     },
                 ]
             "#]],
         );
-    }
-
-    #[test]
-    fn shorten_iterators_in_associated_params() {
-        check_with_config(
-            InlayHintsConfig {
-                parameter_hints: false,
-                type_hints: true,
-                chaining_hints: false,
-                max_length: None,
-            },
-            r#"
-use core::iter;
-
-pub struct SomeIter<T> {}
-
-impl<T> SomeIter<T> {
-    pub fn new() -> Self { SomeIter {} }
-    pub fn push(&mut self, t: T) {}
-}
-
-impl<T> Iterator for SomeIter<T> {
-    type Item = T;
-    fn next(&mut self) -> Option<Self::Item> {
-        None
-    }
-}
-
-fn main() {
-    let mut some_iter = SomeIter::new();
-      //^^^^^^^^^^^^^ SomeIter<Take<Repeat<i32>>>
-      some_iter.push(iter::repeat(2).take(2));
-    let iter_of_iters = some_iter.take(2);
-      //^^^^^^^^^^^^^ impl Iterator<Item = impl Iterator<Item = i32>>
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn hide_param_hints_for_clones() {
-        check_with_config(
-            InlayHintsConfig {
-                parameter_hints: true,
-                type_hints: false,
-                chaining_hints: false,
-                max_length: None,
-            },
-            r#"
-fn foo(bar: i32, baz: String, qux: f32) {}
-
-fn main() {
-    let bar = 3;
-    let baz = &"baz";
-    let fez = 1.0;
-    foo(bar.clone(), baz.clone(), fez.clone());
-                                //^^^^^^^^^^^ qux
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn infer_call_method_return_associated_types_with_generic() {
-        check(
-            r#"
-            pub trait Default {
-                fn default() -> Self;
-            }
-            pub trait Foo {
-                type Bar: Default;
-            }
-
-            pub fn quux<T: Foo>() -> T::Bar {
-                let y = Default::default();
-                  //^ <T as Foo>::Bar
-
-                y
-            }
-            "#,
-        );
-    }
-
-    #[test]
-    fn self_param_hints() {
-        check(
-            r#"
-struct Foo;
-
-impl Foo {
-    fn foo(self: Self) {}
-    fn bar(self: &Self) {}
-}
-
-fn main() {
-    Foo::foo(Foo);
-           //^^^ self
-    Foo::bar(&Foo);
-           //^^^^ self
-}
-"#,
-        )
-    }
-
-    #[test]
-    fn fn_hints() {
-        check(
-            r#"
-trait Sized {}
-
-fn foo() -> impl Fn() { loop {} }
-fn foo1() -> impl Fn(f64) { loop {} }
-fn foo2() -> impl Fn(f64, f64) { loop {} }
-fn foo3() -> impl Fn(f64, f64) -> u32 { loop {} }
-fn foo4() -> &'static dyn Fn(f64, f64) -> u32 { loop {} }
-fn foo5() -> &'static dyn Fn(&'static dyn Fn(f64, f64) -> u32, f64) -> u32 { loop {} }
-fn foo6() -> impl Fn(f64, f64) -> u32 + Sized { loop {} }
-fn foo7() -> *const (impl Fn(f64, f64) -> u32 + Sized) { loop {} }
-
-fn main() {
-    let foo = foo();
-     // ^^^ impl Fn()
-    let foo = foo1();
-     // ^^^ impl Fn(f64)
-    let foo = foo2();
-     // ^^^ impl Fn(f64, f64)
-    let foo = foo3();
-     // ^^^ impl Fn(f64, f64) -> u32
-    let foo = foo4();
-     // ^^^ &dyn Fn(f64, f64) -> u32
-    let foo = foo5();
-     // ^^^ &dyn Fn(&dyn Fn(f64, f64) -> u32, f64) -> u32
-    let foo = foo6();
-     // ^^^ impl Fn(f64, f64) -> u32 + Sized
-    let foo = foo7();
-     // ^^^ *const (impl Fn(f64, f64) -> u32 + Sized)
-}
-"#,
-        )
-    }
-
-    #[test]
-    fn param_name_hints_show_for_literals() {
-        check(
-            r#"pub fn test(a: i32, b: i32) -> [i32; 2] { [a, b] }
-fn main() {
-    test(
-        0x0fab272b,
-      //^^^^^^^^^^ a
-        0x0fab272b
-      //^^^^^^^^^^ b
-    );
-}"#,
-        )
     }
 }

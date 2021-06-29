@@ -435,11 +435,11 @@ fn processes_impls_generated_by_macros() {
 macro_rules! m {
     ($ident:ident) => (impl Trait for $ident {})
 }
-trait Trait { fn foo(self) -> u128 {} }
+trait Trait { fn foo(self) -> u128 { 0 } }
 struct S;
 m!(S);
 fn test() { S.foo(); }
-                //^ u128
+          //^^^^^^^ u128
 "#,
     );
 }
@@ -457,7 +457,7 @@ impl S {
 }
 
 fn test() { S.foo(); }
-                //^ u128
+          //^^^^^^^ u128
 "#,
     );
 }
@@ -479,7 +479,7 @@ impl S {
 }
 
 fn test() { S.foo(); }
-                //^ u128
+          //^^^^^^^ u128
 "#,
     );
 }
@@ -743,12 +743,30 @@ include!("foo.rs");
 
 fn main() {
     bar();
-}     //^ u32
+} //^^^^^ u32
 
 //- /foo.rs
 fn bar() -> u32 {0}
 "#,
     );
+}
+
+#[test]
+fn infer_builtin_macros_include_expression() {
+    check_types(
+        r#"
+//- /main.rs
+#[rustc_builtin_macro]
+macro_rules! include {() => {}}
+fn main() {
+    let i = include!("bla.rs");
+    i;
+  //^ i32
+}
+//- /bla.rs
+0
+        "#,
+    )
 }
 
 #[test]
@@ -763,7 +781,7 @@ include!("f/foo.rs");
 
 fn main() {
     bar::bar();
-}          //^ u32
+} //^^^^^^^^^^ u32
 
 //- /f/foo.rs
 pub mod bar;
@@ -835,7 +853,7 @@ include!("foo.rs");
 
 fn main() {
     RegisterBlock { };
-                  //^ RegisterBlock
+  //^^^^^^^^^^^^^^^^^ RegisterBlock
 }
     "#;
     let fixture = format!("{}\n//- /foo.rs\n{}", fixture, data);
@@ -861,7 +879,7 @@ include!(concat!("f", "oo.rs"));
 
 fn main() {
     bar();
-}     //^ u32
+} //^^^^^ u32
 
 //- /foo.rs
 fn bar() -> u32 {0}
@@ -887,7 +905,7 @@ include!(concat!(env!("OUT_DIR"), "/foo.rs"));
 
 fn main() {
     bar();
-}     //^ {unknown}
+} //^^^^^ {unknown}
 
 //- /foo.rs
 fn bar() -> u32 {0}
@@ -905,7 +923,7 @@ macro_rules! include {() => {}}
 include!("main.rs");
 
 fn main() {
-            0
+    0;
 } //^ i32
 "#,
     );
@@ -961,17 +979,21 @@ fn infer_derive_clone_simple() {
 struct S;
 fn test() {
     S.clone();
-}         //^ S
+} //^^^^^^^^^ S
 
 //- /lib.rs crate:core
-#[prelude_import]
-use clone::*;
-mod clone {
-    trait Clone {
+pub mod prelude {
+    pub mod rust_2018 {
+        #[rustc_builtin_macro]
+        pub macro Clone {}
+        pub use crate::clone::Clone;
+    }
+}
+
+pub mod clone {
+    pub trait Clone {
         fn clone(&self) -> Self;
     }
-    #[rustc_builtin_macro]
-    macro Clone {}
 }
 "#,
     );
@@ -983,14 +1005,22 @@ fn infer_derive_clone_in_core() {
         r#"
 //- /lib.rs crate:core
 #[prelude_import]
-use clone::*;
-mod clone {
-    trait Clone {
+use prelude::rust_2018::*;
+
+pub mod prelude {
+    pub mod rust_2018 {
+        #[rustc_builtin_macro]
+        pub macro Clone {}
+        pub use crate::clone::Clone;
+    }
+}
+
+pub mod clone {
+    pub trait Clone {
         fn clone(&self) -> Self;
     }
-    #[rustc_builtin_macro]
-    macro Clone {}
 }
+
 #[derive(Clone)]
 pub struct S;
 
@@ -998,7 +1028,7 @@ pub struct S;
 use core::S;
 fn test() {
     S.clone();
-}         //^ S
+} //^^^^^^^^^ S
 "#,
     );
 }
@@ -1014,19 +1044,24 @@ struct S;
 struct Wrapper<T>(T);
 struct NonClone;
 fn test() {
-    (Wrapper(S).clone(), Wrapper(NonClone).clone());
+    let x = (Wrapper(S).clone(), Wrapper(NonClone).clone());
+    x;
   //^ (Wrapper<S>, {unknown})
 }
 
 //- /lib.rs crate:core
-#[prelude_import]
-use clone::*;
-mod clone {
-    trait Clone {
+pub mod prelude {
+    pub mod rust_2018 {
+        #[rustc_builtin_macro]
+        pub macro Clone {}
+        pub use crate::clone::Clone;
+    }
+}
+
+pub mod clone {
+    pub trait Clone {
         fn clone(&self) -> Self;
     }
-    #[rustc_builtin_macro]
-    macro Clone {}
 }
 "#,
     );
@@ -1045,7 +1080,7 @@ struct S{}
 
 fn test() {
     S{};
-}   //^ S
+} //^^^ S
 "#,
     );
 }

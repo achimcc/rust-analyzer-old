@@ -10,7 +10,7 @@ use hir_def::{
 };
 use hir_expand::name::Name;
 
-use super::{BindingMode, Expectation, InferenceContext};
+use super::{BindingMode, Expectation, InferenceContext, TypeMismatch};
 use crate::{
     lower::lower_to_chalk_mutability, static_lifetime, Interner, Substitution, Ty, TyBuilder,
     TyExt, TyKind,
@@ -94,19 +94,27 @@ impl<'a> InferenceContext<'a> {
     pub(super) fn infer_pat(
         &mut self,
         pat: PatId,
-        mut expected: &Ty,
+        expected: &Ty,
         mut default_bm: BindingMode,
     ) -> Ty {
         let body = Arc::clone(&self.body); // avoid borrow checker problem
+        let mut expected = self.resolve_ty_shallow(expected);
 
         if is_non_ref_pat(&body, pat) {
+            let mut pat_adjustments = Vec::new();
             while let Some((inner, _lifetime, mutability)) = expected.as_reference() {
-                expected = inner;
+                pat_adjustments.push(expected.clone());
+                expected = self.resolve_ty_shallow(inner);
                 default_bm = match default_bm {
                     BindingMode::Move => BindingMode::Ref(mutability),
                     BindingMode::Ref(Mutability::Not) => BindingMode::Ref(Mutability::Not),
                     BindingMode::Ref(Mutability::Mut) => BindingMode::Ref(mutability),
                 }
+            }
+
+            if !pat_adjustments.is_empty() {
+                pat_adjustments.shrink_to_fit();
+                self.result.pat_adjustments.insert(pat, pat_adjustments);
             }
         } else if let Pat::Ref { .. } = &body[pat] {
             cov_mark::hit!(match_ergonomics_ref);
@@ -126,11 +134,12 @@ impl<'a> InferenceContext<'a> {
                     _ => &[],
                 };
 
-                let (pre, post) = match ellipsis {
-                    Some(idx) => args.split_at(idx),
-                    None => (&args[..], &[][..]),
+                let ((pre, post), n_uncovered_patterns) = match ellipsis {
+                    Some(idx) => {
+                        (args.split_at(idx), expectations.len().saturating_sub(args.len()))
+                    }
+                    None => ((&args[..], &[][..]), 0),
                 };
-                let n_uncovered_patterns = expectations.len().saturating_sub(args.len());
                 let err_ty = self.err_ty();
                 let mut expectations_iter =
                     expectations.iter().map(|a| a.assert_ty_ref(&Interner)).chain(repeat(&err_ty));
@@ -146,9 +155,9 @@ impl<'a> InferenceContext<'a> {
             }
             Pat::Or(ref pats) => {
                 if let Some((first_pat, rest)) = pats.split_first() {
-                    let ty = self.infer_pat(*first_pat, expected, default_bm);
+                    let ty = self.infer_pat(*first_pat, &expected, default_bm);
                     for pat in rest {
-                        self.infer_pat(*pat, expected, default_bm);
+                        self.infer_pat(*pat, &expected, default_bm);
                     }
                     ty
                 } else {
@@ -172,18 +181,18 @@ impl<'a> InferenceContext<'a> {
             Pat::TupleStruct { path: p, args: subpats, ellipsis } => self.infer_tuple_struct_pat(
                 p.as_deref(),
                 subpats,
-                expected,
+                &expected,
                 default_bm,
                 pat,
                 *ellipsis,
             ),
             Pat::Record { path: p, args: fields, ellipsis: _ } => {
-                self.infer_record_pat(p.as_deref(), fields, expected, default_bm, pat)
+                self.infer_record_pat(p.as_deref(), fields, &expected, default_bm, pat)
             }
             Pat::Path(path) => {
                 // FIXME use correct resolver for the surrounding expression
                 let resolver = self.resolver.clone();
-                self.infer_path(&resolver, &path, pat.into()).unwrap_or(self.err_ty())
+                self.infer_path(&resolver, path, pat.into()).unwrap_or_else(|| self.err_ty())
             }
             Pat::Bind { mode, name: _, subpat } => {
                 let mode = if mode == &BindingAnnotation::Unannotated {
@@ -192,9 +201,9 @@ impl<'a> InferenceContext<'a> {
                     BindingMode::convert(*mode)
                 };
                 let inner_ty = if let Some(subpat) = subpat {
-                    self.infer_pat(*subpat, expected, default_bm)
+                    self.infer_pat(*subpat, &expected, default_bm)
                 } else {
-                    expected.clone()
+                    expected
                 };
                 let inner_ty = self.insert_type_vars_shallow(inner_ty);
 
@@ -205,7 +214,6 @@ impl<'a> InferenceContext<'a> {
                     }
                     BindingMode::Move => inner_ty.clone(),
                 };
-                let bound_ty = self.resolve_ty_as_possible(bound_ty);
                 self.write_pat_ty(pat, bound_ty);
                 return inner_ty;
             }
@@ -264,10 +272,11 @@ impl<'a> InferenceContext<'a> {
         };
         // use a new type variable if we got error type here
         let ty = self.insert_type_vars_shallow(ty);
-        if !self.unify(&ty, expected) {
-            // FIXME record mismatch, we need to change the type of self.type_mismatches for that
+        if !self.unify(&ty, &expected) {
+            self.result
+                .type_mismatches
+                .insert(pat.into(), TypeMismatch { expected, actual: ty.clone() });
         }
-        let ty = self.resolve_ty_as_possible(ty);
         self.write_pat_ty(pat, ty.clone());
         ty
     }
@@ -288,6 +297,11 @@ fn is_non_ref_pat(body: &hir_def::body::Body, pat: PatId) -> bool {
             Expr::Literal(Literal::String(..)) => false,
             _ => true,
         },
+        Pat::Bind {
+            mode: BindingAnnotation::Mutable | BindingAnnotation::Unannotated,
+            subpat: Some(subpat),
+            ..
+        } => is_non_ref_pat(body, *subpat),
         Pat::Wild | Pat::Bind { .. } | Pat::Ref { .. } | Pat::Box { .. } | Pat::Missing => false,
     }
 }

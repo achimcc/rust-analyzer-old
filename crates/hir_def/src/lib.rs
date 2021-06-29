@@ -19,7 +19,6 @@ pub mod path;
 pub mod type_ref;
 pub mod builtin_type;
 pub mod builtin_attr;
-pub mod diagnostics;
 pub mod per_ns;
 pub mod item_scope;
 
@@ -56,25 +55,29 @@ use std::{
     sync::Arc,
 };
 
-use adt::VariantData;
+use attr::Attr;
 use base_db::{impl_intern_key, salsa, CrateId};
 use hir_expand::{
     ast_id_map::FileAstId,
     eager::{expand_eager_macro, ErrorEmitted, ErrorSink},
     hygiene::Hygiene,
-    AstId, AttrId, HirFileId, InFile, MacroCallId, MacroCallKind, MacroDefId, MacroDefKind,
+    AstId, FragmentKind, HirFileId, InFile, MacroCallId, MacroCallKind, MacroDefId, MacroDefKind,
 };
 use la_arena::Idx;
 use nameres::DefMap;
 use path::ModPath;
+use stdx::impl_from;
 use syntax::ast;
 
-use crate::builtin_type::BuiltinType;
-use item_tree::{
-    Const, Enum, Function, Impl, ItemTreeId, ItemTreeNode, ModItem, Static, Struct, Trait,
-    TypeAlias, Union,
+use crate::{
+    adt::VariantData,
+    attr::AttrId,
+    builtin_type::BuiltinType,
+    item_tree::{
+        Const, Enum, Function, Impl, ItemTreeId, ItemTreeNode, ModItem, Static, Struct, Trait,
+        TypeAlias, Union,
+    },
 };
-use stdx::impl_from;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ModuleId {
@@ -107,6 +110,10 @@ impl ModuleId {
 
     pub fn containing_module(&self, db: &dyn db::DefDatabase) -> Option<ModuleId> {
         self.def_map(db).containing_module(self.local_id)
+    }
+
+    pub fn containing_block(&self) -> Option<BlockId> {
+        self.block
     }
 
     /// Returns `true` if this module represents a block expression.
@@ -484,6 +491,14 @@ impl VariantId {
             VariantId::UnionId(it) => it.lookup(db).id.file_id(),
         }
     }
+
+    pub fn adt_id(self) -> AdtId {
+        match self {
+            VariantId::EnumVariantId(it) => it.parent.into(),
+            VariantId::StructId(it) => it.into(),
+            VariantId::UnionId(it) => it.into(),
+        }
+    }
 }
 
 trait Intern {
@@ -570,6 +585,18 @@ impl HasModule for GenericDefId {
     }
 }
 
+impl HasModule for TypeAliasId {
+    fn module(&self, db: &dyn db::DefDatabase) -> ModuleId {
+        self.lookup(db).module(db)
+    }
+}
+
+impl HasModule for TraitId {
+    fn module(&self, db: &dyn db::DefDatabase) -> ModuleId {
+        self.lookup(db).container
+    }
+}
+
 impl HasModule for StaticLoc {
     fn module(&self, _db: &dyn db::DefDatabase) -> ModuleId {
         self.container
@@ -652,9 +679,10 @@ impl AsMacroCall for InFile<&ast::MacroCall> {
         resolver: impl Fn(path::ModPath) -> Option<MacroDefId>,
         mut error_sink: &mut dyn FnMut(mbe::ExpandError),
     ) -> Result<Result<MacroCallId, ErrorEmitted>, UnresolvedMacro> {
+        let fragment = hir_expand::to_fragment_kind(self.value);
         let ast_id = AstId::new(self.file_id, db.ast_id_map(self.file_id).ast_id(self.value));
         let h = Hygiene::new(db.upcast(), self.file_id);
-        let path = self.value.path().and_then(|path| path::ModPath::from_src(path, &h));
+        let path = self.value.path().and_then(|path| path::ModPath::from_src(db, path, &h));
 
         let path = match error_sink
             .option(path, || mbe::ExpandError::Other("malformed macro invocation".into()))
@@ -667,6 +695,7 @@ impl AsMacroCall for InFile<&ast::MacroCall> {
 
         macro_call_as_call_id(
             &AstIdWithPath::new(ast_id.file_id, ast_id.value, path),
+            fragment,
             db,
             krate,
             resolver,
@@ -695,6 +724,7 @@ pub struct UnresolvedMacro {
 
 fn macro_call_as_call_id(
     call: &AstIdWithPath<ast::MacroCall>,
+    fragment: FragmentKind,
     db: &dyn db::DefDatabase,
     krate: CrateId,
     resolver: impl Fn(path::ModPath) -> Option<MacroDefId>,
@@ -712,14 +742,16 @@ fn macro_call_as_call_id(
             krate,
             macro_call,
             def,
-            &|path: ast::Path| resolver(path::ModPath::from_src(path, &hygiene)?),
+            &|path: ast::Path| resolver(path::ModPath::from_src(db, path, &hygiene)?),
             error_sink,
         )
         .map(MacroCallId::from)
     } else {
-        Ok(def
-            .as_lazy_macro(db.upcast(), krate, MacroCallKind::FnLike { ast_id: call.ast_id })
-            .into())
+        Ok(def.as_lazy_macro(
+            db.upcast(),
+            krate,
+            MacroCallKind::FnLike { ast_id: call.ast_id, fragment },
+        ))
     };
     Ok(res)
 }
@@ -738,16 +770,51 @@ fn derive_macro_as_call_id(
         .segments()
         .last()
         .ok_or_else(|| UnresolvedMacro { path: item_attr.path.clone() })?;
-    let res = def
-        .as_lazy_macro(
-            db.upcast(),
-            krate,
-            MacroCallKind::Derive {
-                ast_id: item_attr.ast_id,
-                derive_name: last_segment.to_string(),
-                derive_attr,
-            },
-        )
-        .into();
+    let res = def.as_lazy_macro(
+        db.upcast(),
+        krate,
+        MacroCallKind::Derive {
+            ast_id: item_attr.ast_id,
+            derive_name: last_segment.to_string(),
+            derive_attr_index: derive_attr.ast_index,
+        },
+    );
+    Ok(res)
+}
+
+fn attr_macro_as_call_id(
+    item_attr: &AstIdWithPath<ast::Item>,
+    macro_attr: &Attr,
+    db: &dyn db::DefDatabase,
+    krate: CrateId,
+    resolver: impl Fn(path::ModPath) -> Option<MacroDefId>,
+) -> Result<MacroCallId, UnresolvedMacro> {
+    let def: MacroDefId = resolver(item_attr.path.clone())
+        .ok_or_else(|| UnresolvedMacro { path: item_attr.path.clone() })?;
+    let last_segment = item_attr
+        .path
+        .segments()
+        .last()
+        .ok_or_else(|| UnresolvedMacro { path: item_attr.path.clone() })?;
+    let mut arg = match &macro_attr.input {
+        Some(input) => match &**input {
+            attr::AttrInput::Literal(_) => tt::Subtree::default(),
+            attr::AttrInput::TokenTree(tt) => tt.clone(),
+        },
+        None => tt::Subtree::default(),
+    };
+    // The parentheses are always disposed here.
+    arg.delimiter = None;
+
+    let res = def.as_lazy_macro(
+        db.upcast(),
+        krate,
+        MacroCallKind::Attr {
+            ast_id: item_attr.ast_id,
+            attr_name: last_segment.to_string(),
+            attr_args: arg,
+            invoc_attr_index: macro_attr.id.ast_index,
+        },
+    );
     Ok(res)
 }

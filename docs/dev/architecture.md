@@ -146,6 +146,8 @@ Reading the docs of the `base_db::input` module should be useful: everything els
 
 **Architecture Invariant:** particularities of the build system are *not* the part of the ground state.
 In particular, `base_db` knows nothing about cargo.
+For example, `cfg` flags are a part of `base_db`, but `feature`s are not.
+A `foo` feature is a Cargo-level concept, which is lowered by Cargo to `--cfg feature=foo` argument on the command line.
 The `CrateGraph` structure is used to represent the dependencies between the crates abstractly.
 
 **Architecture Invariant:** `base_db` doesn't know about file system and file paths.
@@ -426,7 +428,7 @@ Rather than spawning futures or scheduling callbacks (open), the event loop acce
 It's easy to see all the things that trigger rust-analyzer processing, together with their performance
 
 rust-analyzer includes a simple hierarchical profiler (`hprof`).
-It is enabled with `RA_PROFILE='*>50` env var (log all (`*`) actions which take more than `50` ms) and produces output like:
+It is enabled with `RA_PROFILE='*>50'` env var (log all (`*`) actions which take more than `50` ms) and produces output like:
 
 ```
 85ms - handle_completion
@@ -447,3 +449,9 @@ This is cheap enough to enable in production.
 
 Similarly, we save live object counting (`RA_COUNT=1`).
 It is not cheap enough to enable in prod, and this is a bug which should be fixed.
+
+### Configurability
+
+rust-analyzer strives to be as configurable as possible while offering reasonable defaults where no configuration exists yet.
+There will always be features that some people find more annoying than helpful, so giving the users the ability to tweak or disable these is a big part of offering a good user experience.
+Mind the code--architecture gap: at the moment, we are using fewer feature flags than we really should.

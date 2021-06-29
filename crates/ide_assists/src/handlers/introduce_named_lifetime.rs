@@ -84,19 +84,17 @@ fn generate_fn_def_assist(
         }
     };
     acc.add(AssistId(ASSIST_NAME, AssistKind::Refactor), ASSIST_LABEL, lifetime_loc, |builder| {
-        let fn_def = builder.make_ast_mut(fn_def);
-        let lifetime = builder.make_ast_mut(lifetime);
+        let fn_def = builder.make_mut(fn_def);
+        let lifetime = builder.make_mut(lifetime);
         let loc_needing_lifetime =
             loc_needing_lifetime.and_then(|it| it.make_mut(builder).to_position());
 
-        add_lifetime_param(fn_def.get_or_create_generic_param_list(), new_lifetime_param);
-        ted::replace(
-            lifetime.syntax(),
-            make_ast_lifetime(new_lifetime_param).clone_for_update().syntax(),
+        fn_def.get_or_create_generic_param_list().add_generic_param(
+            make::lifetime_param(new_lifetime_param.clone()).clone_for_update().into(),
         );
-        loc_needing_lifetime.map(|position| {
-            ted::insert(position, make_ast_lifetime(new_lifetime_param).clone_for_update().syntax())
-        });
+        ted::replace(lifetime.syntax(), new_lifetime_param.clone_for_update().syntax());
+        loc_needing_lifetime
+            .map(|position| ted::insert(position, new_lifetime_param.clone_for_update().syntax()));
     })
 }
 
@@ -109,14 +107,13 @@ fn generate_impl_def_assist(
 ) -> Option<()> {
     let new_lifetime_param = generate_unique_lifetime_param_name(impl_def.generic_param_list())?;
     acc.add(AssistId(ASSIST_NAME, AssistKind::Refactor), ASSIST_LABEL, lifetime_loc, |builder| {
-        let impl_def = builder.make_ast_mut(impl_def);
-        let lifetime = builder.make_ast_mut(lifetime);
+        let impl_def = builder.make_mut(impl_def);
+        let lifetime = builder.make_mut(lifetime);
 
-        add_lifetime_param(impl_def.get_or_create_generic_param_list(), new_lifetime_param);
-        ted::replace(
-            lifetime.syntax(),
-            make_ast_lifetime(new_lifetime_param).clone_for_update().syntax(),
+        impl_def.get_or_create_generic_param_list().add_generic_param(
+            make::lifetime_param(new_lifetime_param.clone()).clone_for_update().into(),
         );
+        ted::replace(lifetime.syntax(), new_lifetime_param.clone_for_update().syntax());
     })
 }
 
@@ -124,31 +121,16 @@ fn generate_impl_def_assist(
 /// which is not in the list
 fn generate_unique_lifetime_param_name(
     existing_type_param_list: Option<ast::GenericParamList>,
-) -> Option<char> {
+) -> Option<ast::Lifetime> {
     match existing_type_param_list {
         Some(type_params) => {
-            let used_lifetime_params: FxHashSet<_> = type_params
-                .lifetime_params()
-                .map(|p| p.syntax().text().to_string()[1..].to_owned())
-                .collect();
-            (b'a'..=b'z').map(char::from).find(|c| !used_lifetime_params.contains(&c.to_string()))
+            let used_lifetime_params: FxHashSet<_> =
+                type_params.lifetime_params().map(|p| p.syntax().text().to_string()).collect();
+            ('a'..='z').map(|it| format!("'{}", it)).find(|it| !used_lifetime_params.contains(it))
         }
-        None => Some('a'),
+        None => Some("'a".to_string()),
     }
-}
-
-fn add_lifetime_param(type_params: ast::GenericParamList, new_lifetime_param: char) {
-    let generic_param =
-        make::generic_param(format!("'{}", new_lifetime_param), None).clone_for_update();
-    type_params.add_generic_param(generic_param);
-}
-
-fn make_ast_lifetime(new_lifetime_param: char) -> ast::Lifetime {
-    make::generic_param(format!("'{}", new_lifetime_param), None)
-        .syntax()
-        .descendants()
-        .find_map(ast::Lifetime::cast)
-        .unwrap()
+    .map(|it| make::lifetime(&it))
 }
 
 enum NeedsLifetime {
@@ -159,8 +141,8 @@ enum NeedsLifetime {
 impl NeedsLifetime {
     fn make_mut(self, builder: &mut AssistBuilder) -> Self {
         match self {
-            Self::SelfParam(it) => Self::SelfParam(builder.make_ast_mut(it)),
-            Self::RefType(it) => Self::RefType(builder.make_ast_mut(it)),
+            Self::SelfParam(it) => Self::SelfParam(builder.make_mut(it)),
+            Self::RefType(it) => Self::RefType(builder.make_mut(it)),
         }
     }
 

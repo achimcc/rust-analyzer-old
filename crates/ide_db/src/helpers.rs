@@ -3,13 +3,17 @@ pub mod import_assets;
 pub mod insert_use;
 pub mod merge_imports;
 pub mod rust_doc;
+pub mod generated_lints;
 
 use std::collections::VecDeque;
 
 use base_db::FileId;
 use either::Either;
 use hir::{Crate, Enum, ItemInNs, MacroDef, Module, ModuleDef, Name, ScopeDef, Semantics, Trait};
-use syntax::ast::{self, make};
+use syntax::{
+    ast::{self, make, LoopBodyOwner},
+    AstNode, SyntaxKind, SyntaxToken, TokenAtOffset, WalkEvent,
+};
 
 use crate::RootDatabase;
 
@@ -19,6 +23,14 @@ pub fn item_name(db: &RootDatabase, item: ItemInNs) -> Option<Name> {
         ItemInNs::Values(module_def_id) => ModuleDef::from(module_def_id).name(db),
         ItemInNs::Macros(macro_def_id) => MacroDef::from(macro_def_id).name(db),
     }
+}
+
+/// Picks the token with the highest rank returned by the passed in function.
+pub fn pick_best_token(
+    tokens: TokenAtOffset<SyntaxToken>,
+    f: impl Fn(SyntaxKind) -> usize,
+) -> Option<SyntaxToken> {
+    tokens.max_by_key(move |t| f(t.kind()))
 }
 
 /// Converts the mod path struct into its ast representation.
@@ -73,12 +85,19 @@ pub fn visit_file_defs(
 /// somewhat similar to the known paths infra inside hir, but it different; We
 /// want to make sure that IDE specific paths don't become interesting inside
 /// the compiler itself as well.
+///
+/// Note that, by default, rust-analyzer tests **do not** include core or std
+/// libraries. If you are writing tests for functionality using [`FamousDefs`],
+/// you'd want to include [minicore](test_utils::MiniCore) declaration at the
+/// start of your tests:
+///
+/// ```
+/// //- minicore: iterator, ord, derive
+/// ```
 pub struct FamousDefs<'a, 'b>(pub &'a Semantics<'b, RootDatabase>, pub Option<Crate>);
 
 #[allow(non_snake_case)]
 impl FamousDefs<'_, '_> {
-    pub const FIXTURE: &'static str = include_str!("helpers/famous_defs_fixture.rs");
-
     pub fn std(&self) -> Option<Crate> {
         self.find_crate("std")
     }
@@ -182,6 +201,114 @@ impl SnippetCap {
             Some(SnippetCap { _private: () })
         } else {
             None
+        }
+    }
+}
+
+/// Calls `cb` on each expression inside `expr` that is at "tail position".
+pub fn for_each_tail_expr(expr: &ast::Expr, cb: &mut dyn FnMut(&ast::Expr)) {
+    match expr {
+        ast::Expr::BlockExpr(b) => {
+            if let Some(e) = b.tail_expr() {
+                for_each_tail_expr(&e, cb);
+            }
+        }
+        ast::Expr::EffectExpr(e) => match e.effect() {
+            ast::Effect::Label(label) => {
+                for_each_break_expr(Some(label), e.block_expr(), &mut |b| {
+                    cb(&ast::Expr::BreakExpr(b))
+                });
+                if let Some(b) = e.block_expr() {
+                    for_each_tail_expr(&ast::Expr::BlockExpr(b), cb);
+                }
+            }
+            ast::Effect::Unsafe(_) => {
+                if let Some(e) = e.block_expr().and_then(|b| b.tail_expr()) {
+                    for_each_tail_expr(&e, cb);
+                }
+            }
+            ast::Effect::Async(_) | ast::Effect::Try(_) | ast::Effect::Const(_) => cb(expr),
+        },
+        ast::Expr::IfExpr(if_) => {
+            if_.blocks().for_each(|block| for_each_tail_expr(&ast::Expr::BlockExpr(block), cb))
+        }
+        ast::Expr::LoopExpr(l) => {
+            for_each_break_expr(l.label(), l.loop_body(), &mut |b| cb(&ast::Expr::BreakExpr(b)))
+        }
+        ast::Expr::MatchExpr(m) => {
+            if let Some(arms) = m.match_arm_list() {
+                arms.arms().filter_map(|arm| arm.expr()).for_each(|e| for_each_tail_expr(&e, cb));
+            }
+        }
+        ast::Expr::ArrayExpr(_)
+        | ast::Expr::AwaitExpr(_)
+        | ast::Expr::BinExpr(_)
+        | ast::Expr::BoxExpr(_)
+        | ast::Expr::BreakExpr(_)
+        | ast::Expr::CallExpr(_)
+        | ast::Expr::CastExpr(_)
+        | ast::Expr::ClosureExpr(_)
+        | ast::Expr::ContinueExpr(_)
+        | ast::Expr::FieldExpr(_)
+        | ast::Expr::ForExpr(_)
+        | ast::Expr::IndexExpr(_)
+        | ast::Expr::Literal(_)
+        | ast::Expr::MacroCall(_)
+        | ast::Expr::MacroStmts(_)
+        | ast::Expr::MethodCallExpr(_)
+        | ast::Expr::ParenExpr(_)
+        | ast::Expr::PathExpr(_)
+        | ast::Expr::PrefixExpr(_)
+        | ast::Expr::RangeExpr(_)
+        | ast::Expr::RecordExpr(_)
+        | ast::Expr::RefExpr(_)
+        | ast::Expr::ReturnExpr(_)
+        | ast::Expr::TryExpr(_)
+        | ast::Expr::TupleExpr(_)
+        | ast::Expr::WhileExpr(_)
+        | ast::Expr::YieldExpr(_) => cb(expr),
+    }
+}
+
+/// Calls `cb` on each break expr inside of `body` that is applicable for the given label.
+pub fn for_each_break_expr(
+    label: Option<ast::Label>,
+    body: Option<ast::BlockExpr>,
+    cb: &mut dyn FnMut(ast::BreakExpr),
+) {
+    let label = label.and_then(|lbl| lbl.lifetime());
+    let mut depth = 0;
+    if let Some(b) = body {
+        let preorder = &mut b.syntax().preorder();
+        let ev_as_expr = |ev| match ev {
+            WalkEvent::Enter(it) => Some(WalkEvent::Enter(ast::Expr::cast(it)?)),
+            WalkEvent::Leave(it) => Some(WalkEvent::Leave(ast::Expr::cast(it)?)),
+        };
+        let eq_label = |lt: Option<ast::Lifetime>| {
+            lt.zip(label.as_ref()).map_or(false, |(lt, lbl)| lt.text() == lbl.text())
+        };
+        while let Some(node) = preorder.find_map(ev_as_expr) {
+            match node {
+                WalkEvent::Enter(expr) => match expr {
+                    ast::Expr::LoopExpr(_) | ast::Expr::WhileExpr(_) | ast::Expr::ForExpr(_) => {
+                        depth += 1
+                    }
+                    ast::Expr::EffectExpr(e) if e.label().is_some() => depth += 1,
+                    ast::Expr::BreakExpr(b)
+                        if (depth == 0 && b.lifetime().is_none()) || eq_label(b.lifetime()) =>
+                    {
+                        cb(b);
+                    }
+                    _ => (),
+                },
+                WalkEvent::Leave(expr) => match expr {
+                    ast::Expr::LoopExpr(_) | ast::Expr::WhileExpr(_) | ast::Expr::ForExpr(_) => {
+                        depth -= 1
+                    }
+                    ast::Expr::EffectExpr(e) if e.label().is_some() => depth -= 1,
+                    _ => (),
+                },
+            }
         }
     }
 }

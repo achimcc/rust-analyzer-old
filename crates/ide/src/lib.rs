@@ -24,31 +24,35 @@ mod display;
 
 mod annotations;
 mod call_hierarchy;
-mod diagnostics;
+mod doc_links;
+mod highlight_related;
 mod expand_macro;
 mod extend_selection;
 mod file_structure;
+mod fn_references;
 mod folding_ranges;
+mod goto_declaration;
 mod goto_definition;
 mod goto_implementation;
 mod goto_type_definition;
-mod view_hir;
 mod hover;
 mod inlay_hints;
 mod join_lines;
+mod markdown_remove;
 mod matching_brace;
 mod move_item;
 mod parent_module;
 mod references;
-mod fn_references;
+mod rename;
 mod runnables;
 mod ssr;
 mod status;
 mod syntax_highlighting;
 mod syntax_tree;
 mod typing;
-mod markdown_remove;
-mod doc_links;
+mod view_crate_graph;
+mod view_hir;
+mod view_item_tree;
 
 use std::sync::Arc;
 
@@ -56,7 +60,7 @@ use cfg::CfgOptions;
 
 use ide_db::base_db::{
     salsa::{self, ParallelDatabase},
-    CheckCanceled, Env, FileLoader, FileSet, SourceDatabase, VfsPath,
+    Env, FileLoader, FileSet, SourceDatabase, VfsPath,
 };
 use ide_db::{
     symbol_index::{self, FileSymbol},
@@ -69,17 +73,18 @@ use crate::display::ToNav;
 pub use crate::{
     annotations::{Annotation, AnnotationConfig, AnnotationKind},
     call_hierarchy::CallItem,
-    diagnostics::{Diagnostic, DiagnosticsConfig, Severity},
     display::navigation_target::NavigationTarget,
     expand_macro::ExpandedMacro,
     file_structure::{StructureNode, StructureNodeKind},
     folding_ranges::{Fold, FoldKind},
-    hover::{HoverAction, HoverConfig, HoverGotoTypeData, HoverResult},
+    highlight_related::HighlightedRange,
+    hover::{HoverAction, HoverConfig, HoverDocFormat, HoverGotoTypeData, HoverResult},
     inlay_hints::{InlayHint, InlayHintsConfig, InlayKind},
     markup::Markup,
     move_item::Direction,
     prime_caches::PrimeCachesProgress,
-    references::{rename::RenameError, ReferenceSearchResult},
+    references::ReferenceSearchResult,
+    rename::RenameError,
     runnables::{Runnable, RunnableKind, TestId},
     syntax_highlighting::{
         tags::{Highlight, HlMod, HlMods, HlOperator, HlPunct, HlTag},
@@ -87,14 +92,16 @@ pub use crate::{
     },
 };
 pub use hir::{Documentation, Semantics};
-pub use ide_assists::{Assist, AssistConfig, AssistId, AssistKind};
+pub use ide_assists::{
+    Assist, AssistConfig, AssistId, AssistKind, AssistResolveStrategy, SingleResolve,
+};
 pub use ide_completion::{
     CompletionConfig, CompletionItem, CompletionItemKind, CompletionRelevance, ImportEdit,
     InsertTextFormat,
 };
 pub use ide_db::{
     base_db::{
-        Canceled, Change, CrateGraph, CrateId, Edition, FileId, FilePosition, FileRange,
+        Cancelled, Change, CrateGraph, CrateId, Edition, FileId, FilePosition, FileRange,
         SourceRoot, SourceRootId,
     },
     call_info::CallInfo,
@@ -105,11 +112,12 @@ pub use ide_db::{
     symbol_index::Query,
     RootDatabase, SymbolKind,
 };
+pub use ide_diagnostics::{Diagnostic, DiagnosticsConfig, Severity};
 pub use ide_ssr::SsrError;
 pub use syntax::{TextRange, TextSize};
 pub use text_edit::{Indel, TextEdit};
 
-pub type Cancelable<T> = Result<T, Canceled>;
+pub type Cancellable<T> = Result<T, Cancelled>;
 
 /// Info associated with a text range.
 #[derive(Debug)]
@@ -212,6 +220,7 @@ impl Analysis {
             file_id,
             Edition::Edition2018,
             None,
+            cfg_options.clone(),
             cfg_options,
             Env::default(),
             Default::default(),
@@ -223,11 +232,11 @@ impl Analysis {
     }
 
     /// Debug info about the current state of the analysis.
-    pub fn status(&self, file_id: Option<FileId>) -> Cancelable<String> {
+    pub fn status(&self, file_id: Option<FileId>) -> Cancellable<String> {
         self.with_db(|db| status::status(&*db, file_id))
     }
 
-    pub fn prime_caches<F>(&self, cb: F) -> Cancelable<()>
+    pub fn prime_caches<F>(&self, cb: F) -> Cancellable<()>
     where
         F: Fn(PrimeCachesProgress) + Sync + std::panic::UnwindSafe,
     {
@@ -235,35 +244,35 @@ impl Analysis {
     }
 
     /// Gets the text of the source file.
-    pub fn file_text(&self, file_id: FileId) -> Cancelable<Arc<String>> {
+    pub fn file_text(&self, file_id: FileId) -> Cancellable<Arc<String>> {
         self.with_db(|db| db.file_text(file_id))
     }
 
     /// Gets the syntax tree of the file.
-    pub fn parse(&self, file_id: FileId) -> Cancelable<SourceFile> {
+    pub fn parse(&self, file_id: FileId) -> Cancellable<SourceFile> {
         self.with_db(|db| db.parse(file_id).tree())
     }
 
     /// Returns true if this file belongs to an immutable library.
-    pub fn is_library_file(&self, file_id: FileId) -> Cancelable<bool> {
+    pub fn is_library_file(&self, file_id: FileId) -> Cancellable<bool> {
         use ide_db::base_db::SourceDatabaseExt;
         self.with_db(|db| db.source_root(db.file_source_root(file_id)).is_library)
     }
 
     /// Gets the file's `LineIndex`: data structure to convert between absolute
     /// offsets and line/column representation.
-    pub fn file_line_index(&self, file_id: FileId) -> Cancelable<Arc<LineIndex>> {
+    pub fn file_line_index(&self, file_id: FileId) -> Cancellable<Arc<LineIndex>> {
         self.with_db(|db| db.line_index(file_id))
     }
 
     /// Selects the next syntactic nodes encompassing the range.
-    pub fn extend_selection(&self, frange: FileRange) -> Cancelable<TextRange> {
+    pub fn extend_selection(&self, frange: FileRange) -> Cancellable<TextRange> {
         self.with_db(|db| extend_selection::extend_selection(db, frange))
     }
 
     /// Returns position of the matching brace (all types of braces are
     /// supported).
-    pub fn matching_brace(&self, position: FilePosition) -> Cancelable<Option<TextSize>> {
+    pub fn matching_brace(&self, position: FilePosition) -> Cancellable<Option<TextSize>> {
         self.with_db(|db| {
             let parse = db.parse(position.file_id);
             let file = parse.tree();
@@ -277,21 +286,30 @@ impl Analysis {
         &self,
         file_id: FileId,
         text_range: Option<TextRange>,
-    ) -> Cancelable<String> {
-        self.with_db(|db| syntax_tree::syntax_tree(&db, file_id, text_range))
+    ) -> Cancellable<String> {
+        self.with_db(|db| syntax_tree::syntax_tree(db, file_id, text_range))
     }
 
-    pub fn view_hir(&self, position: FilePosition) -> Cancelable<String> {
-        self.with_db(|db| view_hir::view_hir(&db, position))
+    pub fn view_hir(&self, position: FilePosition) -> Cancellable<String> {
+        self.with_db(|db| view_hir::view_hir(db, position))
     }
 
-    pub fn expand_macro(&self, position: FilePosition) -> Cancelable<Option<ExpandedMacro>> {
+    pub fn view_item_tree(&self, file_id: FileId) -> Cancellable<String> {
+        self.with_db(|db| view_item_tree::view_item_tree(db, file_id))
+    }
+
+    /// Renders the crate graph to GraphViz "dot" syntax.
+    pub fn view_crate_graph(&self) -> Cancellable<Result<String, String>> {
+        self.with_db(|db| view_crate_graph::view_crate_graph(db))
+    }
+
+    pub fn expand_macro(&self, position: FilePosition) -> Cancellable<Option<ExpandedMacro>> {
         self.with_db(|db| expand_macro::expand_macro(db, position))
     }
 
     /// Returns an edit to remove all newlines in the range, cleaning up minor
     /// stuff like trailing commas.
-    pub fn join_lines(&self, frange: FileRange) -> Cancelable<TextEdit> {
+    pub fn join_lines(&self, frange: FileRange) -> Cancellable<TextEdit> {
         self.with_db(|db| {
             let parse = db.parse(frange.file_id);
             join_lines::join_lines(&parse.tree(), frange.range)
@@ -301,8 +319,8 @@ impl Analysis {
     /// Returns an edit which should be applied when opening a new line, fixing
     /// up minor stuff like continuing the comment.
     /// The edit will be a snippet (with `$0`).
-    pub fn on_enter(&self, position: FilePosition) -> Cancelable<Option<TextEdit>> {
-        self.with_db(|db| typing::on_enter(&db, position))
+    pub fn on_enter(&self, position: FilePosition) -> Cancellable<Option<TextEdit>> {
+        self.with_db(|db| typing::on_enter(db, position))
     }
 
     /// Returns an edit which should be applied after a character was typed.
@@ -313,17 +331,17 @@ impl Analysis {
         &self,
         position: FilePosition,
         char_typed: char,
-    ) -> Cancelable<Option<SourceChange>> {
+    ) -> Cancellable<Option<SourceChange>> {
         // Fast path to not even parse the file.
         if !typing::TRIGGER_CHARS.contains(char_typed) {
             return Ok(None);
         }
-        self.with_db(|db| typing::on_char_typed(&db, position, char_typed))
+        self.with_db(|db| typing::on_char_typed(db, position, char_typed))
     }
 
     /// Returns a tree representation of symbols in the file. Useful to draw a
     /// file outline.
-    pub fn file_structure(&self, file_id: FileId) -> Cancelable<Vec<StructureNode>> {
+    pub fn file_structure(&self, file_id: FileId) -> Cancellable<Vec<StructureNode>> {
         self.with_db(|db| file_structure::file_structure(&db.parse(file_id).tree()))
     }
 
@@ -332,17 +350,17 @@ impl Analysis {
         &self,
         file_id: FileId,
         config: &InlayHintsConfig,
-    ) -> Cancelable<Vec<InlayHint>> {
+    ) -> Cancellable<Vec<InlayHint>> {
         self.with_db(|db| inlay_hints::inlay_hints(db, file_id, config))
     }
 
     /// Returns the set of folding ranges.
-    pub fn folding_ranges(&self, file_id: FileId) -> Cancelable<Vec<Fold>> {
+    pub fn folding_ranges(&self, file_id: FileId) -> Cancellable<Vec<Fold>> {
         self.with_db(|db| folding_ranges::folding_ranges(&db.parse(file_id).tree()))
     }
 
     /// Fuzzy searches for a symbol.
-    pub fn symbol_search(&self, query: Query) -> Cancelable<Vec<NavigationTarget>> {
+    pub fn symbol_search(&self, query: Query) -> Cancellable<Vec<NavigationTarget>> {
         self.with_db(|db| {
             symbol_index::world_symbols(db, query)
                 .into_iter()
@@ -355,15 +373,23 @@ impl Analysis {
     pub fn goto_definition(
         &self,
         position: FilePosition,
-    ) -> Cancelable<Option<RangeInfo<Vec<NavigationTarget>>>> {
+    ) -> Cancellable<Option<RangeInfo<Vec<NavigationTarget>>>> {
         self.with_db(|db| goto_definition::goto_definition(db, position))
+    }
+
+    /// Returns the declaration from the symbol at `position`.
+    pub fn goto_declaration(
+        &self,
+        position: FilePosition,
+    ) -> Cancellable<Option<RangeInfo<Vec<NavigationTarget>>>> {
+        self.with_db(|db| goto_declaration::goto_declaration(db, position))
     }
 
     /// Returns the impls from the symbol at `position`.
     pub fn goto_implementation(
         &self,
         position: FilePosition,
-    ) -> Cancelable<Option<RangeInfo<Vec<NavigationTarget>>>> {
+    ) -> Cancellable<Option<RangeInfo<Vec<NavigationTarget>>>> {
         self.with_db(|db| goto_implementation::goto_implementation(db, position))
     }
 
@@ -371,7 +397,7 @@ impl Analysis {
     pub fn goto_type_definition(
         &self,
         position: FilePosition,
-    ) -> Cancelable<Option<RangeInfo<Vec<NavigationTarget>>>> {
+    ) -> Cancellable<Option<RangeInfo<Vec<NavigationTarget>>>> {
         self.with_db(|db| goto_type_definition::goto_type_definition(db, position))
     }
 
@@ -380,12 +406,12 @@ impl Analysis {
         &self,
         position: FilePosition,
         search_scope: Option<SearchScope>,
-    ) -> Cancelable<Option<ReferenceSearchResult>> {
+    ) -> Cancellable<Option<ReferenceSearchResult>> {
         self.with_db(|db| references::find_all_refs(&Semantics::new(db), position, search_scope))
     }
 
     /// Finds all methods and free functions for the file. Does not return tests!
-    pub fn find_all_methods(&self, file_id: FileId) -> Cancelable<Vec<FileRange>> {
+    pub fn find_all_methods(&self, file_id: FileId) -> Cancellable<Vec<FileRange>> {
         self.with_db(|db| fn_references::find_all_methods(db, file_id))
     }
 
@@ -393,22 +419,21 @@ impl Analysis {
     pub fn hover(
         &self,
         position: FilePosition,
-        links_in_hover: bool,
-        markdown: bool,
-    ) -> Cancelable<Option<RangeInfo<HoverResult>>> {
-        self.with_db(|db| hover::hover(db, position, links_in_hover, markdown))
+        config: &HoverConfig,
+    ) -> Cancellable<Option<RangeInfo<HoverResult>>> {
+        self.with_db(|db| hover::hover(db, position, config))
     }
 
     /// Return URL(s) for the documentation of the symbol under the cursor.
     pub fn external_docs(
         &self,
         position: FilePosition,
-    ) -> Cancelable<Option<doc_links::DocumentationLink>> {
+    ) -> Cancellable<Option<doc_links::DocumentationLink>> {
         self.with_db(|db| doc_links::external_docs(db, &position))
     }
 
     /// Computes parameter information for the given call expression.
-    pub fn call_info(&self, position: FilePosition) -> Cancelable<Option<CallInfo>> {
+    pub fn call_info(&self, position: FilePosition) -> Cancellable<Option<CallInfo>> {
         self.with_db(|db| ide_db::call_info::call_info(db, position))
     }
 
@@ -416,42 +441,42 @@ impl Analysis {
     pub fn call_hierarchy(
         &self,
         position: FilePosition,
-    ) -> Cancelable<Option<RangeInfo<Vec<NavigationTarget>>>> {
+    ) -> Cancellable<Option<RangeInfo<Vec<NavigationTarget>>>> {
         self.with_db(|db| call_hierarchy::call_hierarchy(db, position))
     }
 
     /// Computes incoming calls for the given file position.
-    pub fn incoming_calls(&self, position: FilePosition) -> Cancelable<Option<Vec<CallItem>>> {
+    pub fn incoming_calls(&self, position: FilePosition) -> Cancellable<Option<Vec<CallItem>>> {
         self.with_db(|db| call_hierarchy::incoming_calls(db, position))
     }
 
-    /// Computes incoming calls for the given file position.
-    pub fn outgoing_calls(&self, position: FilePosition) -> Cancelable<Option<Vec<CallItem>>> {
+    /// Computes outgoing calls for the given file position.
+    pub fn outgoing_calls(&self, position: FilePosition) -> Cancellable<Option<Vec<CallItem>>> {
         self.with_db(|db| call_hierarchy::outgoing_calls(db, position))
     }
 
     /// Returns a `mod name;` declaration which created the current module.
-    pub fn parent_module(&self, position: FilePosition) -> Cancelable<Vec<NavigationTarget>> {
+    pub fn parent_module(&self, position: FilePosition) -> Cancellable<Vec<NavigationTarget>> {
         self.with_db(|db| parent_module::parent_module(db, position))
     }
 
     /// Returns crates this file belongs too.
-    pub fn crate_for(&self, file_id: FileId) -> Cancelable<Vec<CrateId>> {
+    pub fn crate_for(&self, file_id: FileId) -> Cancellable<Vec<CrateId>> {
         self.with_db(|db| parent_module::crate_for(db, file_id))
     }
 
     /// Returns the edition of the given crate.
-    pub fn crate_edition(&self, crate_id: CrateId) -> Cancelable<Edition> {
+    pub fn crate_edition(&self, crate_id: CrateId) -> Cancellable<Edition> {
         self.with_db(|db| db.crate_graph()[crate_id].edition)
     }
 
     /// Returns the root file of the given crate.
-    pub fn crate_root(&self, crate_id: CrateId) -> Cancelable<FileId> {
+    pub fn crate_root(&self, crate_id: CrateId) -> Cancellable<FileId> {
         self.with_db(|db| db.crate_graph()[crate_id].root_file_id)
     }
 
     /// Returns the set of possible targets to run for the current file.
-    pub fn runnables(&self, file_id: FileId) -> Cancelable<Vec<Runnable>> {
+    pub fn runnables(&self, file_id: FileId) -> Cancellable<Vec<Runnable>> {
         self.with_db(|db| runnables::runnables(db, file_id))
     }
 
@@ -460,24 +485,32 @@ impl Analysis {
         &self,
         position: FilePosition,
         search_scope: Option<SearchScope>,
-    ) -> Cancelable<Vec<Runnable>> {
+    ) -> Cancellable<Vec<Runnable>> {
         self.with_db(|db| runnables::related_tests(db, position, search_scope))
     }
 
     /// Computes syntax highlighting for the given file
-    pub fn highlight(&self, file_id: FileId) -> Cancelable<Vec<HlRange>> {
+    pub fn highlight(&self, file_id: FileId) -> Cancellable<Vec<HlRange>> {
         self.with_db(|db| syntax_highlighting::highlight(db, file_id, None, false))
     }
 
+    /// Computes all ranges to highlight for a given item in a file.
+    pub fn highlight_related(
+        &self,
+        position: FilePosition,
+    ) -> Cancellable<Option<Vec<HighlightedRange>>> {
+        self.with_db(|db| highlight_related::highlight_related(&Semantics::new(db), position))
+    }
+
     /// Computes syntax highlighting for the given file range.
-    pub fn highlight_range(&self, frange: FileRange) -> Cancelable<Vec<HlRange>> {
+    pub fn highlight_range(&self, frange: FileRange) -> Cancellable<Vec<HlRange>> {
         self.with_db(|db| {
             syntax_highlighting::highlight(db, frange.file_id, Some(frange.range), false)
         })
     }
 
     /// Computes syntax highlighting for the given file.
-    pub fn highlight_as_html(&self, file_id: FileId, rainbow: bool) -> Cancelable<String> {
+    pub fn highlight_as_html(&self, file_id: FileId, rainbow: bool) -> Cancellable<String> {
         self.with_db(|db| syntax_highlighting::highlight_as_html(db, file_id, rainbow))
     }
 
@@ -486,7 +519,7 @@ impl Analysis {
         &self,
         config: &CompletionConfig,
         position: FilePosition,
-    ) -> Cancelable<Option<Vec<CompletionItem>>> {
+    ) -> Cancellable<Option<Vec<CompletionItem>>> {
         self.with_db(|db| ide_completion::completions(db, config, position).map(Into::into))
     }
 
@@ -497,7 +530,7 @@ impl Analysis {
         position: FilePosition,
         full_import_path: &str,
         imported_name: String,
-    ) -> Cancelable<Vec<TextEdit>> {
+    ) -> Cancellable<Vec<TextEdit>> {
         Ok(self
             .with_db(|db| {
                 ide_completion::resolve_completion_edits(
@@ -518,12 +551,13 @@ impl Analysis {
     pub fn assists(
         &self,
         config: &AssistConfig,
-        resolve: bool,
+        resolve: AssistResolveStrategy,
         frange: FileRange,
-    ) -> Cancelable<Vec<Assist>> {
+    ) -> Cancellable<Vec<Assist>> {
         self.with_db(|db| {
-            let mut acc = Assist::get(db, config, resolve, frange);
-            ssr::add_ssr_assist(db, &mut acc, resolve, frange);
+            let ssr_assists = ssr::ssr_assists(db, &resolve, frange);
+            let mut acc = ide_assists::assists(db, config, resolve, frange);
+            acc.extend(ssr_assists.into_iter());
             acc
         })
     }
@@ -532,10 +566,10 @@ impl Analysis {
     pub fn diagnostics(
         &self,
         config: &DiagnosticsConfig,
-        resolve: bool,
+        resolve: AssistResolveStrategy,
         file_id: FileId,
-    ) -> Cancelable<Vec<Diagnostic>> {
-        self.with_db(|db| diagnostics::diagnostics(db, config, resolve, file_id))
+    ) -> Cancellable<Vec<Diagnostic>> {
+        self.with_db(|db| ide_diagnostics::diagnostics(db, config, &resolve, file_id))
     }
 
     /// Convenience function to return assists + quick fixes for diagnostics
@@ -543,26 +577,31 @@ impl Analysis {
         &self,
         assist_config: &AssistConfig,
         diagnostics_config: &DiagnosticsConfig,
-        resolve: bool,
+        resolve: AssistResolveStrategy,
         frange: FileRange,
-    ) -> Cancelable<Vec<Assist>> {
+    ) -> Cancellable<Vec<Assist>> {
         let include_fixes = match &assist_config.allowed {
             Some(it) => it.iter().any(|&it| it == AssistKind::None || it == AssistKind::QuickFix),
             None => true,
         };
 
         self.with_db(|db| {
-            let mut res = Assist::get(db, assist_config, resolve, frange);
-            ssr::add_ssr_assist(db, &mut res, resolve, frange);
+            let diagnostic_assists = if include_fixes {
+                ide_diagnostics::diagnostics(db, diagnostics_config, &resolve, frange.file_id)
+                    .into_iter()
+                    .flat_map(|it| it.fixes.unwrap_or_default())
+                    .filter(|it| it.target.intersect(frange.range).is_some())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let ssr_assists = ssr::ssr_assists(db, &resolve, frange);
+            let assists = ide_assists::assists(db, assist_config, resolve, frange);
 
-            if include_fixes {
-                res.extend(
-                    diagnostics::diagnostics(db, diagnostics_config, resolve, frange.file_id)
-                        .into_iter()
-                        .filter_map(|it| it.fix)
-                        .filter(|it| it.target.intersect(frange.range).is_some()),
-                );
-            }
+            let mut res = diagnostic_assists;
+            res.extend(ssr_assists.into_iter());
+            res.extend(assists.into_iter());
+
             res
         })
     }
@@ -573,23 +612,23 @@ impl Analysis {
         &self,
         position: FilePosition,
         new_name: &str,
-    ) -> Cancelable<Result<SourceChange, RenameError>> {
-        self.with_db(|db| references::rename::rename(db, position, new_name))
+    ) -> Cancellable<Result<SourceChange, RenameError>> {
+        self.with_db(|db| rename::rename(db, position, new_name))
     }
 
     pub fn prepare_rename(
         &self,
         position: FilePosition,
-    ) -> Cancelable<Result<RangeInfo<()>, RenameError>> {
-        self.with_db(|db| references::rename::prepare_rename(db, position))
+    ) -> Cancellable<Result<RangeInfo<()>, RenameError>> {
+        self.with_db(|db| rename::prepare_rename(db, position))
     }
 
     pub fn will_rename_file(
         &self,
         file_id: FileId,
         new_name_stem: &str,
-    ) -> Cancelable<Option<SourceChange>> {
-        self.with_db(|db| references::rename::will_rename_file(db, file_id, new_name_stem))
+    ) -> Cancellable<Option<SourceChange>> {
+        self.with_db(|db| rename::will_rename_file(db, file_id, new_name_stem))
     }
 
     pub fn structural_search_replace(
@@ -598,7 +637,7 @@ impl Analysis {
         parse_only: bool,
         resolve_context: FilePosition,
         selections: Vec<FileRange>,
-    ) -> Cancelable<Result<SourceChange, SsrError>> {
+    ) -> Cancellable<Result<SourceChange, SsrError>> {
         self.with_db(|db| {
             let rule: ide_ssr::SsrRule = query.parse()?;
             let mut match_finder =
@@ -613,11 +652,11 @@ impl Analysis {
         &self,
         file_id: FileId,
         config: AnnotationConfig,
-    ) -> Cancelable<Vec<Annotation>> {
+    ) -> Cancellable<Vec<Annotation>> {
         self.with_db(|db| annotations::annotations(db, file_id, config))
     }
 
-    pub fn resolve_annotation(&self, annotation: Annotation) -> Cancelable<Annotation> {
+    pub fn resolve_annotation(&self, annotation: Annotation) -> Cancellable<Annotation> {
         self.with_db(|db| annotations::resolve_annotation(db, annotation))
     }
 
@@ -625,16 +664,28 @@ impl Analysis {
         &self,
         range: FileRange,
         direction: Direction,
-    ) -> Cancelable<Option<TextEdit>> {
+    ) -> Cancellable<Option<TextEdit>> {
         self.with_db(|db| move_item::move_item(db, range, direction))
     }
 
-    /// Performs an operation on that may be Canceled.
-    fn with_db<F, T>(&self, f: F) -> Cancelable<T>
+    /// Performs an operation on the database that may be canceled.
+    ///
+    /// rust-analyzer needs to be able to answer semantic questions about the
+    /// code while the code is being modified. A common problem is that a
+    /// long-running query is being calculated when a new change arrives.
+    ///
+    /// We can't just apply the change immediately: this will cause the pending
+    /// query to see inconsistent state (it will observe an absence of
+    /// repeatable read). So what we do is we **cancel** all pending queries
+    /// before applying the change.
+    ///
+    /// Salsa implements cancelation by unwinding with a special value and
+    /// catching it on the API boundary.
+    fn with_db<F, T>(&self, f: F) -> Cancellable<T>
     where
         F: FnOnce(&RootDatabase) -> T + std::panic::UnwindSafe,
     {
-        self.db.catch_canceled(f)
+        Cancelled::catch(|| f(&self.db))
     }
 }
 

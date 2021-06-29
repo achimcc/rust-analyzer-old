@@ -17,22 +17,21 @@ use ide_db::ty_filter::TryEnum;
 
 // Assist: replace_unwrap_with_match
 //
-// Replaces `unwrap` a `match` expression. Works for Result and Option.
+// Replaces `unwrap` with a `match` expression. Works for Result and Option.
 //
 // ```
-// enum Result<T, E> { Ok(T), Err(E) }
+// # //- minicore: result
 // fn main() {
-//     let x: Result<i32, i32> = Result::Ok(92);
+//     let x: Result<i32, i32> = Ok(92);
 //     let y = x.$0unwrap();
 // }
 // ```
 // ->
 // ```
-// enum Result<T, E> { Ok(T), Err(E) }
 // fn main() {
-//     let x: Result<i32, i32> = Result::Ok(92);
+//     let x: Result<i32, i32> = Ok(92);
 //     let y = match x {
-//         Ok(a) => a,
+//         Ok(it) => it,
 //         $0_ => unreachable!(),
 //     };
 // }
@@ -52,16 +51,17 @@ pub(crate) fn replace_unwrap_with_match(acc: &mut Assists, ctx: &AssistContext) 
         "Replace unwrap with match",
         target,
         |builder| {
-            let ok_path = make::path_unqualified(make::path_segment(make::name_ref(happy_variant)));
-            let it = make::ident_pat(make::name("a")).into();
+            let ok_path = make::ext::ident_path(happy_variant);
+            let it = make::ident_pat(make::name("it")).into();
             let ok_tuple = make::tuple_struct_pat(ok_path, iter::once(it)).into();
 
-            let bind_path = make::path_unqualified(make::path_segment(make::name_ref("a")));
+            let bind_path = make::ext::ident_path("it");
             let ok_arm = make::match_arm(iter::once(ok_tuple), make::expr_path(bind_path));
 
-            let unreachable_call = make::expr_unreachable();
-            let err_arm =
-                make::match_arm(iter::once(make::wildcard_pat().into()), unreachable_call);
+            let err_arm = make::match_arm(
+                iter::once(make::wildcard_pat().into()),
+                make::ext::expr_unreachable(),
+            );
 
             let match_arm_list = make::match_arm_list(vec![ok_arm, err_arm]);
             let match_expr = make::expr_match(caller.clone(), match_arm_list)
@@ -96,25 +96,24 @@ mod tests {
     fn test_replace_result_unwrap_with_match() {
         check_assist(
             replace_unwrap_with_match,
-            r"
-enum Result<T, E> { Ok(T), Err(E) }
+            r#"
+//- minicore: result
 fn i<T>(a: T) -> T { a }
 fn main() {
-    let x: Result<i32, i32> = Result::Ok(92);
+    let x: Result<i32, i32> = Ok(92);
     let y = i(x).$0unwrap();
 }
-            ",
-            r"
-enum Result<T, E> { Ok(T), Err(E) }
+"#,
+            r#"
 fn i<T>(a: T) -> T { a }
 fn main() {
-    let x: Result<i32, i32> = Result::Ok(92);
+    let x: Result<i32, i32> = Ok(92);
     let y = match i(x) {
-        Ok(a) => a,
+        Ok(it) => it,
         $0_ => unreachable!(),
     };
 }
-            ",
+"#,
         )
     }
 
@@ -122,25 +121,24 @@ fn main() {
     fn test_replace_option_unwrap_with_match() {
         check_assist(
             replace_unwrap_with_match,
-            r"
-enum Option<T> { Some(T), None }
+            r#"
+//- minicore: option
 fn i<T>(a: T) -> T { a }
 fn main() {
-    let x = Option::Some(92);
+    let x = Some(92);
     let y = i(x).$0unwrap();
 }
-            ",
-            r"
-enum Option<T> { Some(T), None }
+"#,
+            r#"
 fn i<T>(a: T) -> T { a }
 fn main() {
-    let x = Option::Some(92);
+    let x = Some(92);
     let y = match i(x) {
-        Some(a) => a,
+        Some(it) => it,
         $0_ => unreachable!(),
     };
 }
-            ",
+"#,
         );
     }
 
@@ -148,25 +146,24 @@ fn main() {
     fn test_replace_result_unwrap_with_match_chaining() {
         check_assist(
             replace_unwrap_with_match,
-            r"
-enum Result<T, E> { Ok(T), Err(E) }
+            r#"
+//- minicore: result
 fn i<T>(a: T) -> T { a }
 fn main() {
-    let x: Result<i32, i32> = Result::Ok(92);
+    let x: Result<i32, i32> = Ok(92);
     let y = i(x).$0unwrap().count_zeroes();
 }
-            ",
-            r"
-enum Result<T, E> { Ok(T), Err(E) }
+"#,
+            r#"
 fn i<T>(a: T) -> T { a }
 fn main() {
-    let x: Result<i32, i32> = Result::Ok(92);
+    let x: Result<i32, i32> = Ok(92);
     let y = match i(x) {
-        Ok(a) => a,
+        Ok(it) => it,
         $0_ => unreachable!(),
     }.count_zeroes();
 }
-            ",
+"#,
         )
     }
 
@@ -174,14 +171,14 @@ fn main() {
     fn replace_unwrap_with_match_target() {
         check_assist_target(
             replace_unwrap_with_match,
-            r"
-enum Option<T> { Some(T), None }
+            r#"
+//- minicore: option
 fn i<T>(a: T) -> T { a }
 fn main() {
-    let x = Option::Some(92);
+    let x = Some(92);
     let y = i(x).$0unwrap();
 }
-            ",
+"#,
             r"i(x).unwrap()",
         );
     }

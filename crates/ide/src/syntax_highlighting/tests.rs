@@ -10,6 +10,7 @@ use crate::{fixture, FileRange, HlTag, TextRange};
 fn test_highlighting() {
     check_highlighting(
         r#"
+//- /main.rs crate:main deps:foo
 use inner::{self as inner_mod};
 mod inner {}
 
@@ -39,11 +40,11 @@ struct Foo {
     pub y: i32,
 }
 
-trait Bar {
+trait Bar where Self: {
     fn bar(&self) -> i32;
 }
 
-impl Bar for Foo {
+impl Bar for Foo where Self: {
     fn bar(&self) -> i32 {
         self.x
     }
@@ -121,6 +122,10 @@ def_fn! {
     }
 }
 
+macro_rules! dont_color_me_braces {
+    () => {0}
+}
+
 macro_rules! noop {
     ($expr:expr) => {
         $expr
@@ -144,6 +149,7 @@ macro without_args {
 // comment
 fn main() {
     println!("Hello, {}!", 92);
+    dont_color_me_braces!();
 
     let mut vec = Vec::new();
     if true {
@@ -183,8 +189,8 @@ fn main() {
     let a = |x| x;
     let bar = Foo::baz;
 
-    let baz = -42;
-    let baz = -baz;
+    let baz = (-42,);
+    let baz = -baz.0;
 
     let _ = !true;
 
@@ -207,6 +213,71 @@ impl<T> Option<T> {
             Nope => Nope,
         }
     }
+}
+
+async fn learn_and_sing() {
+    let song = learn_song().await;
+    sing_song(song).await;
+}
+
+async fn async_main() {
+    let f1 = learn_and_sing();
+    let f2 = dance();
+    futures::join!(f1, f2);
+}
+
+unsafe trait Dangerous {}
+impl Dangerous for () {}
+
+fn use_foo_items() {
+    let bob = foo::Person {
+        name: "Bob",
+        age: foo::consts::NUMBER,
+    };
+
+    let control_flow = foo::identity(foo::ControlFlow::Continue);
+
+    if control_flow.should_die() {
+        foo::die!();
+    }
+}
+
+pub enum Bool { True, False }
+
+impl Bool {
+    pub const fn to_primitive(self) -> bool {
+        matches!(self, Self::True)
+    }
+}
+const USAGE_OF_BOOL:bool = Bool::True.to_primitive();
+
+//- /foo.rs crate:foo
+pub struct Person {
+    pub name: &'static str,
+    pub age: u8,
+}
+
+pub enum ControlFlow {
+    Continue,
+    Die,
+}
+
+impl ControlFlow {
+    pub fn should_die(self) -> bool {
+        matches!(self, ControlFlow::Die)
+    }
+}
+
+pub fn identity<T>(x: T) -> T { x }
+
+pub mod consts {
+    pub const NUMBER: i64 = 92;
+}
+
+macro_rules! die {
+    () => {
+        panic!();
+    };
 }
 "#
         .trim(),
@@ -327,7 +398,7 @@ struct Foo {
         .highlight_range(FileRange { file_id, range: TextRange::at(45.into(), 1.into()) })
         .unwrap();
 
-    assert_eq!(&highlights[0].highlight.to_string(), "field.declaration");
+    assert_eq!(&highlights[0].highlight.to_string(), "field.declaration.public");
 }
 
 #[test]
@@ -464,6 +535,11 @@ struct Packed {
     a: u16,
 }
 
+unsafe trait UnsafeTrait {}
+unsafe impl UnsafeTrait for Packed {}
+
+fn require_unsafe_trait<T: UnsafeTrait>(_: T) {}
+
 trait DoTheAutoref {
     fn calls_autoref(&self);
 }
@@ -513,6 +589,11 @@ fn main() {
 fn test_highlight_doc_comment() {
     check_highlighting(
         r#"
+//! This is a module to test doc injection.
+//! ```
+//! fn test() {}
+//! ```
+
 /// ```
 /// let _ = "early doctests should not go boom";
 /// ```
@@ -520,6 +601,13 @@ struct Foo {
     bar: bool,
 }
 
+/// This is an impl with a code block.
+///
+/// ```
+/// fn foo() {
+///
+/// }
+/// ```
 impl Foo {
     /// ```
     /// let _ = "Call me
@@ -618,6 +706,7 @@ It is beyond me why you'd use these when you got ///
 ```rust
 let _ = example(&[1, 2, 3]);
 ```
+[`block_comments2`] tests these with indentation
  */
 pub fn block_comments() {}
 
@@ -626,6 +715,7 @@ pub fn block_comments() {}
     ```rust
     let _ = example(&[1, 2, 3]);
     ```
+    [`block_comments`] tests these without indentation
 */
 pub fn block_comments2() {}
 "#

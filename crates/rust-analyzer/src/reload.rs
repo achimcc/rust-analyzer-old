@@ -2,6 +2,7 @@
 use std::{mem, sync::Arc};
 
 use flycheck::{FlycheckConfig, FlycheckHandle};
+use hir::db::DefDatabase;
 use ide::Change;
 use ide_db::base_db::{CrateGraph, SourceRoot, VfsPath};
 use project_model::{BuildDataCollector, BuildDataResult, ProcMacroClient, ProjectWorkspace};
@@ -47,6 +48,11 @@ impl GlobalState {
         } else if self.config.flycheck() != old_config.flycheck() {
             self.reload_flycheck();
         }
+
+        // Apply experimental feature flags.
+        self.analysis_host
+            .raw_database_mut()
+            .set_enable_proc_attr_macros(self.config.expand_proc_attr_macros());
     }
     pub(crate) fn maybe_refresh(&mut self, changes: &[(AbsPathBuf, ChangeKind)]) {
         if !changes.iter().any(|(path, kind)| is_interesting(path, *kind)) {
@@ -147,6 +153,7 @@ impl GlobalState {
 
         self.task_pool.handle.spawn_with_sender({
             let linked_projects = self.config.linked_projects();
+            let detached_files = self.config.detached_files().to_vec();
             let cargo_config = self.config.cargo();
 
             move |sender| {
@@ -161,7 +168,7 @@ impl GlobalState {
 
                 sender.send(Task::FetchWorkspace(ProjectWorkspaceProgress::Begin)).unwrap();
 
-                let workspaces = linked_projects
+                let mut workspaces = linked_projects
                     .iter()
                     .map(|project| match project {
                         LinkedProject::ProjectManifest(manifest) => {
@@ -179,6 +186,11 @@ impl GlobalState {
                         }
                     })
                     .collect::<Vec<_>>();
+
+                if !detached_files.is_empty() {
+                    workspaces
+                        .push(project_model::ProjectWorkspace::load_detached_files(detached_files));
+                }
 
                 log::info!("did fetch workspaces {:?}", workspaces);
                 sender
@@ -407,6 +419,7 @@ impl GlobalState {
                         _ => None,
                     }
                 }
+                ProjectWorkspace::DetachedFiles { .. } => None,
             })
             .map(|(id, root)| {
                 let sender = sender.clone();
@@ -448,7 +461,11 @@ impl ProjectFolders {
                 dirs.include.extend(root.include);
                 dirs.exclude.extend(root.exclude);
                 for excl in global_excludes {
-                    if dirs.include.iter().any(|incl| incl.starts_with(excl)) {
+                    if dirs
+                        .include
+                        .iter()
+                        .any(|incl| incl.starts_with(excl) || excl.starts_with(incl))
+                    {
                         dirs.exclude.push(excl.clone());
                     }
                 }

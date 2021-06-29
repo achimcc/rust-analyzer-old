@@ -15,7 +15,7 @@
 //!
 //! `hir` is what insulates the "we don't know how to actually write an incremental compiler"
 //! from the ide with completions, hovers, etc. It is a (soft, internal) boundary:
-//! https://www.tedinski.com/2018/02/06/system-boundaries.html.
+//! <https://www.tedinski.com/2018/02/06/system-boundaries.html>.
 
 #![recursion_limit = "512"]
 
@@ -38,22 +38,26 @@ use base_db::{CrateDisplayName, CrateId, Edition, FileId};
 use either::Either;
 use hir_def::{
     adt::{ReprKind, VariantData},
+    body::{BodyDiagnostic, SyntheticSyntax},
     expr::{BindingAnnotation, LabelId, Pat, PatId},
     item_tree::ItemTreeNode,
     lang_item::LangItemTarget,
+    nameres,
     per_ns::PerNs,
     resolver::{HasResolver, Resolver},
     src::HasSource as _,
-    type_ref::TraitRef,
     AdtId, AssocContainerId, AssocItemId, AssocItemLoc, AttrDefId, ConstId, ConstParamId,
     DefWithBodyId, EnumId, FunctionId, GenericDefId, HasModule, ImplId, LifetimeParamId,
     LocalEnumVariantId, LocalFieldId, Lookup, ModuleId, StaticId, StructId, TraitId, TypeAliasId,
     TypeParamId, UnionId,
 };
-use hir_expand::{diagnostics::DiagnosticSink, name::name, MacroDefKind};
+use hir_expand::{name::name, MacroCallKind, MacroDefId, MacroDefKind};
 use hir_ty::{
-    autoderef, could_unify,
-    method_resolution::{self, def_crates, TyFingerprint},
+    autoderef,
+    consteval::ConstExt,
+    could_unify,
+    diagnostics::BodyValidationDiagnostic,
+    method_resolution::{self, TyFingerprint},
     primitive::UintTy,
     subst_prefix,
     traits::FnTrait,
@@ -63,11 +67,13 @@ use hir_ty::{
     WhereClause,
 };
 use itertools::Itertools;
+use nameres::diagnostics::DefDiagnosticKind;
+use once_cell::unsync::Lazy;
 use rustc_hash::FxHashSet;
 use stdx::{format_to, impl_from};
 use syntax::{
     ast::{self, AttrsOwner, NameOwner},
-    AstNode, SmolStr,
+    AstNode, AstPtr, SmolStr, SyntaxKind, SyntaxNodePtr,
 };
 use tt::{Ident, Leaf, Literal, TokenTree};
 
@@ -75,6 +81,13 @@ use crate::db::{DefDatabase, HirDatabase};
 
 pub use crate::{
     attrs::{HasAttrs, Namespace},
+    diagnostics::{
+        AnyDiagnostic, BreakOutsideOfLoop, InactiveCode, IncorrectCase, MacroError,
+        MismatchedArgCount, MissingFields, MissingMatchArms, MissingOkOrSomeInTailExpr,
+        MissingUnsafe, NoSuchField, RemoveThisSemicolon, ReplaceFilterMapNextWithFindMap,
+        UnimplementedBuiltinMacro, UnresolvedExternCrate, UnresolvedImport, UnresolvedMacroCall,
+        UnresolvedModule, UnresolvedProcMacro,
+    },
     has_source::HasSource,
     semantics::{PathResolution, Semantics, SemanticsScope},
 };
@@ -89,13 +102,13 @@ pub use crate::{
 // Generally, a refactoring which *removes* a name from this list is a good
 // idea!
 pub use {
+    cfg::{CfgAtom, CfgExpr, CfgOptions},
     hir_def::{
         adt::StructKind,
         attr::{Attr, Attrs, AttrsWithOwner, Documentation},
-        body::scope::ExprScopes,
         find_path::PrefixKind,
         import_map,
-        item_scope::ItemInNs,
+        item_scope::ItemInNs, // FIXME: don't re-export ItemInNs, as it uses raw ids.
         nameres::ModuleSource,
         path::{ModPath, PathKind},
         type_ref::{Mutability, TypeRef},
@@ -103,8 +116,7 @@ pub use {
     },
     hir_expand::{
         name::{known, Name},
-        ExpandResult, HirFileId, InFile, MacroCallId, MacroCallLoc, /* FIXME */ MacroDefId,
-        MacroFile, Origin,
+        ExpandResult, HirFileId, InFile, MacroFile, Origin,
     },
     hir_ty::display::HirDisplay,
 };
@@ -181,6 +193,7 @@ impl Crate {
         db: &dyn DefDatabase,
         query: import_map::Query,
     ) -> impl Iterator<Item = Either<ModuleDef, MacroDef>> {
+        let _p = profile::span("query_external_importables");
         import_map::search_dependencies(db, self.into(), query).into_iter().map(|item| match item {
             ItemInNs::Types(mod_id) | ItemInNs::Values(mod_id) => Either::Left(mod_id.into()),
             ItemInNs::Macros(mac_id) => Either::Right(mac_id.into()),
@@ -204,8 +217,7 @@ impl Crate {
         let doc_url = doc_attr_q.tt_values().map(|tt| {
             let name = tt.token_trees.iter()
                 .skip_while(|tt| !matches!(tt, TokenTree::Leaf(Leaf::Ident(Ident{text: ref ident, ..})) if ident == "html_root_url"))
-                .skip(2)
-                .next();
+                .nth(2);
 
             match name {
                 Some(TokenTree::Leaf(Leaf::Literal(Literal{ref text, ..}))) => Some(text),
@@ -214,6 +226,14 @@ impl Crate {
         }).flatten().next();
 
         doc_url.map(|s| s.trim_matches('"').trim_end_matches('/').to_owned() + "/")
+    }
+
+    pub fn cfg(&self, db: &dyn HirDatabase) -> CfgOptions {
+        db.crate_graph()[self.id].cfg_options.clone()
+    }
+
+    pub fn potential_cfg(&self, db: &dyn HirDatabase) -> CfgOptions {
+        db.crate_graph()[self.id].potential_cfg_options.clone()
     }
 }
 
@@ -283,26 +303,6 @@ impl ModuleDef {
         Some(segments.join("::"))
     }
 
-    pub fn definition_visibility(&self, db: &dyn HirDatabase) -> Option<Visibility> {
-        let module = match self {
-            ModuleDef::Module(it) => it.parent(db)?,
-            ModuleDef::Function(it) => return Some(it.visibility(db)),
-            ModuleDef::Adt(it) => it.module(db),
-            ModuleDef::Variant(it) => {
-                let parent = it.parent_enum(db);
-                let module = it.module(db);
-                return module.visibility_of(db, &ModuleDef::Adt(Adt::Enum(parent)));
-            }
-            ModuleDef::Const(it) => return Some(it.visibility(db)),
-            ModuleDef::Static(it) => it.module(db),
-            ModuleDef::Trait(it) => it.module(db),
-            ModuleDef::TypeAlias(it) => return Some(it.visibility(db)),
-            ModuleDef::BuiltinType(_) => return None,
-        };
-
-        module.visibility_of(db, self)
-    }
-
     pub fn name(self, db: &dyn HirDatabase) -> Option<Name> {
         match self {
             ModuleDef::Adt(it) => Some(it.name(db)),
@@ -317,7 +317,7 @@ impl ModuleDef {
         }
     }
 
-    pub fn diagnostics(self, db: &dyn HirDatabase, sink: &mut DiagnosticSink) {
+    pub fn diagnostics(self, db: &dyn HirDatabase) -> Vec<AnyDiagnostic> {
         let id = match self {
             ModuleDef::Adt(it) => match it {
                 Adt::Struct(it) => it.id.into(),
@@ -330,15 +330,19 @@ impl ModuleDef {
             ModuleDef::Module(it) => it.id.into(),
             ModuleDef::Const(it) => it.id.into(),
             ModuleDef::Static(it) => it.id.into(),
-            _ => return,
+            _ => return Vec::new(),
         };
 
         let module = match self.module(db) {
             Some(it) => it,
-            None => return,
+            None => return Vec::new(),
         };
 
-        hir_ty::diagnostics::validate_module_item(db, module.id.krate(), id, sink)
+        let mut acc = Vec::new();
+        for diag in hir_ty::diagnostics::validate_module_item(db, module.id.krate(), id) {
+            acc.push(diag.into())
+        }
+        acc
     }
 }
 
@@ -427,34 +431,180 @@ impl Module {
     }
 
     pub fn visibility_of(self, db: &dyn HirDatabase, def: &ModuleDef) -> Option<Visibility> {
-        self.id.def_map(db.upcast())[self.id.local_id].scope.visibility_of(def.clone().into())
+        self.id.def_map(db.upcast())[self.id.local_id].scope.visibility_of((*def).into())
     }
 
-    pub fn diagnostics(self, db: &dyn HirDatabase, sink: &mut DiagnosticSink) {
+    pub fn diagnostics(self, db: &dyn HirDatabase, acc: &mut Vec<AnyDiagnostic>) {
         let _p = profile::span("Module::diagnostics").detail(|| {
             format!("{:?}", self.name(db).map_or("<unknown>".into(), |name| name.to_string()))
         });
         let def_map = self.id.def_map(db.upcast());
-        def_map.add_diagnostics(db.upcast(), self.id.local_id, sink);
+        for diag in def_map.diagnostics() {
+            if diag.in_module != self.id.local_id {
+                // FIXME: This is accidentally quadratic.
+                continue;
+            }
+            match &diag.kind {
+                DefDiagnosticKind::UnresolvedModule { ast: declaration, candidate } => {
+                    let decl = declaration.to_node(db.upcast());
+                    acc.push(
+                        UnresolvedModule {
+                            decl: InFile::new(declaration.file_id, AstPtr::new(&decl)),
+                            candidate: candidate.clone(),
+                        }
+                        .into(),
+                    )
+                }
+                DefDiagnosticKind::UnresolvedExternCrate { ast } => {
+                    let item = ast.to_node(db.upcast());
+                    acc.push(
+                        UnresolvedExternCrate {
+                            decl: InFile::new(ast.file_id, AstPtr::new(&item)),
+                        }
+                        .into(),
+                    );
+                }
+
+                DefDiagnosticKind::UnresolvedImport { id, index } => {
+                    let file_id = id.file_id();
+                    let item_tree = id.item_tree(db.upcast());
+                    let import = &item_tree[id.value];
+
+                    let use_tree = import.use_tree_to_ast(db.upcast(), file_id, *index);
+                    acc.push(
+                        UnresolvedImport { decl: InFile::new(file_id, AstPtr::new(&use_tree)) }
+                            .into(),
+                    );
+                }
+
+                DefDiagnosticKind::UnconfiguredCode { ast, cfg, opts } => {
+                    let item = ast.to_node(db.upcast());
+                    acc.push(
+                        InactiveCode {
+                            node: ast.with_value(AstPtr::new(&item).into()),
+                            cfg: cfg.clone(),
+                            opts: opts.clone(),
+                        }
+                        .into(),
+                    );
+                }
+
+                DefDiagnosticKind::UnresolvedProcMacro { ast } => {
+                    let mut precise_location = None;
+                    let (node, name) = match ast {
+                        MacroCallKind::FnLike { ast_id, .. } => {
+                            let node = ast_id.to_node(db.upcast());
+                            (ast_id.with_value(SyntaxNodePtr::from(AstPtr::new(&node))), None)
+                        }
+                        MacroCallKind::Derive { ast_id, derive_name, .. } => {
+                            let node = ast_id.to_node(db.upcast());
+
+                            // Compute the precise location of the macro name's token in the derive
+                            // list.
+                            // FIXME: This does not handle paths to the macro, but neither does the
+                            // rest of r-a.
+                            let derive_attrs =
+                                node.attrs().filter_map(|attr| match attr.as_simple_call() {
+                                    Some((name, args)) if name == "derive" => Some(args),
+                                    _ => None,
+                                });
+                            'outer: for attr in derive_attrs {
+                                let tokens =
+                                    attr.syntax().children_with_tokens().filter_map(|elem| {
+                                        match elem {
+                                            syntax::NodeOrToken::Node(_) => None,
+                                            syntax::NodeOrToken::Token(tok) => Some(tok),
+                                        }
+                                    });
+                                for token in tokens {
+                                    if token.kind() == SyntaxKind::IDENT
+                                        && token.text() == derive_name.as_str()
+                                    {
+                                        precise_location = Some(token.text_range());
+                                        break 'outer;
+                                    }
+                                }
+                            }
+
+                            (
+                                ast_id.with_value(SyntaxNodePtr::from(AstPtr::new(&node))),
+                                Some(derive_name.clone()),
+                            )
+                        }
+                        MacroCallKind::Attr { ast_id, invoc_attr_index, attr_name, .. } => {
+                            let node = ast_id.to_node(db.upcast());
+                            let attr =
+                                node.attrs().nth((*invoc_attr_index) as usize).unwrap_or_else(
+                                    || panic!("cannot find attribute #{}", invoc_attr_index),
+                                );
+                            (
+                                ast_id.with_value(SyntaxNodePtr::from(AstPtr::new(&attr))),
+                                Some(attr_name.clone()),
+                            )
+                        }
+                    };
+                    acc.push(
+                        UnresolvedProcMacro { node, precise_location, macro_name: name }.into(),
+                    );
+                }
+
+                DefDiagnosticKind::UnresolvedMacroCall { ast, path } => {
+                    let node = ast.to_node(db.upcast());
+                    acc.push(
+                        UnresolvedMacroCall {
+                            macro_call: InFile::new(ast.file_id, AstPtr::new(&node)),
+                            path: path.clone(),
+                        }
+                        .into(),
+                    );
+                }
+
+                DefDiagnosticKind::MacroError { ast, message } => {
+                    let node = match ast {
+                        MacroCallKind::FnLike { ast_id, .. } => {
+                            let node = ast_id.to_node(db.upcast());
+                            ast_id.with_value(SyntaxNodePtr::from(AstPtr::new(&node)))
+                        }
+                        MacroCallKind::Derive { ast_id, .. }
+                        | MacroCallKind::Attr { ast_id, .. } => {
+                            // FIXME: point to the attribute instead, this creates very large diagnostics
+                            let node = ast_id.to_node(db.upcast());
+                            ast_id.with_value(SyntaxNodePtr::from(AstPtr::new(&node)))
+                        }
+                    };
+                    acc.push(MacroError { node, message: message.clone() }.into());
+                }
+
+                DefDiagnosticKind::UnimplementedBuiltinMacro { ast } => {
+                    let node = ast.to_node(db.upcast());
+                    // Must have a name, otherwise we wouldn't emit it.
+                    let name = node.name().expect("unimplemented builtin macro with no name");
+                    acc.push(
+                        UnimplementedBuiltinMacro {
+                            node: ast.with_value(SyntaxNodePtr::from(AstPtr::new(&name))),
+                        }
+                        .into(),
+                    );
+                }
+            }
+        }
         for decl in self.declarations(db) {
             match decl {
-                crate::ModuleDef::Function(f) => f.diagnostics(db, sink),
-                crate::ModuleDef::Module(m) => {
+                ModuleDef::Function(f) => f.diagnostics(db, acc),
+                ModuleDef::Module(m) => {
                     // Only add diagnostics from inline modules
                     if def_map[m.id.local_id].origin.is_inline() {
-                        m.diagnostics(db, sink)
+                        m.diagnostics(db, acc)
                     }
                 }
-                _ => {
-                    decl.diagnostics(db, sink);
-                }
+                _ => acc.extend(decl.diagnostics(db)),
             }
         }
 
         for impl_def in self.impl_defs(db) {
             for item in impl_def.items(db) {
                 if let AssocItem::Function(f) = item {
-                    f.diagnostics(db, sink);
+                    f.diagnostics(db, acc);
                 }
             }
         }
@@ -506,9 +656,8 @@ impl Field {
     }
 
     /// Returns the type as in the signature of the struct (i.e., with
-    /// placeholder types for type parameters). This is good for showing
-    /// signature help, but not so good to actually get the type of the field
-    /// when you actually have a variable of the struct.
+    /// placeholder types for type parameters). Only use this in the context of
+    /// the field definition.
     pub fn ty(&self, db: &dyn HirDatabase) -> Type {
         let var_id = self.parent.into();
         let generic_def_id: GenericDefId = match self.parent {
@@ -543,10 +692,6 @@ pub struct Struct {
 impl Struct {
     pub fn module(self, db: &dyn HirDatabase) -> Module {
         Module { id: self.id.lookup(db.upcast()).container }
-    }
-
-    pub fn krate(self, db: &dyn HirDatabase) -> Option<Crate> {
-        Some(self.module(db).krate())
     }
 
     pub fn name(self, db: &dyn HirDatabase) -> Name {
@@ -633,10 +778,6 @@ impl Enum {
         Module { id: self.id.lookup(db.upcast()).container }
     }
 
-    pub fn krate(self, db: &dyn HirDatabase) -> Option<Crate> {
-        Some(self.module(db).krate())
-    }
-
     pub fn name(self, db: &dyn HirDatabase) -> Name {
         db.enum_data(self.id).name.clone()
     }
@@ -666,6 +807,7 @@ impl Variant {
     pub fn module(self, db: &dyn HirDatabase) -> Module {
         self.parent.module(db)
     }
+
     pub fn parent_enum(self, _db: &dyn HirDatabase) -> Enum {
         self.parent
     }
@@ -722,15 +864,21 @@ impl Adt {
         }
     }
 
-    pub fn krate(self, db: &dyn HirDatabase) -> Crate {
-        self.module(db).krate()
-    }
-
     pub fn name(self, db: &dyn HirDatabase) -> Name {
         match self {
             Adt::Struct(s) => s.name(db),
             Adt::Union(u) => u.name(db),
             Adt::Enum(e) => e.name(db),
+        }
+    }
+}
+
+impl HasVisibility for Adt {
+    fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
+        match self {
+            Adt::Struct(it) => it.visibility(db),
+            Adt::Union(it) => it.visibility(db),
+            Adt::Enum(it) => it.visibility(db),
         }
     }
 }
@@ -814,10 +962,6 @@ impl Function {
         self.id.lookup(db.upcast()).module(db.upcast()).into()
     }
 
-    pub fn krate(self, db: &dyn HirDatabase) -> Option<Crate> {
-        Some(self.module(db).krate())
-    }
-
     pub fn name(self, db: &dyn HirDatabase) -> Name {
         db.function_data(self.id).name.clone()
     }
@@ -868,11 +1012,195 @@ impl Function {
         db.function_data(self.id).is_unsafe()
     }
 
-    pub fn diagnostics(self, db: &dyn HirDatabase, sink: &mut DiagnosticSink) {
+    pub fn is_async(self, db: &dyn HirDatabase) -> bool {
+        db.function_data(self.id).is_async()
+    }
+
+    pub fn diagnostics(self, db: &dyn HirDatabase, acc: &mut Vec<AnyDiagnostic>) {
         let krate = self.module(db).id.krate();
-        hir_def::diagnostics::validate_body(db.upcast(), self.id.into(), sink);
-        hir_ty::diagnostics::validate_module_item(db, krate, self.id.into(), sink);
-        hir_ty::diagnostics::validate_body(db, self.id.into(), sink);
+
+        let source_map = db.body_with_source_map(self.id.into()).1;
+        for diag in source_map.diagnostics() {
+            match diag {
+                BodyDiagnostic::InactiveCode { node, cfg, opts } => acc.push(
+                    InactiveCode { node: node.clone(), cfg: cfg.clone(), opts: opts.clone() }
+                        .into(),
+                ),
+                BodyDiagnostic::MacroError { node, message } => acc.push(
+                    MacroError {
+                        node: node.clone().map(|it| it.into()),
+                        message: message.to_string(),
+                    }
+                    .into(),
+                ),
+                BodyDiagnostic::UnresolvedProcMacro { node } => acc.push(
+                    UnresolvedProcMacro {
+                        node: node.clone().map(|it| it.into()),
+                        precise_location: None,
+                        macro_name: None,
+                    }
+                    .into(),
+                ),
+                BodyDiagnostic::UnresolvedMacroCall { node, path } => acc.push(
+                    UnresolvedMacroCall { macro_call: node.clone(), path: path.clone() }.into(),
+                ),
+            }
+        }
+
+        let infer = db.infer(self.id.into());
+        let source_map = Lazy::new(|| db.body_with_source_map(self.id.into()).1);
+        for d in &infer.diagnostics {
+            match d {
+                hir_ty::InferenceDiagnostic::NoSuchField { expr } => {
+                    let field = source_map.field_syntax(*expr);
+                    acc.push(NoSuchField { field }.into())
+                }
+                hir_ty::InferenceDiagnostic::BreakOutsideOfLoop { expr } => {
+                    let expr = source_map
+                        .expr_syntax(*expr)
+                        .expect("break outside of loop in synthetic syntax");
+                    acc.push(BreakOutsideOfLoop { expr }.into())
+                }
+            }
+        }
+
+        for expr in hir_ty::diagnostics::missing_unsafe(db, self.id.into()) {
+            match source_map.expr_syntax(expr) {
+                Ok(expr) => acc.push(MissingUnsafe { expr }.into()),
+                Err(SyntheticSyntax) => {
+                    // FIXME: Here and eslwhere in this file, the `expr` was
+                    // desugared, report or assert that this doesn't happen.
+                }
+            }
+        }
+
+        for diagnostic in BodyValidationDiagnostic::collect(db, self.id.into()) {
+            match diagnostic {
+                BodyValidationDiagnostic::RecordMissingFields {
+                    record,
+                    variant,
+                    missed_fields,
+                } => {
+                    let variant_data = variant.variant_data(db.upcast());
+                    let missed_fields = missed_fields
+                        .into_iter()
+                        .map(|idx| variant_data.fields()[idx].name.clone())
+                        .collect();
+
+                    match record {
+                        Either::Left(record_expr) => match source_map.expr_syntax(record_expr) {
+                            Ok(source_ptr) => {
+                                let root = source_ptr.file_syntax(db.upcast());
+                                if let ast::Expr::RecordExpr(record_expr) =
+                                    &source_ptr.value.to_node(&root)
+                                {
+                                    if let Some(_) = record_expr.record_expr_field_list() {
+                                        acc.push(
+                                            MissingFields {
+                                                file: source_ptr.file_id,
+                                                field_list_parent: Either::Left(AstPtr::new(
+                                                    record_expr,
+                                                )),
+                                                field_list_parent_path: record_expr
+                                                    .path()
+                                                    .map(|path| AstPtr::new(&path)),
+                                                missed_fields,
+                                            }
+                                            .into(),
+                                        )
+                                    }
+                                }
+                            }
+                            Err(SyntheticSyntax) => (),
+                        },
+                        Either::Right(record_pat) => match source_map.pat_syntax(record_pat) {
+                            Ok(source_ptr) => {
+                                if let Some(expr) = source_ptr.value.as_ref().left() {
+                                    let root = source_ptr.file_syntax(db.upcast());
+                                    if let ast::Pat::RecordPat(record_pat) = expr.to_node(&root) {
+                                        if let Some(_) = record_pat.record_pat_field_list() {
+                                            acc.push(
+                                                MissingFields {
+                                                    file: source_ptr.file_id,
+                                                    field_list_parent: Either::Right(AstPtr::new(
+                                                        &record_pat,
+                                                    )),
+                                                    field_list_parent_path: record_pat
+                                                        .path()
+                                                        .map(|path| AstPtr::new(&path)),
+                                                    missed_fields,
+                                                }
+                                                .into(),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            Err(SyntheticSyntax) => (),
+                        },
+                    }
+                }
+                BodyValidationDiagnostic::ReplaceFilterMapNextWithFindMap { method_call_expr } => {
+                    if let Ok(next_source_ptr) = source_map.expr_syntax(method_call_expr) {
+                        acc.push(
+                            ReplaceFilterMapNextWithFindMap {
+                                file: next_source_ptr.file_id,
+                                next_expr: next_source_ptr.value,
+                            }
+                            .into(),
+                        );
+                    }
+                }
+                BodyValidationDiagnostic::MismatchedArgCount { call_expr, expected, found } => {
+                    match source_map.expr_syntax(call_expr) {
+                        Ok(source_ptr) => acc.push(
+                            MismatchedArgCount { call_expr: source_ptr, expected, found }.into(),
+                        ),
+                        Err(SyntheticSyntax) => (),
+                    }
+                }
+                BodyValidationDiagnostic::RemoveThisSemicolon { expr } => {
+                    match source_map.expr_syntax(expr) {
+                        Ok(expr) => acc.push(RemoveThisSemicolon { expr }.into()),
+                        Err(SyntheticSyntax) => (),
+                    }
+                }
+                BodyValidationDiagnostic::MissingOkOrSomeInTailExpr { expr, required } => {
+                    match source_map.expr_syntax(expr) {
+                        Ok(expr) => acc.push(MissingOkOrSomeInTailExpr { expr, required }.into()),
+                        Err(SyntheticSyntax) => (),
+                    }
+                }
+                BodyValidationDiagnostic::MissingMatchArms { match_expr } => {
+                    match source_map.expr_syntax(match_expr) {
+                        Ok(source_ptr) => {
+                            let root = source_ptr.file_syntax(db.upcast());
+                            if let ast::Expr::MatchExpr(match_expr) =
+                                &source_ptr.value.to_node(&root)
+                            {
+                                if let (Some(match_expr), Some(arms)) =
+                                    (match_expr.expr(), match_expr.match_arm_list())
+                                {
+                                    acc.push(
+                                        MissingMatchArms {
+                                            file: source_ptr.file_id,
+                                            match_expr: AstPtr::new(&match_expr),
+                                            arms: AstPtr::new(&arms),
+                                        }
+                                        .into(),
+                                    )
+                                }
+                            }
+                        }
+                        Err(SyntheticSyntax) => (),
+                    }
+                }
+            }
+        }
+
+        for diag in hir_ty::diagnostics::validate_module_item(db, krate, self.id.into()) {
+            acc.push(diag.into())
+        }
     }
 
     /// Whether this function declaration has a definition.
@@ -1003,10 +1331,6 @@ impl Const {
         Module { id: self.id.lookup(db.upcast()).module(db.upcast()) }
     }
 
-    pub fn krate(self, db: &dyn HirDatabase) -> Option<Crate> {
-        Some(self.module(db).krate())
-    }
-
     pub fn name(self, db: &dyn HirDatabase) -> Option<Name> {
         db.const_data(self.id).name.clone()
     }
@@ -1032,10 +1356,6 @@ pub struct Static {
 impl Static {
     pub fn module(self, db: &dyn HirDatabase) -> Module {
         Module { id: self.id.lookup(db.upcast()).module(db.upcast()) }
-    }
-
-    pub fn krate(self, db: &dyn HirDatabase) -> Option<Crate> {
-        Some(self.module(db).krate())
     }
 
     pub fn name(self, db: &dyn HirDatabase) -> Option<Name> {
@@ -1074,6 +1394,10 @@ impl Trait {
     pub fn is_auto(self, db: &dyn HirDatabase) -> bool {
         db.trait_data(self.id).is_auto
     }
+
+    pub fn is_unsafe(&self, db: &dyn HirDatabase) -> bool {
+        db.trait_data(self.id).is_unsafe
+    }
 }
 
 impl HasVisibility for Trait {
@@ -1095,10 +1419,6 @@ impl TypeAlias {
 
     pub fn module(self, db: &dyn HirDatabase) -> Module {
         Module { id: self.id.lookup(db.upcast()).module(db.upcast()) }
-    }
-
-    pub fn krate(self, db: &dyn HirDatabase) -> Crate {
-        self.module(db).krate()
     }
 
     pub fn type_ref(self, db: &dyn HirDatabase) -> Option<TypeRef> {
@@ -1141,10 +1461,16 @@ impl BuiltinType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MacroKind {
+    /// `macro_rules!` or Macros 2.0 macro.
     Declarative,
-    ProcMacro,
+    /// A built-in or custom derive.
     Derive,
+    /// A built-in function-like macro.
     BuiltIn,
+    /// A procedural attribute macro.
+    Attr,
+    /// A function-like procedural macro.
+    ProcMacro,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1174,11 +1500,21 @@ impl MacroDef {
     pub fn kind(&self) -> MacroKind {
         match self.id.kind {
             MacroDefKind::Declarative(_) => MacroKind::Declarative,
-            MacroDefKind::BuiltIn(_, _) => MacroKind::BuiltIn,
+            MacroDefKind::BuiltIn(_, _) | MacroDefKind::BuiltInEager(_, _) => MacroKind::BuiltIn,
             MacroDefKind::BuiltInDerive(_, _) => MacroKind::Derive,
-            MacroDefKind::BuiltInEager(_, _) => MacroKind::BuiltIn,
-            // FIXME might be a derive
-            MacroDefKind::ProcMacro(_, _) => MacroKind::ProcMacro,
+            MacroDefKind::BuiltInAttr(_, _) => MacroKind::Attr,
+            MacroDefKind::ProcMacro(_, base_db::ProcMacroKind::CustomDerive, _) => {
+                MacroKind::Derive
+            }
+            MacroDefKind::ProcMacro(_, base_db::ProcMacroKind::Attr, _) => MacroKind::Attr,
+            MacroDefKind::ProcMacro(_, base_db::ProcMacroKind::FuncLike, _) => MacroKind::ProcMacro,
+        }
+    }
+
+    pub fn is_fn_like(&self) -> bool {
+        match self.kind() {
+            MacroKind::Declarative | MacroKind::BuiltIn | MacroKind::ProcMacro => true,
+            MacroKind::Attr | MacroKind::Derive => false,
         }
     }
 }
@@ -1270,6 +1606,20 @@ impl AssocItem {
         match self.container(db) {
             AssocItemContainer::Trait(t) => Some(t),
             _ => None,
+        }
+    }
+
+    pub fn containing_trait_impl(self, db: &dyn HirDatabase) -> Option<Trait> {
+        match self.container(db) {
+            AssocItemContainer::Impl(i) => i.trait_(db),
+            _ => None,
+        }
+    }
+
+    pub fn containing_trait_or_trait_impl(self, db: &dyn HirDatabase) -> Option<Trait> {
+        match self.container(db) {
+            AssocItemContainer::Trait(t) => Some(t),
+            AssocItemContainer::Impl(i) => i.trait_(db),
         }
     }
 }
@@ -1487,7 +1837,7 @@ impl TypeParam {
 
     pub fn trait_bounds(self, db: &dyn HirDatabase) -> Vec<Trait> {
         db.generic_predicates_for_param(self.id)
-            .into_iter()
+            .iter()
             .filter_map(|pred| match &pred.skip_binders().skip_binders() {
                 hir_ty::WhereClause::Implemented(trait_ref) => {
                     Some(Trait::from(trait_ref.hir_trait_id()))
@@ -1569,7 +1919,7 @@ impl Impl {
     }
 
     pub fn all_for_type(db: &dyn HirDatabase, Type { krate, ty, .. }: Type) -> Vec<Impl> {
-        let def_crates = match def_crates(db, &ty, krate) {
+        let def_crates = match method_resolution::def_crates(db, &ty, krate) {
             Some(def_crates) => def_crates,
             None => return Vec::new(),
         };
@@ -1592,7 +1942,7 @@ impl Impl {
             all.extend(
                 db.inherent_impls_in_crate(id)
                     .for_self_ty(&ty)
-                    .into_iter()
+                    .iter()
                     .cloned()
                     .map(Self::from)
                     .filter(filter),
@@ -1626,9 +1976,11 @@ impl Impl {
     }
 
     // FIXME: the return type is wrong. This should be a hir version of
-    // `TraitRef` (ie, resolved `TypeRef`).
-    pub fn trait_(self, db: &dyn HirDatabase) -> Option<TraitRef> {
-        db.impl_data(self.id).target_trait.as_deref().cloned()
+    // `TraitRef` (to account for parameters and qualifiers)
+    pub fn trait_(self, db: &dyn HirDatabase) -> Option<Trait> {
+        let trait_ref = db.impl_trait(self.id)?.skip_binders().clone();
+        let id = hir_ty::from_chalk_trait_id(trait_ref.trait_id);
+        Some(Trait { id })
     }
 
     pub fn self_ty(self, db: &dyn HirDatabase) -> Type {
@@ -1652,10 +2004,6 @@ impl Impl {
         self.id.lookup(db.upcast()).container.into()
     }
 
-    pub fn krate(self, db: &dyn HirDatabase) -> Crate {
-        Crate { id: self.module(db).id.krate() }
-    }
-
     pub fn is_builtin_derive(self, db: &dyn HirDatabase) -> Option<InFile<ast::Attr>> {
         let src = self.source(db)?;
         let item = src.file_id.is_builtin_derive(db.upcast())?;
@@ -1666,7 +2014,7 @@ impl Impl {
             .value
             .attrs()
             .filter_map(|it| {
-                let path = ModPath::from_src(it.path()?, &hygenic)?;
+                let path = ModPath::from_src(db.upcast(), it.path()?, &hygenic)?;
                 if path.as_ident()?.to_string() == "derive" {
                     Some(it)
                 } else {
@@ -1701,15 +2049,17 @@ impl Type {
         resolver: &Resolver,
         ty: Ty,
     ) -> Type {
-        let environment =
-            resolver.generic_def().map_or_else(Default::default, |d| db.trait_environment(d));
+        let environment = resolver
+            .generic_def()
+            .map_or_else(|| Arc::new(TraitEnvironment::empty(krate)), |d| db.trait_environment(d));
         Type { krate, env: environment, ty }
     }
 
     fn new(db: &dyn HirDatabase, krate: CrateId, lexical_env: impl HasResolver, ty: Ty) -> Type {
         let resolver = lexical_env.resolver(db.upcast());
-        let environment =
-            resolver.generic_def().map_or_else(Default::default, |d| db.trait_environment(d));
+        let environment = resolver
+            .generic_def()
+            .map_or_else(|| Arc::new(TraitEnvironment::empty(krate)), |d| db.trait_environment(d));
         Type { krate, env: environment, ty }
     }
 
@@ -1725,8 +2075,13 @@ impl Type {
     pub fn is_unit(&self) -> bool {
         matches!(self.ty.kind(&Interner), TyKind::Tuple(0, ..))
     }
+
     pub fn is_bool(&self) -> bool {
         matches!(self.ty.kind(&Interner), TyKind::Scalar(Scalar::Bool))
+    }
+
+    pub fn is_never(&self) -> bool {
+        matches!(self.ty.kind(&Interner), TyKind::Never)
     }
 
     pub fn is_mutable_reference(&self) -> bool {
@@ -1742,6 +2097,10 @@ impl Type {
             TyKind::Ref(.., ty) => Some(self.derived(ty.clone())),
             _ => None,
         }
+    }
+
+    pub fn strip_references(&self) -> Type {
+        self.derived(self.ty.strip_references().clone())
     }
 
     pub fn is_unknown(&self) -> bool {
@@ -1869,8 +2228,8 @@ impl Type {
     }
 
     pub fn is_packed(&self, db: &dyn HirDatabase) -> bool {
-        let adt_id = match self.ty.kind(&Interner) {
-            &TyKind::Adt(hir_ty::AdtId(adt_id), ..) => adt_id,
+        let adt_id = match *self.ty.kind(&Interner) {
+            TyKind::Adt(hir_ty::AdtId(adt_id), ..) => adt_id,
             _ => return false,
         };
 
@@ -1901,6 +2260,7 @@ impl Type {
                     substs.iter(&Interner).filter_map(|a| a.ty(&Interner)).any(go)
                 }
 
+                TyKind::Array(_ty, len) if len.is_unknown() => true,
                 TyKind::Array(ty, _)
                 | TyKind::Slice(ty)
                 | TyKind::Raw(_, ty)
@@ -1923,9 +2283,9 @@ impl Type {
     }
 
     pub fn fields(&self, db: &dyn HirDatabase) -> Vec<(Field, Type)> {
-        let (variant_id, substs) = match self.ty.kind(&Interner) {
-            &TyKind::Adt(hir_ty::AdtId(AdtId::StructId(s)), ref substs) => (s.into(), substs),
-            &TyKind::Adt(hir_ty::AdtId(AdtId::UnionId(u)), ref substs) => (u.into(), substs),
+        let (variant_id, substs) = match *self.ty.kind(&Interner) {
+            TyKind::Adt(hir_ty::AdtId(AdtId::StructId(s)), ref substs) => (s.into(), substs),
+            TyKind::Adt(hir_ty::AdtId(AdtId::UnionId(u)), ref substs) => (u.into(), substs),
             _ => return Vec::new(),
         };
 
@@ -1970,7 +2330,7 @@ impl Type {
         krate: Crate,
         mut callback: impl FnMut(AssocItem) -> Option<T>,
     ) -> Option<T> {
-        for krate in def_crates(db, &self.ty, krate.id)? {
+        for krate in method_resolution::def_crates(db, &self.ty, krate.id)? {
             let impls = db.inherent_impls_in_crate(krate);
 
             for impl_def in impls.for_self_ty(&self.ty) {
@@ -2002,6 +2362,7 @@ impl Type {
         name: Option<&Name>,
         mut callback: impl FnMut(&Ty, Function) -> Option<T>,
     ) -> Option<T> {
+        let _p = profile::span("iterate_method_candidates");
         // There should be no inference vars in types passed here
         // FIXME check that?
         // FIXME replace Unknown by bound vars here
@@ -2035,11 +2396,8 @@ impl Type {
         name: Option<&Name>,
         mut callback: impl FnMut(&Ty, AssocItem) -> Option<T>,
     ) -> Option<T> {
-        // There should be no inference vars in types passed here
-        // FIXME check that?
-        // FIXME replace Unknown by bound vars here
-        let canonical =
-            Canonical { value: self.ty.clone(), binders: CanonicalVarKinds::empty(&Interner) };
+        let _p = profile::span("iterate_path_candidates");
+        let canonical = hir_ty::replace_errors_with_variables(&self.ty);
 
         let env = self.env.clone();
         let krate = krate.id;
@@ -2062,6 +2420,10 @@ impl Type {
         Some(adt.into())
     }
 
+    pub fn as_builtin(&self) -> Option<BuiltinType> {
+        self.ty.as_builtin().map(|inner| BuiltinType { inner })
+    }
+
     pub fn as_dyn_trait(&self) -> Option<Trait> {
         self.ty.dyn_trait().map(Into::into)
     }
@@ -2072,6 +2434,7 @@ impl Type {
         &'a self,
         db: &'a dyn HirDatabase,
     ) -> impl Iterator<Item = Trait> + 'a {
+        let _p = profile::span("applicable_inherent_traits");
         self.autoderef(db)
             .filter_map(|derefed_type| derefed_type.ty.dyn_trait())
             .flat_map(move |dyn_trait_id| hir_ty::all_super_traits(db.upcast(), dyn_trait_id))
@@ -2121,20 +2484,17 @@ impl Type {
             cb: &mut impl FnMut(Type),
         ) {
             for pred in bounds {
-                match pred.skip_binders() {
-                    WhereClause::Implemented(trait_ref) => {
-                        cb(type_.clone());
-                        // skip the self type. it's likely the type we just got the bounds from
-                        for ty in trait_ref
-                            .substitution
-                            .iter(&Interner)
-                            .skip(1)
-                            .filter_map(|a| a.ty(&Interner))
-                        {
-                            walk_type(db, &type_.derived(ty.clone()), cb);
-                        }
+                if let WhereClause::Implemented(trait_ref) = pred.skip_binders() {
+                    cb(type_.clone());
+                    // skip the self type. it's likely the type we just got the bounds from
+                    for ty in trait_ref
+                        .substitution
+                        .iter(&Interner)
+                        .skip(1)
+                        .filter_map(|a| a.ty(&Interner))
+                    {
+                        walk_type(db, &type_.derived(ty.clone()), cb);
                     }
-                    _ => (),
                 }
             }
         }
@@ -2144,13 +2504,13 @@ impl Type {
             match ty.kind(&Interner) {
                 TyKind::Adt(_, substs) => {
                     cb(type_.derived(ty.clone()));
-                    walk_substs(db, type_, &substs, cb);
+                    walk_substs(db, type_, substs, cb);
                 }
                 TyKind::AssociatedType(_, substs) => {
-                    if let Some(_) = ty.associated_type_parent_trait(db) {
+                    if ty.associated_type_parent_trait(db).is_some() {
                         cb(type_.derived(ty.clone()));
                     }
-                    walk_substs(db, type_, &substs, cb);
+                    walk_substs(db, type_, substs, cb);
                 }
                 TyKind::OpaqueType(_, subst) => {
                     if let Some(bounds) = ty.impl_trait_bounds(db) {
@@ -2190,7 +2550,7 @@ impl Type {
                 TyKind::FnDef(_, substs)
                 | TyKind::Tuple(_, substs)
                 | TyKind::Closure(.., substs) => {
-                    walk_substs(db, type_, &substs, cb);
+                    walk_substs(db, type_, substs, cb);
                 }
                 TyKind::Function(hir_ty::FnPointer { substitution, .. }) => {
                     walk_substs(db, type_, &substitution.0, cb);
@@ -2203,8 +2563,9 @@ impl Type {
         walk_type(db, self, &mut cb);
     }
 
-    pub fn could_unify_with(&self, other: &Type) -> bool {
-        could_unify(&self.ty, &other.ty)
+    pub fn could_unify_with(&self, db: &dyn HirDatabase, other: &Type) -> bool {
+        let tys = hir_ty::replace_errors_with_variables(&(self.ty.clone(), other.ty.clone()));
+        could_unify(db, self.env.clone(), &tys)
     }
 }
 

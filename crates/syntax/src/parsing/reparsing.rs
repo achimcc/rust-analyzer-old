@@ -26,18 +26,18 @@ pub(crate) fn incremental_reparse(
     edit: &Indel,
     errors: Vec<SyntaxError>,
 ) -> Option<(GreenNode, Vec<SyntaxError>, TextRange)> {
-    if let Some((green, new_errors, old_range)) = reparse_token(node, &edit) {
+    if let Some((green, new_errors, old_range)) = reparse_token(node, edit) {
         return Some((green, merge_errors(errors, new_errors, old_range, edit), old_range));
     }
 
-    if let Some((green, new_errors, old_range)) = reparse_block(node, &edit) {
+    if let Some((green, new_errors, old_range)) = reparse_block(node, edit) {
         return Some((green, merge_errors(errors, new_errors, old_range, edit), old_range));
     }
     None
 }
 
-fn reparse_token<'node>(
-    root: &'node SyntaxNode,
+fn reparse_token(
+    root: &SyntaxNode,
     edit: &Indel,
 ) -> Option<(GreenNode, Vec<SyntaxError>, TextRange)> {
     let prev_token = root.covering_element(edit.delete).as_token()?.clone();
@@ -52,7 +52,7 @@ fn reparse_token<'node>(
                 }
             }
 
-            let mut new_text = get_text_after_edit(prev_token.clone().into(), &edit);
+            let mut new_text = get_text_after_edit(prev_token.clone().into(), edit);
             let (new_token_kind, new_err) = lex_single_syntax_kind(&new_text)?;
 
             if new_token_kind != prev_token_kind
@@ -84,8 +84,8 @@ fn reparse_token<'node>(
     }
 }
 
-fn reparse_block<'node>(
-    root: &'node SyntaxNode,
+fn reparse_block(
+    root: &SyntaxNode,
     edit: &Indel,
 ) -> Option<(GreenNode, Vec<SyntaxError>, TextRange)> {
     let (node, reparser) = find_reparsable_node(root, edit.delete)?;

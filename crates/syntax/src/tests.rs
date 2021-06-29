@@ -69,13 +69,13 @@ fn parser_tests() {
     dir_tests(&test_data_dir(), &["parser/inline/ok", "parser/ok"], "rast", |text, path| {
         let parse = SourceFile::parse(text);
         let errors = parse.errors();
-        assert_errors_are_absent(&errors, path);
+        assert_errors_are_absent(errors, path);
         parse.debug_dump()
     });
     dir_tests(&test_data_dir(), &["parser/err", "parser/inline/err"], "rast", |text, path| {
         let parse = SourceFile::parse(text);
         let errors = parse.errors();
-        assert_errors_are_present(&errors, path);
+        assert_errors_are_present(errors, path);
         parse.debug_dump()
     });
 }
@@ -145,7 +145,6 @@ fn parser_fuzz_tests() {
 fn reparse_fuzz_tests() {
     for (_, text) in collect_rust_files(&test_data_dir(), &["reparse/fuzz-failures"]) {
         let check = fuzz::CheckReparse::from_data(text.as_bytes()).unwrap();
-        println!("{:?}", check);
         check.run();
     }
 }
@@ -237,7 +236,7 @@ where
         }
     });
     dir_tests(&test_data_dir(), err_paths, "rast", |text, path| {
-        if let Ok(_) = f(text) {
+        if f(text).is_ok() {
             panic!("'{:?}' successfully parsed when it should have errored", path);
         } else {
             "ERROR\n".to_owned()

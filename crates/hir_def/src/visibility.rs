@@ -33,17 +33,19 @@ impl RawVisibility {
         db: &dyn DefDatabase,
         node: InFile<Option<ast::Visibility>>,
     ) -> RawVisibility {
-        Self::from_ast_with_hygiene(node.value, &Hygiene::new(db.upcast(), node.file_id))
+        Self::from_ast_with_hygiene(db, node.value, &Hygiene::new(db.upcast(), node.file_id))
     }
 
     pub(crate) fn from_ast_with_hygiene(
+        db: &dyn DefDatabase,
         node: Option<ast::Visibility>,
         hygiene: &Hygiene,
     ) -> RawVisibility {
-        Self::from_ast_with_hygiene_and_default(node, RawVisibility::private(), hygiene)
+        Self::from_ast_with_hygiene_and_default(db, node, RawVisibility::private(), hygiene)
     }
 
     pub(crate) fn from_ast_with_hygiene_and_default(
+        db: &dyn DefDatabase,
         node: Option<ast::Visibility>,
         default: RawVisibility,
         hygiene: &Hygiene,
@@ -54,7 +56,7 @@ impl RawVisibility {
         };
         match node.kind() {
             ast::VisibilityKind::In(path) => {
-                let path = ModPath::from_src(path, hygiene);
+                let path = ModPath::from_src(db, path, hygiene);
                 let path = match path {
                     None => return RawVisibility::private(),
                     Some(path) => path,
@@ -170,9 +172,8 @@ impl Visibility {
     /// visible in unrelated modules).
     pub(crate) fn max(self, other: Visibility, def_map: &DefMap) -> Option<Visibility> {
         match (self, other) {
-            (Visibility::Module(_), Visibility::Public)
-            | (Visibility::Public, Visibility::Module(_))
-            | (Visibility::Public, Visibility::Public) => Some(Visibility::Public),
+            (Visibility::Module(_) | Visibility::Public, Visibility::Public)
+            | (Visibility::Public, Visibility::Module(_)) => Some(Visibility::Public),
             (Visibility::Module(mod_a), Visibility::Module(mod_b)) => {
                 if mod_a.krate != mod_b.krate {
                     return None;

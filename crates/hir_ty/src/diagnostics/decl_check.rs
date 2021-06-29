@@ -19,10 +19,7 @@ use hir_def::{
     src::HasSource,
     AdtId, AttrDefId, ConstId, EnumId, FunctionId, Lookup, ModuleDefId, StaticId, StructId,
 };
-use hir_expand::{
-    diagnostics::DiagnosticSink,
-    name::{AsName, Name},
-};
+use hir_expand::name::{AsName, Name};
 use stdx::{always, never};
 use syntax::{
     ast::{self, NameOwner},
@@ -42,10 +39,10 @@ mod allow {
     pub(super) const NON_CAMEL_CASE_TYPES: &str = "non_camel_case_types";
 }
 
-pub(super) struct DeclValidator<'a, 'b> {
+pub(super) struct DeclValidator<'a> {
     db: &'a dyn HirDatabase,
     krate: CrateId,
-    sink: &'a mut DiagnosticSink<'b>,
+    pub(super) sink: Vec<IncorrectCase>,
 }
 
 #[derive(Debug)]
@@ -55,13 +52,9 @@ struct Replacement {
     expected_case: CaseType,
 }
 
-impl<'a, 'b> DeclValidator<'a, 'b> {
-    pub(super) fn new(
-        db: &'a dyn HirDatabase,
-        krate: CrateId,
-        sink: &'a mut DiagnosticSink<'b>,
-    ) -> DeclValidator<'a, 'b> {
-        DeclValidator { db, krate, sink }
+impl<'a> DeclValidator<'a> {
+    pub(super) fn new(db: &'a dyn HirDatabase, krate: CrateId) -> DeclValidator<'a> {
+        DeclValidator { db, krate, sink: Vec::new() }
     }
 
     pub(super) fn validate_item(&mut self, item: ModuleDefId) {
@@ -133,7 +126,7 @@ impl<'a, 'b> DeclValidator<'a, 'b> {
         for (_, block_def_map) in body.blocks(self.db.upcast()) {
             for (_, module) in block_def_map.modules() {
                 for def_id in module.scope.declarations() {
-                    let mut validator = DeclValidator::new(self.db, self.krate, self.sink);
+                    let mut validator = DeclValidator::new(self.db, self.krate);
                     validator.validate_item(def_id);
                 }
             }
@@ -152,29 +145,11 @@ impl<'a, 'b> DeclValidator<'a, 'b> {
             expected_case: CaseType::LowerSnakeCase,
         });
 
-        // Check the param names.
-        let fn_param_replacements = body
-            .params
-            .iter()
-            .filter_map(|&id| match &body[id] {
-                Pat::Bind { name, .. } => Some(name),
-                _ => None,
-            })
-            .filter_map(|param_name| {
-                Some(Replacement {
-                    current_name: param_name.clone(),
-                    suggested_text: to_lower_snake_case(&param_name.to_string())?,
-                    expected_case: CaseType::LowerSnakeCase,
-                })
-            })
-            .collect();
-
         // Check the patterns inside the function body.
+        // This includes function parameters.
         let pats_replacements = body
             .pats
             .iter()
-            // We aren't interested in function parameters, we've processed them above.
-            .filter(|(pat_idx, _)| !body.params.contains(&pat_idx))
             .filter_map(|(id, pat)| match pat {
                 Pat::Bind { name, .. } => Some((id, name)),
                 _ => None,
@@ -192,11 +167,10 @@ impl<'a, 'b> DeclValidator<'a, 'b> {
             .collect();
 
         // If there is at least one element to spawn a warning on, go to the source map and generate a warning.
-        self.create_incorrect_case_diagnostic_for_func(
-            func,
-            fn_name_replacement,
-            fn_param_replacements,
-        );
+        if let Some(fn_name_replacement) = fn_name_replacement {
+            self.create_incorrect_case_diagnostic_for_func(func, fn_name_replacement);
+        }
+
         self.create_incorrect_case_diagnostic_for_variables(func, pats_replacements);
     }
 
@@ -205,100 +179,34 @@ impl<'a, 'b> DeclValidator<'a, 'b> {
     fn create_incorrect_case_diagnostic_for_func(
         &mut self,
         func: FunctionId,
-        fn_name_replacement: Option<Replacement>,
-        fn_param_replacements: Vec<Replacement>,
+        fn_name_replacement: Replacement,
     ) {
-        // XXX: only look at sources if we do have incorrect names
-        if fn_name_replacement.is_none() && fn_param_replacements.is_empty() {
-            return;
-        }
-
         let fn_loc = func.lookup(self.db.upcast());
         let fn_src = fn_loc.source(self.db.upcast());
 
         // Diagnostic for function name.
-        if let Some(replacement) = fn_name_replacement {
-            let ast_ptr = match fn_src.value.name() {
-                Some(name) => name,
-                None => {
-                    never!(
-                        "Replacement ({:?}) was generated for a function without a name: {:?}",
-                        replacement,
-                        fn_src
-                    );
-                    return;
-                }
-            };
-
-            let diagnostic = IncorrectCase {
-                file: fn_src.file_id,
-                ident_type: IdentType::Function,
-                ident: AstPtr::new(&ast_ptr),
-                expected_case: replacement.expected_case,
-                ident_text: replacement.current_name.to_string(),
-                suggested_text: replacement.suggested_text,
-            };
-
-            self.sink.push(diagnostic);
-        }
-
-        // Diagnostics for function params.
-        let fn_params_list = match fn_src.value.param_list() {
-            Some(params) => params,
+        let ast_ptr = match fn_src.value.name() {
+            Some(name) => name,
             None => {
-                always!(
-                    fn_param_replacements.is_empty(),
-                    "Replacements ({:?}) were generated for a function parameters which had no parameters list: {:?}",
-                    fn_param_replacements,
+                never!(
+                    "Replacement ({:?}) was generated for a function without a name: {:?}",
+                    fn_name_replacement,
                     fn_src
                 );
                 return;
             }
         };
-        let mut fn_params_iter = fn_params_list.params();
-        for param_to_rename in fn_param_replacements {
-            // We assume that parameters in replacement are in the same order as in the
-            // actual params list, but just some of them (ones that named correctly) are skipped.
-            let ast_ptr: ast::Name = loop {
-                match fn_params_iter.next() {
-                    Some(element) => {
-                        if let Some(ast::Pat::IdentPat(pat)) = element.pat() {
-                            if pat.to_string() == param_to_rename.current_name.to_string() {
-                                if let Some(name) = pat.name() {
-                                    break name;
-                                }
-                                // This is critical. If we consider this parameter the expected one,
-                                // it **must** have a name.
-                                never!(
-                                    "Pattern {:?} equals to expected replacement {:?}, but has no name",
-                                    element,
-                                    param_to_rename
-                                );
-                                return;
-                            }
-                        }
-                    }
-                    None => {
-                        never!(
-                            "Replacement ({:?}) was generated for a function parameter which was not found: {:?}",
-                            param_to_rename, fn_src
-                        );
-                        return;
-                    }
-                }
-            };
 
-            let diagnostic = IncorrectCase {
-                file: fn_src.file_id,
-                ident_type: IdentType::Argument,
-                ident: AstPtr::new(&ast_ptr),
-                expected_case: param_to_rename.expected_case,
-                ident_text: param_to_rename.current_name.to_string(),
-                suggested_text: param_to_rename.suggested_text,
-            };
+        let diagnostic = IncorrectCase {
+            file: fn_src.file_id,
+            ident_type: IdentType::Function,
+            ident: AstPtr::new(&ast_ptr),
+            expected_case: fn_name_replacement.expected_case,
+            ident_text: fn_name_replacement.current_name.to_string(),
+            suggested_text: fn_name_replacement.suggested_text,
+        };
 
-            self.sink.push(diagnostic);
-        }
+        self.sink.push(diagnostic);
     }
 
     /// Given the information about incorrect variable names, looks up into the source code
@@ -329,20 +237,25 @@ impl<'a, 'b> DeclValidator<'a, 'b> {
                             None => continue,
                         };
 
+                        let is_param = ast::Param::can_cast(parent.kind());
+
                         // We have to check that it's either `let var = ...` or `var @ Variant(_)` statement,
                         // because e.g. match arms are patterns as well.
                         // In other words, we check that it's a named variable binding.
                         let is_binding = ast::LetStmt::can_cast(parent.kind())
                             || (ast::MatchArm::can_cast(parent.kind())
                                 && ident_pat.at_token().is_some());
-                        if !is_binding {
+                        if !(is_param || is_binding) {
                             // This pattern is not an actual variable declaration, e.g. `Some(val) => {..}` match arm.
                             continue;
                         }
 
+                        let ident_type =
+                            if is_param { IdentType::Parameter } else { IdentType::Variable };
+
                         let diagnostic = IncorrectCase {
                             file: source_ptr.file_id,
-                            ident_type: IdentType::Variable,
+                            ident_type,
                             ident: AstPtr::new(&name_ast),
                             expected_case: replacement.expected_case,
                             ident_text: replacement.current_name.to_string(),
@@ -410,7 +323,7 @@ impl<'a, 'b> DeclValidator<'a, 'b> {
         struct_name_replacement: Option<Replacement>,
         struct_fields_replacements: Vec<Replacement>,
     ) {
-        // XXX: only look at sources if we do have incorrect names
+        // XXX: Only look at sources if we do have incorrect names.
         if struct_name_replacement.is_none() && struct_fields_replacements.is_empty() {
             return;
         }
@@ -703,340 +616,5 @@ impl<'a, 'b> DeclValidator<'a, 'b> {
         };
 
         self.sink.push(diagnostic);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::diagnostics::tests::check_diagnostics;
-
-    #[test]
-    fn incorrect_function_name() {
-        check_diagnostics(
-            r#"
-fn NonSnakeCaseName() {}
-// ^^^^^^^^^^^^^^^^ Function `NonSnakeCaseName` should have snake_case name, e.g. `non_snake_case_name`
-"#,
-        );
-    }
-
-    #[test]
-    fn incorrect_function_params() {
-        check_diagnostics(
-            r#"
-fn foo(SomeParam: u8) {}
-    // ^^^^^^^^^ Argument `SomeParam` should have snake_case name, e.g. `some_param`
-
-fn foo2(ok_param: &str, CAPS_PARAM: u8) {}
-                     // ^^^^^^^^^^ Argument `CAPS_PARAM` should have snake_case name, e.g. `caps_param`
-"#,
-        );
-    }
-
-    #[test]
-    fn incorrect_variable_names() {
-        check_diagnostics(
-            r#"
-fn foo() {
-    let SOME_VALUE = 10;
-     // ^^^^^^^^^^ Variable `SOME_VALUE` should have snake_case name, e.g. `some_value`
-    let AnotherValue = 20;
-     // ^^^^^^^^^^^^ Variable `AnotherValue` should have snake_case name, e.g. `another_value`
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn incorrect_struct_names() {
-        check_diagnostics(
-            r#"
-struct non_camel_case_name {}
-    // ^^^^^^^^^^^^^^^^^^^ Structure `non_camel_case_name` should have CamelCase name, e.g. `NonCamelCaseName`
-
-struct SCREAMING_CASE {}
-    // ^^^^^^^^^^^^^^ Structure `SCREAMING_CASE` should have CamelCase name, e.g. `ScreamingCase`
-"#,
-        );
-    }
-
-    #[test]
-    fn no_diagnostic_for_camel_cased_acronyms_in_struct_name() {
-        check_diagnostics(
-            r#"
-struct AABB {}
-"#,
-        );
-    }
-
-    #[test]
-    fn incorrect_struct_field() {
-        check_diagnostics(
-            r#"
-struct SomeStruct { SomeField: u8 }
-                 // ^^^^^^^^^ Field `SomeField` should have snake_case name, e.g. `some_field`
-"#,
-        );
-    }
-
-    #[test]
-    fn incorrect_enum_names() {
-        check_diagnostics(
-            r#"
-enum some_enum { Val(u8) }
-  // ^^^^^^^^^ Enum `some_enum` should have CamelCase name, e.g. `SomeEnum`
-
-enum SOME_ENUM
-  // ^^^^^^^^^ Enum `SOME_ENUM` should have CamelCase name, e.g. `SomeEnum`
-"#,
-        );
-    }
-
-    #[test]
-    fn no_diagnostic_for_camel_cased_acronyms_in_enum_name() {
-        check_diagnostics(
-            r#"
-enum AABB {}
-"#,
-        );
-    }
-
-    #[test]
-    fn incorrect_enum_variant_name() {
-        check_diagnostics(
-            r#"
-enum SomeEnum { SOME_VARIANT(u8) }
-             // ^^^^^^^^^^^^ Variant `SOME_VARIANT` should have CamelCase name, e.g. `SomeVariant`
-"#,
-        );
-    }
-
-    #[test]
-    fn incorrect_const_name() {
-        check_diagnostics(
-            r#"
-const some_weird_const: u8 = 10;
-   // ^^^^^^^^^^^^^^^^ Constant `some_weird_const` should have UPPER_SNAKE_CASE name, e.g. `SOME_WEIRD_CONST`
-
-fn func() {
-    const someConstInFunc: &str = "hi there";
-       // ^^^^^^^^^^^^^^^ Constant `someConstInFunc` should have UPPER_SNAKE_CASE name, e.g. `SOME_CONST_IN_FUNC`
-
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn incorrect_static_name() {
-        check_diagnostics(
-            r#"
-static some_weird_const: u8 = 10;
-    // ^^^^^^^^^^^^^^^^ Static variable `some_weird_const` should have UPPER_SNAKE_CASE name, e.g. `SOME_WEIRD_CONST`
-
-fn func() {
-    static someConstInFunc: &str = "hi there";
-        // ^^^^^^^^^^^^^^^ Static variable `someConstInFunc` should have UPPER_SNAKE_CASE name, e.g. `SOME_CONST_IN_FUNC`
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn fn_inside_impl_struct() {
-        check_diagnostics(
-            r#"
-struct someStruct;
-    // ^^^^^^^^^^ Structure `someStruct` should have CamelCase name, e.g. `SomeStruct`
-
-impl someStruct {
-    fn SomeFunc(&self) {
-    // ^^^^^^^^ Function `SomeFunc` should have snake_case name, e.g. `some_func`
-        static someConstInFunc: &str = "hi there";
-            // ^^^^^^^^^^^^^^^ Static variable `someConstInFunc` should have UPPER_SNAKE_CASE name, e.g. `SOME_CONST_IN_FUNC`
-        let WHY_VAR_IS_CAPS = 10;
-         // ^^^^^^^^^^^^^^^ Variable `WHY_VAR_IS_CAPS` should have snake_case name, e.g. `why_var_is_caps`
-    }
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn no_diagnostic_for_enum_varinats() {
-        check_diagnostics(
-            r#"
-enum Option { Some, None }
-
-fn main() {
-    match Option::None {
-        None => (),
-        Some => (),
-    }
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn non_let_bind() {
-        check_diagnostics(
-            r#"
-enum Option { Some, None }
-
-fn main() {
-    match Option::None {
-        SOME_VAR @ None => (),
-     // ^^^^^^^^ Variable `SOME_VAR` should have snake_case name, e.g. `some_var`
-        Some => (),
-    }
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn allow_attributes() {
-        check_diagnostics(
-            r#"
-#[allow(non_snake_case)]
-fn NonSnakeCaseName(SOME_VAR: u8) -> u8{
-    // cov_flags generated output from elsewhere in this file
-    extern "C" {
-        #[no_mangle]
-        static lower_case: u8;
-    }
-
-    let OtherVar = SOME_VAR + 1;
-    OtherVar
-}
-
-#[allow(nonstandard_style)]
-mod CheckNonstandardStyle {
-    fn HiImABadFnName() {}
-}
-
-#[allow(bad_style)]
-mod CheckBadStyle {
-    fn HiImABadFnName() {}
-}
-
-mod F {
-    #![allow(non_snake_case)]
-    fn CheckItWorksWithModAttr(BAD_NAME_HI: u8) {}
-}
-
-#[allow(non_snake_case, non_camel_case_types)]
-pub struct some_type {
-    SOME_FIELD: u8,
-    SomeField: u16,
-}
-
-#[allow(non_upper_case_globals)]
-pub const some_const: u8 = 10;
-
-#[allow(non_upper_case_globals)]
-pub static SomeStatic: u8 = 10;
-    "#,
-        );
-    }
-
-    #[test]
-    fn allow_attributes_crate_attr() {
-        check_diagnostics(
-            r#"
-#![allow(non_snake_case)]
-
-mod F {
-    fn CheckItWorksWithCrateAttr(BAD_NAME_HI: u8) {}
-}
-    "#,
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn bug_trait_inside_fn() {
-        // FIXME:
-        // This is broken, and in fact, should not even be looked at by this
-        // lint in the first place. There's weird stuff going on in the
-        // collection phase.
-        // It's currently being brought in by:
-        // * validate_func on `a` recursing into modules
-        // * then it finds the trait and then the function while iterating
-        //   through modules
-        // * then validate_func is called on Dirty
-        // * ... which then proceeds to look at some unknown module taking no
-        //   attrs from either the impl or the fn a, and then finally to the root
-        //   module
-        //
-        // It should find the attribute on the trait, but it *doesn't even see
-        // the trait* as far as I can tell.
-
-        check_diagnostics(
-            r#"
-trait T { fn a(); }
-struct U {}
-impl T for U {
-    fn a() {
-        // this comes out of bitflags, mostly
-        #[allow(non_snake_case)]
-        trait __BitFlags {
-            const HiImAlsoBad: u8 = 2;
-            #[inline]
-            fn Dirty(&self) -> bool {
-                false
-            }
-        }
-
-    }
-}
-    "#,
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn bug_traits_arent_checked() {
-        // FIXME: Traits and functions in traits aren't currently checked by
-        // r-a, even though rustc will complain about them.
-        check_diagnostics(
-            r#"
-trait BAD_TRAIT {
-    // ^^^^^^^^^ Trait `BAD_TRAIT` should have CamelCase name, e.g. `BadTrait`
-    fn BAD_FUNCTION();
-    // ^^^^^^^^^^^^ Function `BAD_FUNCTION` should have snake_case name, e.g. `bad_function`
-    fn BadFunction();
-    // ^^^^^^^^^^^^ Function `BadFunction` should have snake_case name, e.g. `bad_function`
-}
-    "#,
-        );
-    }
-
-    #[test]
-    fn ignores_extern_items() {
-        cov_mark::check!(extern_func_incorrect_case_ignored);
-        cov_mark::check!(extern_static_incorrect_case_ignored);
-        check_diagnostics(
-            r#"
-extern {
-    fn NonSnakeCaseName(SOME_VAR: u8) -> u8;
-    pub static SomeStatic: u8 = 10;
-}
-            "#,
-        );
-    }
-
-    #[test]
-    fn infinite_loop_inner_items() {
-        check_diagnostics(
-            r#"
-fn qualify() {
-    mod foo {
-        use super::*;
-    }
-}
-            "#,
-        )
     }
 }

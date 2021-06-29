@@ -13,6 +13,7 @@ use hir_def::{
     db::DefDatabase,
     find_path,
     generics::TypeParamProvenance,
+    intern::{Internable, Interned},
     item_scope::ItemInNs,
     path::{Path, PathKind},
     type_ref::{TypeBound, TypeRef},
@@ -256,6 +257,12 @@ impl<T: HirDisplay> HirDisplay for &'_ T {
     }
 }
 
+impl<T: HirDisplay + Internable> HirDisplay for Interned<T> {
+    fn hir_fmt(&self, f: &mut HirFormatter) -> Result<(), HirDisplayError> {
+        HirDisplay::hir_fmt(self.as_ref(), f)
+    }
+}
+
 impl HirDisplay for ProjectionTy {
     fn hir_fmt(&self, f: &mut HirFormatter) -> Result<(), HirDisplayError> {
         if f.should_truncate() {
@@ -308,7 +315,7 @@ impl HirDisplay for Const {
                 let param_data = &generics.params.consts[id.local_id];
                 write!(f, "{}", param_data.name)
             }
-            ConstValue::Concrete(_) => write!(f, "_"),
+            ConstValue::Concrete(c) => write!(f, "{}", c.interned),
         }
     }
 }
@@ -771,8 +778,10 @@ fn write_bounds_like_dyn_trait(
             }
             WhereClause::AliasEq(alias_eq) if is_fn_trait => {
                 is_fn_trait = false;
-                write!(f, " -> ")?;
-                alias_eq.ty.hir_fmt(f)?;
+                if !alias_eq.ty.is_unit() {
+                    write!(f, " -> ")?;
+                    alias_eq.ty.hir_fmt(f)?;
+                }
             }
             WhereClause::AliasEq(AliasEq { ty, alias }) => {
                 // in types in actual Rust, these will always come
@@ -962,11 +971,10 @@ impl HirDisplay for TypeRef {
                 write!(f, "{}", mutability)?;
                 inner.hir_fmt(f)?;
             }
-            TypeRef::Array(inner) => {
+            TypeRef::Array(inner, len) => {
                 write!(f, "[")?;
                 inner.hir_fmt(f)?;
-                // FIXME: Array length?
-                write!(f, "; _]")?;
+                write!(f, "; {}]", len)?;
             }
             TypeRef::Slice(inner) => {
                 write!(f, "[")?;
@@ -1000,7 +1008,7 @@ impl HirDisplay for TypeRef {
             }
             TypeRef::Macro(macro_call) => {
                 let macro_call = macro_call.to_node(f.db.upcast());
-                let ctx = body::LowerCtx::with_hygiene(&Hygiene::new_unhygienic());
+                let ctx = body::LowerCtx::with_hygiene(f.db.upcast(), &Hygiene::new_unhygienic());
                 match macro_call.path() {
                     Some(path) => match Path::from_src(path, &ctx) {
                         Some(path) => path.hir_fmt(f)?,

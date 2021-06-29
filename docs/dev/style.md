@@ -174,6 +174,13 @@ Instead, explicitly check for `None`, `Err`, etc.
 `rust-analyzer` is not a library, we don't need to test for API misuse, and we have to handle any user input without panics.
 Panic messages in the logs from the `#[should_panic]` tests are confusing.
 
+## `#[ignore]`
+
+Do not `#[ignore]` tests.
+If the test currently does not work, assert the wrong behavior and add a fixme explaining why it is wrong.
+
+**Rationale:** noticing when the behavior is fixed, making sure that even the wrong behavior is acceptable (ie, not a panic).
+
 ## Function Preconditions
 
 Express function preconditions in types and force the caller to provide them (rather than checking in callee):
@@ -449,6 +456,39 @@ fn query_all(name: String, case_sensitive: bool) -> Vec<Item> { ... }
 fn query_first(name: String, case_sensitive: bool) -> Option<Item> { ... }
 ```
 
+## Prefer Separate Functions Over Parameters
+
+If a function has a `bool` or an `Option` parameter, and it is always called with `true`, `false`, `Some` and `None` literals, split the function in two.
+
+```rust
+// GOOD
+fn caller_a() {
+    foo()
+}
+
+fn caller_b() {
+    foo_with_bar(Bar::new())
+}
+
+fn foo() { ... }
+fn foo_with_bar(bar: Bar) { ... }
+
+// BAD
+fn caller_a() {
+    foo(None)
+}
+
+fn caller_b() {
+    foo(Some(Bar::new()))
+}
+
+fn foo(bar: Option<Bar>) { ... }
+```
+
+**Rationale:** more often than not, such functions display "`false sharing`" -- they have additional `if` branching inside for two different cases.
+Splitting the two different control flows into two functions simplifies each path, and remove cross-dependencies between the two paths.
+If there's common code between `foo` and `foo_with_bar`, extract *that* into a common helper.
+
 ## Avoid Monomorphization
 
 Avoid making a lot of code type parametric, *especially* on the boundaries between crates.
@@ -603,6 +643,10 @@ use crate::{}
 
 // Finally, parent and child modules, but prefer `use crate::`.
 use super::{}
+
+// Re-exports are treated as item definitions rather than imports, so they go
+// after imports and modules. Use them sparingly.
+pub use crate::x::Z;
 ```
 
 **Rationale:** consistency.
@@ -660,6 +704,9 @@ Avoid local `use MyEnum::*` imports.
 
 Prefer `use crate::foo::bar` to `use super::bar` or `use self::bar::baz`.
 **Rationale:** consistency, this is the style which works in all cases.
+
+By default, avoid re-exports.
+**Rationale:** for non-library code, re-exports introduce two ways to use something and allow for inconsistency.
 
 ## Order of Items
 
@@ -751,13 +798,14 @@ Many names in rust-analyzer conflict with keywords.
 We use mangled names instead of `r#ident` syntax:
 
 ```
-struct -> strukt
 crate  -> krate
-impl   -> imp
-trait  -> trait_
-fn     -> func
 enum   -> enum_
+fn     -> func
+impl   -> imp
 mod    -> module
+struct -> strukt
+trait  -> trait_
+type   -> ty
 ```
 
 **Rationale:** consistency.
@@ -911,7 +959,29 @@ match p.current() {
 
 ## Documentation
 
+Style inline code comments as proper sentences.
+Start with a capital letter, end with a dot.
+
+```rust
+// GOOD
+
+// Only simple single segment paths are allowed.
+MergeBehavior::Last => {
+    tree.use_tree_list().is_none() && tree.path().map(path_len) <= Some(1)
+}
+
+// BAD
+
+// only simple single segment paths are allowed
+MergeBehavior::Last => {
+    tree.use_tree_list().is_none() && tree.path().map(path_len) <= Some(1)
+}
+```
+
+**Rationale:** writing a sentence (or maybe even a paragraph) rather just "a comment" creates a more appropriate frame of mind.
+It tricks you into writing down more of the context you keep in your head while coding.
+
 For `.md` and `.adoc` files, prefer a sentence-per-line format, don't wrap lines.
 If the line is too long, you want to split the sentence in two :-)
 
-**Rationale:** much easier to edit the text and read the diff.
+**Rationale:** much easier to edit the text and read the diff, see [this link](https://asciidoctor.org/docs/asciidoc-recommended-practices/#one-sentence-per-line).

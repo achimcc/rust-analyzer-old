@@ -37,7 +37,7 @@
     "dependencies": {
         "https-proxy-agent": "^5.0.0",
         "node-fetch": "^2.6.1",
-        "vscode-languageclient": "^7.1.0-next.4"
+        "vscode-languageclient": "^7.1.0-next.5"
     },
     "devDependencies": {
         "@rollup/plugin-commonjs": "^17.0.0",
@@ -107,6 +107,16 @@
             {
                 "command": "rust-analyzer.viewHir",
                 "title": "View Hir",
+                "category": "Rust Analyzer"
+            },
+            {
+                "command": "rust-analyzer.viewItemTree",
+                "title": "Debug ItemTree",
+                "category": "Rust Analyzer"
+            },
+            {
+                "command": "rust-analyzer.viewCrateGraph",
+                "title": "View Crate Graph",
                 "category": "Rust Analyzer"
             },
             {
@@ -303,7 +313,7 @@
                 },
                 "rust-analyzer.updates.askBeforeDownload": {
                     "type": "boolean",
-                    "default": true,
+                    "default": false,
                     "description": "Whether to ask for permission before downloading any files from the Internet."
                 },
                 "rust-analyzer.server.path": {
@@ -359,7 +369,10 @@
                     ]
                 },
                 "rust-analyzer.debug.sourceFileMap": {
-                    "type": ["object", "string"],
+                    "type": [
+                        "object",
+                        "string"
+                    ],
                     "const": "auto",
                     "description": "Optional source file mappings passed to the debug engine.",
                     "default": {
@@ -376,21 +389,28 @@
                     "default": {},
                     "markdownDescription": "Optional settings passed to the debug engine. Example: `{ \"lldb\": { \"terminal\":\"external\"} }`"
                 },
-                "$generated-start": false,
-                "rust-analyzer.assist.importMergeBehavior": {
-                    "markdownDescription": "The strategy to use when inserting new imports or merging imports.",
-                    "default": "full",
+                "$generated-start": {},
+                "rust-analyzer.assist.importGranularity": {
+                    "markdownDescription": "How imports should be grouped into use statements.",
+                    "default": "crate",
                     "type": "string",
                     "enum": [
-                        "none",
-                        "full",
-                        "last"
+                        "preserve",
+                        "crate",
+                        "module",
+                        "item"
                     ],
                     "enumDescriptions": [
-                        "No merging",
-                        "Merge all layers of the import trees",
-                        "Only merge the last layer of the import trees"
+                        "Do not change the granularity of any imports and preserve the original structure written by the developer.",
+                        "Merge imports from the same crate into a single use statement. Conversely, imports from different crates are split into separate statements.",
+                        "Merge imports from the same module into a single use statement. Conversely, imports from different modules are split into separate statements.",
+                        "Flatten imports so that each has its own use statement."
                     ]
+                },
+                "rust-analyzer.assist.importEnforceGranularity": {
+                    "markdownDescription": "Whether to enforce the import granularity setting for all files. If set to false rust-analyzer will try to keep import styles consistent per file.",
+                    "default": false,
+                    "type": "boolean"
                 },
                 "rust-analyzer.assist.importPrefix": {
                     "markdownDescription": "The path structure for newly inserted paths to use.",
@@ -398,17 +418,22 @@
                     "type": "string",
                     "enum": [
                         "plain",
-                        "by_self",
-                        "by_crate"
+                        "self",
+                        "crate"
                     ],
                     "enumDescriptions": [
                         "Insert import paths relative to the current module, using up to one `super` prefix if the parent module contains the requested item.",
-                        "Prefix all import paths with `self` if they don't begin with `self`, `super`, `crate` or a crate name.",
-                        "Force import paths to be absolute by always starting them with `crate` or the crate name they refer to."
+                        "Insert import paths relative to the current module, using up to one `super` prefix if the parent module contains the requested item. Prefixes `self` in front of the path if it starts with a module.",
+                        "Force import paths to be absolute by always starting them with `crate` or the extern crate name they come from."
                     ]
                 },
                 "rust-analyzer.assist.importGroup": {
                     "markdownDescription": "Group inserted imports by the [following order](https://rust-analyzer.github.io/manual.html#auto-import). Groups are separated by newlines.",
+                    "default": true,
+                    "type": "boolean"
+                },
+                "rust-analyzer.assist.allowMergingIntoGlobImports": {
+                    "markdownDescription": "Whether to allow import insertion to merge new imports into single path glob imports like `use std::fmt::*;`.",
                     "default": true,
                     "type": "boolean"
                 },
@@ -426,6 +451,16 @@
                     "markdownDescription": "Activate all available features (`--all-features`).",
                     "default": false,
                     "type": "boolean"
+                },
+                "rust-analyzer.cargo.unsetTest": {
+                    "markdownDescription": "Unsets `#[cfg(test)]` for the specified crates.",
+                    "default": [
+                        "core"
+                    ],
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 },
                 "rust-analyzer.cargo.features": {
                     "markdownDescription": "List of features to activate.",
@@ -533,7 +568,7 @@
                     }
                 },
                 "rust-analyzer.completion.addCallArgumentSnippets": {
-                    "markdownDescription": "Whether to add argument snippets when completing functions.",
+                    "markdownDescription": "Whether to add argument snippets when completing functions.\nOnly applies when `#rust-analyzer.completion.addCallParenthesis#` is set.",
                     "default": true,
                     "type": "boolean"
                 },
@@ -549,6 +584,11 @@
                 },
                 "rust-analyzer.completion.autoimport.enable": {
                     "markdownDescription": "Toggles the additional completions that automatically add imports when completed.\nNote that your client must specify the `additionalTextEdits` LSP client capability to truly have this feature enabled.",
+                    "default": true,
+                    "type": "boolean"
+                },
+                "rust-analyzer.completion.autoself.enable": {
+                    "markdownDescription": "Toggles the additional completions that automatically show method calls and field accesses\nwith `self` prefixed to them when inside a method.",
                     "default": true,
                     "type": "boolean"
                 },
@@ -577,7 +617,7 @@
                     "type": "object"
                 },
                 "rust-analyzer.diagnostics.warningsAsHint": {
-                    "markdownDescription": "List of warnings that should be displayed with info severity.\n\nThe warnings will be indicated by a blue squiggly underline in code\nand a blue icon in the `Problems Panel`.",
+                    "markdownDescription": "List of warnings that should be displayed with hint severity.\n\nThe warnings will be indicated by faded text or three dots in code\nand will not show up in the `Problems Panel`.",
                     "default": [],
                     "type": "array",
                     "items": {
@@ -585,12 +625,17 @@
                     }
                 },
                 "rust-analyzer.diagnostics.warningsAsInfo": {
-                    "markdownDescription": "List of warnings that should be displayed with hint severity.\n\nThe warnings will be indicated by faded text or three dots in code\nand will not show up in the `Problems Panel`.",
+                    "markdownDescription": "List of warnings that should be displayed with info severity.\n\nThe warnings will be indicated by a blue squiggly underline in code\nand a blue icon in the `Problems Panel`.",
                     "default": [],
                     "type": "array",
                     "items": {
                         "type": "string"
                     }
+                },
+                "rust-analyzer.experimental.procAttrMacros": {
+                    "markdownDescription": "Expand attribute macros.",
+                    "default": false,
+                    "type": "boolean"
                 },
                 "rust-analyzer.files.watcher": {
                     "markdownDescription": "Controls file watching implementation.",
@@ -604,6 +649,21 @@
                     "items": {
                         "type": "string"
                     }
+                },
+                "rust-analyzer.highlighting.strings": {
+                    "markdownDescription": "Use semantic tokens for strings.\n\nIn some editors (e.g. vscode) semantic tokens override other highlighting grammars.\nBy disabling semantic tokens for strings, other grammars can be used to highlight\ntheir contents.",
+                    "default": true,
+                    "type": "boolean"
+                },
+                "rust-analyzer.hover.documentation": {
+                    "markdownDescription": "Whether to show documentation on hover.",
+                    "default": true,
+                    "type": "boolean"
+                },
+                "rust-analyzer.hover.linksInHover": {
+                    "markdownDescription": "Use markdown syntax for links in hover.",
+                    "default": true,
+                    "type": "boolean"
                 },
                 "rust-analyzer.hoverActions.debug": {
                     "markdownDescription": "Whether to show `Debug` action. Only applies when\n`#rust-analyzer.hoverActions.enable#` is set.",
@@ -625,13 +685,13 @@
                     "default": true,
                     "type": "boolean"
                 },
-                "rust-analyzer.hoverActions.run": {
-                    "markdownDescription": "Whether to show `Run` action. Only applies when\n`#rust-analyzer.hoverActions.enable#` is set.",
-                    "default": true,
+                "rust-analyzer.hoverActions.references": {
+                    "markdownDescription": "Whether to show `References` action. Only applies when\n`#rust-analyzer.hoverActions.enable#` is set.",
+                    "default": false,
                     "type": "boolean"
                 },
-                "rust-analyzer.hoverActions.linksInHover": {
-                    "markdownDescription": "Use markdown syntax for links in hover.",
+                "rust-analyzer.hoverActions.run": {
+                    "markdownDescription": "Whether to show `Run` action. Only applies when\n`#rust-analyzer.hoverActions.enable#` is set.",
                     "default": true,
                     "type": "boolean"
                 },
@@ -770,7 +830,38 @@
                         "type": "string"
                     }
                 },
-                "$generated-end": false
+                "rust-analyzer.rustfmt.enableRangeFormatting": {
+                    "markdownDescription": "Enables the use of rustfmt's unstable range formatting command for the\n`textDocument/rangeFormatting` request. The rustfmt option is unstable and only\navailable on a nightly build.",
+                    "default": false,
+                    "type": "boolean"
+                },
+                "rust-analyzer.workspace.symbol.search.scope": {
+                    "markdownDescription": "Workspace symbol search scope.",
+                    "default": "workspace",
+                    "type": "string",
+                    "enum": [
+                        "workspace",
+                        "workspace_and_dependencies"
+                    ],
+                    "enumDescriptions": [
+                        "Search in current workspace only",
+                        "Search in current workspace and dependencies"
+                    ]
+                },
+                "rust-analyzer.workspace.symbol.search.kind": {
+                    "markdownDescription": "Workspace symbol search kind.",
+                    "default": "only_types",
+                    "type": "string",
+                    "enum": [
+                        "only_types",
+                        "all_symbols"
+                    ],
+                    "enumDescriptions": [
+                        "Search for types only",
+                        "Search for all symbols kinds"
+                    ]
+                },
+                "$generated-end": {}
             }
         },
         "problemPatterns": [

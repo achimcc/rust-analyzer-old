@@ -143,6 +143,7 @@ impl WorkspaceBuildData {
             cmd.env("RA_RUSTC_WRAPPER", "1");
         }
 
+        cmd.current_dir(cargo_toml.parent().unwrap());
         cmd.args(&["check", "--quiet", "--workspace", "--message-format=json", "--manifest-path"])
             .arg(cargo_toml.as_ref());
 
@@ -183,10 +184,10 @@ impl WorkspaceBuildData {
 
                 // Copy-pasted from existing cargo_metadata. It seems like we
                 // should be using sered_stacker here?
-                let mut deserializer = serde_json::Deserializer::from_str(&line);
+                let mut deserializer = serde_json::Deserializer::from_str(line);
                 deserializer.disable_recursion_limit();
                 let message = Message::deserialize(&mut deserializer)
-                    .unwrap_or(Message::TextLine(line.to_string()));
+                    .unwrap_or_else(|_| Message::TextLine(line.to_string()));
 
                 match message {
                     Message::BuildScriptExecuted(BuildScript {
@@ -213,7 +214,7 @@ impl WorkspaceBuildData {
                             acc
                         };
                         let package_build_data =
-                            res.per_package.entry(package_id.repr.clone()).or_default();
+                            res.per_package.entry(package_id.repr).or_default();
                         // cargo_metadata crate returns default (empty) path for
                         // older cargos, which is not absolute, so work around that.
                         if !out_dir.as_str().is_empty() {
@@ -228,7 +229,7 @@ impl WorkspaceBuildData {
                     Message::CompilerArtifact(message) => {
                         progress(format!("metadata {}", message.target.name));
 
-                        if message.target.kind.contains(&"proc-macro".to_string()) {
+                        if message.target.kind.iter().any(|k| k == "proc-macro") {
                             let package_id = message.package_id;
                             // Skip rmeta file
                             if let Some(filename) =
@@ -236,13 +237,13 @@ impl WorkspaceBuildData {
                             {
                                 let filename = AbsPathBuf::assert(PathBuf::from(&filename));
                                 let package_build_data =
-                                    res.per_package.entry(package_id.repr.clone()).or_default();
+                                    res.per_package.entry(package_id.repr).or_default();
                                 package_build_data.proc_macro_dylib_path = Some(filename);
                             }
                         }
                     }
                     Message::CompilerMessage(message) => {
-                        progress(message.target.name.clone());
+                        progress(message.target.name);
                     }
                     Message::BuildFinished(_) => {}
                     Message::TextLine(_) => {}

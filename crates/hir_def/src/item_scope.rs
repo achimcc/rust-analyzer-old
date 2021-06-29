@@ -4,11 +4,12 @@
 use std::collections::hash_map::Entry;
 
 use base_db::CrateId;
-use hir_expand::name::Name;
-use hir_expand::MacroDefKind;
+use hir_expand::{name::Name, AstId, MacroCallId, MacroDefKind};
 use once_cell::sync::Lazy;
+use profile::Count;
 use rustc_hash::{FxHashMap, FxHashSet};
 use stdx::format_to;
+use syntax::ast;
 
 use crate::{
     db::DefDatabase, per_ns::PerNs, visibility::Visibility, AdtId, BuiltinType, ConstId, ImplId,
@@ -30,12 +31,18 @@ pub struct PerNsGlobImports {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ItemScope {
+    _c: Count<Self>,
+
+    /// Defs visible in this scope. This includes `declarations`, but also
+    /// imports.
     types: FxHashMap<Name, (ModuleDefId, Visibility)>,
     values: FxHashMap<Name, (ModuleDefId, Visibility)>,
     macros: FxHashMap<Name, (MacroDefId, Visibility)>,
     unresolved: FxHashSet<Name>,
 
-    defs: Vec<ModuleDefId>,
+    /// The defs declared in this scope. Each def has a single scope where it is
+    /// declared.
+    declarations: Vec<ModuleDefId>,
     impls: Vec<ImplId>,
     unnamed_consts: Vec<ConstId>,
     /// Traits imported via `use Trait as _;`.
@@ -53,12 +60,13 @@ pub struct ItemScope {
     // FIXME: Macro shadowing in one module is not properly handled. Non-item place macros will
     // be all resolved to the last one defined if shadowing happens.
     legacy_macros: FxHashMap<Name, MacroDefId>,
+    attr_macros: FxHashMap<AstId<ast::Item>, MacroCallId>,
 }
 
 pub(crate) static BUILTIN_SCOPE: Lazy<FxHashMap<Name, PerNs>> = Lazy::new(|| {
     BuiltinType::ALL
         .iter()
-        .map(|(name, ty)| (name.clone(), PerNs::types(ty.clone().into(), Visibility::Public)))
+        .map(|(name, ty)| (name.clone(), PerNs::types((*ty).into(), Visibility::Public)))
         .collect()
 });
 
@@ -88,7 +96,7 @@ impl ItemScope {
     }
 
     pub fn declarations(&self) -> impl Iterator<Item = ModuleDefId> + '_ {
-        self.defs.iter().copied()
+        self.declarations.iter().copied()
     }
 
     pub fn impls(&self) -> impl Iterator<Item = ImplId> + ExactSizeIterator + '_ {
@@ -149,8 +157,8 @@ impl ItemScope {
             .chain(self.unnamed_trait_imports.keys().copied())
     }
 
-    pub(crate) fn define_def(&mut self, def: ModuleDefId) {
-        self.defs.push(def)
+    pub(crate) fn declare(&mut self, def: ModuleDefId) {
+        self.declarations.push(def)
     }
 
     pub(crate) fn get_legacy_macro(&self, name: &Name) -> Option<MacroDefId> {
@@ -167,6 +175,16 @@ impl ItemScope {
 
     pub(crate) fn define_legacy_macro(&mut self, name: Name, mac: MacroDefId) {
         self.legacy_macros.insert(name, mac);
+    }
+
+    pub(crate) fn add_attr_macro_invoc(&mut self, item: AstId<ast::Item>, call: MacroCallId) {
+        self.attr_macros.insert(item, call);
+    }
+
+    pub(crate) fn attr_macro_invocs(
+        &self,
+    ) -> impl Iterator<Item = (AstId<ast::Item>, MacroCallId)> + '_ {
+        self.attr_macros.iter().map(|(k, v)| (*k, *v))
     }
 
     pub(crate) fn unnamed_trait_vis(&self, tr: TraitId) -> Option<Visibility> {
@@ -230,10 +248,8 @@ impl ItemScope {
         check_changed!(changed, (self / def).values, glob_imports[lookup], def_import_type);
         check_changed!(changed, (self / def).macros, glob_imports[lookup], def_import_type);
 
-        if def.is_none() {
-            if self.unresolved.insert(lookup.1) {
-                changed = true;
-            }
+        if def.is_none() && self.unresolved.insert(lookup.1) {
+            changed = true;
         }
 
         changed
@@ -298,15 +314,17 @@ impl ItemScope {
     pub(crate) fn shrink_to_fit(&mut self) {
         // Exhaustive match to require handling new fields.
         let Self {
+            _c: _,
             types,
             values,
             macros,
             unresolved,
-            defs,
+            declarations: defs,
             impls,
             unnamed_consts,
             unnamed_trait_imports,
             legacy_macros,
+            attr_macros,
         } = self;
         types.shrink_to_fit();
         values.shrink_to_fit();
@@ -317,6 +335,7 @@ impl ItemScope {
         unnamed_consts.shrink_to_fit();
         unnamed_trait_imports.shrink_to_fit();
         legacy_macros.shrink_to_fit();
+        attr_macros.shrink_to_fit();
     }
 }
 

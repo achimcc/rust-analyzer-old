@@ -3,7 +3,6 @@
 use std::{collections::hash_map::Entry, mem, sync::Arc};
 
 use hir_expand::{ast_id_map::AstIdMap, hygiene::Hygiene, name::known, HirFileId};
-use smallvec::SmallVec;
 use syntax::{
     ast::{self, ModuleItemOwner},
     SyntaxNode, WalkEvent,
@@ -20,32 +19,21 @@ fn id<N: ItemTreeNode>(index: Idx<N>) -> FileItemTreeId<N> {
     FileItemTreeId { index, _p: PhantomData }
 }
 
-struct ModItems(SmallVec<[ModItem; 1]>);
-
-impl<T> From<T> for ModItems
-where
-    T: Into<ModItem>,
-{
-    fn from(t: T) -> Self {
-        ModItems(SmallVec::from_buf([t.into(); 1]))
-    }
-}
-
-pub(super) struct Ctx {
+pub(super) struct Ctx<'a> {
+    db: &'a dyn DefDatabase,
     tree: ItemTree,
     hygiene: Hygiene,
-    file: HirFileId,
     source_ast_id_map: Arc<AstIdMap>,
-    body_ctx: crate::body::LowerCtx,
+    body_ctx: crate::body::LowerCtx<'a>,
     forced_visibility: Option<RawVisibilityId>,
 }
 
-impl Ctx {
-    pub(super) fn new(db: &dyn DefDatabase, hygiene: Hygiene, file: HirFileId) -> Self {
+impl<'a> Ctx<'a> {
+    pub(super) fn new(db: &'a dyn DefDatabase, hygiene: Hygiene, file: HirFileId) -> Self {
         Self {
+            db,
             tree: ItemTree::default(),
             hygiene,
-            file,
             source_ast_id_map: db.ast_id_map(file),
             body_ctx: crate::body::LowerCtx::new(db, file),
             forced_visibility: None,
@@ -53,11 +41,8 @@ impl Ctx {
     }
 
     pub(super) fn lower_module_items(mut self, item_owner: &dyn ModuleItemOwner) -> ItemTree {
-        self.tree.top_level = item_owner
-            .items()
-            .flat_map(|item| self.lower_mod_item(&item, false))
-            .flat_map(|items| items.0)
-            .collect();
+        self.tree.top_level =
+            item_owner.items().flat_map(|item| self.lower_mod_item(&item, false)).collect();
         self.tree
     }
 
@@ -69,7 +54,6 @@ impl Ctx {
                 _ => None,
             })
             .flat_map(|item| self.lower_mod_item(&item, false))
-            .flat_map(|items| items.0)
             .collect();
 
         // Non-items need to have their inner items collected.
@@ -96,7 +80,7 @@ impl Ctx {
         self.tree.data_mut()
     }
 
-    fn lower_mod_item(&mut self, item: &ast::Item, inner: bool) -> Option<ModItems> {
+    fn lower_mod_item(&mut self, item: &ast::Item, inner: bool) -> Option<ModItem> {
         // Collect inner items for 1-to-1-lowered items.
         match item {
             ast::Item::Struct(_)
@@ -126,37 +110,29 @@ impl Ctx {
             | ast::Item::MacroDef(_) => {}
         };
 
-        let attrs = RawAttrs::new(item, &self.hygiene);
-        let items = match item {
-            ast::Item::Struct(ast) => self.lower_struct(ast).map(Into::into),
-            ast::Item::Union(ast) => self.lower_union(ast).map(Into::into),
-            ast::Item::Enum(ast) => self.lower_enum(ast).map(Into::into),
-            ast::Item::Fn(ast) => self.lower_function(ast).map(Into::into),
-            ast::Item::TypeAlias(ast) => self.lower_type_alias(ast).map(Into::into),
-            ast::Item::Static(ast) => self.lower_static(ast).map(Into::into),
-            ast::Item::Const(ast) => Some(self.lower_const(ast).into()),
-            ast::Item::Module(ast) => self.lower_module(ast).map(Into::into),
-            ast::Item::Trait(ast) => self.lower_trait(ast).map(Into::into),
-            ast::Item::Impl(ast) => self.lower_impl(ast).map(Into::into),
-            ast::Item::Use(ast) => Some(ModItems(
-                self.lower_use(ast).into_iter().map(Into::into).collect::<SmallVec<_>>(),
-            )),
-            ast::Item::ExternCrate(ast) => self.lower_extern_crate(ast).map(Into::into),
-            ast::Item::MacroCall(ast) => self.lower_macro_call(ast).map(Into::into),
-            ast::Item::MacroRules(ast) => self.lower_macro_rules(ast).map(Into::into),
-            ast::Item::MacroDef(ast) => self.lower_macro_def(ast).map(Into::into),
-            ast::Item::ExternBlock(ast) => {
-                Some(ModItems(self.lower_extern_block(ast).into_iter().collect::<SmallVec<_>>()))
-            }
+        let attrs = RawAttrs::new(self.db, item, &self.hygiene);
+        let item: ModItem = match item {
+            ast::Item::Struct(ast) => self.lower_struct(ast)?.into(),
+            ast::Item::Union(ast) => self.lower_union(ast)?.into(),
+            ast::Item::Enum(ast) => self.lower_enum(ast)?.into(),
+            ast::Item::Fn(ast) => self.lower_function(ast)?.into(),
+            ast::Item::TypeAlias(ast) => self.lower_type_alias(ast)?.into(),
+            ast::Item::Static(ast) => self.lower_static(ast)?.into(),
+            ast::Item::Const(ast) => self.lower_const(ast).into(),
+            ast::Item::Module(ast) => self.lower_module(ast)?.into(),
+            ast::Item::Trait(ast) => self.lower_trait(ast)?.into(),
+            ast::Item::Impl(ast) => self.lower_impl(ast)?.into(),
+            ast::Item::Use(ast) => self.lower_use(ast)?.into(),
+            ast::Item::ExternCrate(ast) => self.lower_extern_crate(ast)?.into(),
+            ast::Item::MacroCall(ast) => self.lower_macro_call(ast)?.into(),
+            ast::Item::MacroRules(ast) => self.lower_macro_rules(ast)?.into(),
+            ast::Item::MacroDef(ast) => self.lower_macro_def(ast)?.into(),
+            ast::Item::ExternBlock(ast) => self.lower_extern_block(ast).into(),
         };
 
-        if !attrs.is_empty() {
-            for item in items.iter().flat_map(|items| &items.0) {
-                self.add_attrs((*item).into(), attrs.clone());
-            }
-        }
+        self.add_attrs(item.into(), attrs);
 
-        items
+        Some(item)
     }
 
     fn add_attrs(&mut self, item: AttrOwner, attrs: RawAttrs) {
@@ -190,12 +166,10 @@ impl Ctx {
                             },
                             ast::Item(item) => {
                                 // FIXME: This triggers for macro calls in expression/pattern/type position
-                                let mod_items = self.lower_mod_item(&item, true);
+                                let mod_item = self.lower_mod_item(&item, true);
                                 let current_block = block_stack.last();
-                                if let (Some(mod_items), Some(block)) = (mod_items, current_block) {
-                                    if !mod_items.0.is_empty() {
-                                        self.data().inner_items.entry(*block).or_default().extend(mod_items.0.iter().copied());
-                                    }
+                                if let (Some(mod_item), Some(block)) = (mod_item, current_block) {
+                                        self.data().inner_items.entry(*block).or_default().push(mod_item);
                                 }
                             },
                             _ => {}
@@ -228,12 +202,7 @@ impl Ctx {
         let generic_params = self.lower_generic_params(GenericsOwner::Struct, strukt);
         let fields = self.lower_fields(&strukt.kind());
         let ast_id = self.source_ast_id_map.ast_id(strukt);
-        let kind = match strukt.kind() {
-            ast::StructKind::Record(_) => StructDefKind::Record,
-            ast::StructKind::Tuple(_) => StructDefKind::Tuple,
-            ast::StructKind::Unit => StructDefKind::Unit,
-        };
-        let res = Struct { name, visibility, generic_params, fields, ast_id, kind };
+        let res = Struct { name, visibility, generic_params, fields, ast_id };
         Some(id(self.data().structs.alloc(res)))
     }
 
@@ -256,7 +225,7 @@ impl Ctx {
         for field in fields.fields() {
             if let Some(data) = self.lower_record_field(&field) {
                 let idx = self.data().fields.alloc(data);
-                self.add_attrs(idx.into(), RawAttrs::new(&field, &self.hygiene));
+                self.add_attrs(idx.into(), RawAttrs::new(self.db, &field, &self.hygiene));
             }
         }
         let end = self.next_field_idx();
@@ -276,7 +245,7 @@ impl Ctx {
         for (i, field) in fields.fields().enumerate() {
             let data = self.lower_tuple_field(i, &field);
             let idx = self.data().fields.alloc(data);
-            self.add_attrs(idx.into(), RawAttrs::new(&field, &self.hygiene));
+            self.add_attrs(idx.into(), RawAttrs::new(self.db, &field, &self.hygiene));
         }
         let end = self.next_field_idx();
         IdRange::new(start..end)
@@ -307,10 +276,11 @@ impl Ctx {
         let visibility = self.lower_visibility(enum_);
         let name = enum_.name()?.as_name();
         let generic_params = self.lower_generic_params(GenericsOwner::Enum, enum_);
-        let variants = match &enum_.variant_list() {
-            Some(variant_list) => self.lower_variants(variant_list),
-            None => IdRange::new(self.next_variant_idx()..self.next_variant_idx()),
-        };
+        let variants =
+            self.with_inherited_visibility(visibility, |this| match &enum_.variant_list() {
+                Some(variant_list) => this.lower_variants(variant_list),
+                None => IdRange::new(this.next_variant_idx()..this.next_variant_idx()),
+            });
         let ast_id = self.source_ast_id_map.ast_id(enum_);
         let res = Enum { name, visibility, generic_params, variants, ast_id };
         Some(id(self.data().enums.alloc(res)))
@@ -321,7 +291,7 @@ impl Ctx {
         for variant in variants.variants() {
             if let Some(data) = self.lower_variant(&variant) {
                 let idx = self.data().variants.alloc(data);
-                self.add_attrs(idx.into(), RawAttrs::new(&variant, &self.hygiene));
+                self.add_attrs(idx.into(), RawAttrs::new(self.db, &variant, &self.hygiene));
             }
         }
         let end = self.next_variant_idx();
@@ -364,7 +334,7 @@ impl Ctx {
                 };
                 let ty = Interned::new(self_type);
                 let idx = self.data().params.alloc(Param::Normal(ty));
-                self.add_attrs(idx.into(), RawAttrs::new(&self_param, &self.hygiene));
+                self.add_attrs(idx.into(), RawAttrs::new(self.db, &self_param, &self.hygiene));
                 has_self_param = true;
             }
             for param in param_list.params() {
@@ -376,7 +346,7 @@ impl Ctx {
                         self.data().params.alloc(Param::Normal(ty))
                     }
                 };
-                self.add_attrs(idx.into(), RawAttrs::new(&param, &self.hygiene));
+                self.add_attrs(idx.into(), RawAttrs::new(self.db, &param, &self.hygiene));
             }
         }
         let end_param = self.next_param_idx();
@@ -387,27 +357,16 @@ impl Ctx {
             _ => TypeRef::unit(),
         };
 
-        let ret_type = if func.async_token().is_some() {
+        let (ret_type, async_ret_type) = if func.async_token().is_some() {
+            let async_ret_type = ret_type.clone();
             let future_impl = desugar_future_path(ret_type);
-            let ty_bound = TypeBound::Path(future_impl);
-            TypeRef::ImplTrait(vec![ty_bound])
+            let ty_bound = Interned::new(TypeBound::Path(future_impl));
+            (TypeRef::ImplTrait(vec![ty_bound]), Some(async_ret_type))
         } else {
-            ret_type
+            (ret_type, None)
         };
 
-        let abi = func.abi().map(|abi| {
-            // FIXME: Abi::abi() -> Option<SyntaxToken>?
-            match abi.syntax().last_token() {
-                Some(tok) if tok.kind() == SyntaxKind::STRING => {
-                    // FIXME: Better way to unescape?
-                    Interned::new_str(tok.text().trim_matches('"'))
-                }
-                _ => {
-                    // `extern` default to be `extern "C"`.
-                    Interned::new_str("C")
-                }
-            }
-        });
+        let abi = func.abi().map(lower_abi);
 
         let ast_id = self.source_ast_id_map.ast_id(func);
 
@@ -438,6 +397,7 @@ impl Ctx {
             abi,
             params,
             ret_type: Interned::new(ret_type),
+            async_ret_type: async_ret_type.map(Interned::new),
             ast_id,
             flags,
         };
@@ -497,10 +457,7 @@ impl Ctx {
                 items: module
                     .item_list()
                     .map(|list| {
-                        list.items()
-                            .flat_map(|item| self.lower_mod_item(&item, false))
-                            .flat_map(|items| items.0)
-                            .collect()
+                        list.items().flat_map(|item| self.lower_mod_item(&item, false)).collect()
                     })
                     .unwrap_or_else(|| {
                         cov_mark::hit!(name_res_works_for_broken_modules);
@@ -520,12 +477,12 @@ impl Ctx {
             self.lower_generic_params_and_inner_items(GenericsOwner::Trait(trait_def), trait_def);
         let is_auto = trait_def.auto_token().is_some();
         let is_unsafe = trait_def.unsafe_token().is_some();
-        let bounds = self.lower_type_bounds(trait_def);
         let items = trait_def.assoc_item_list().map(|list| {
+            let db = self.db;
             self.with_inherited_visibility(visibility, |this| {
                 list.assoc_items()
                     .filter_map(|item| {
-                        let attrs = RawAttrs::new(&item, &this.hygiene);
+                        let attrs = RawAttrs::new(db, &item, &this.hygiene);
                         this.collect_inner_items(item.syntax());
                         this.lower_assoc_item(&item).map(|item| {
                             this.add_attrs(ModItem::from(item).into(), attrs);
@@ -542,7 +499,6 @@ impl Ctx {
             generic_params,
             is_auto,
             is_unsafe,
-            bounds: bounds.into(),
             items: items.unwrap_or_default(),
             ast_id,
         };
@@ -567,7 +523,7 @@ impl Ctx {
             .filter_map(|item| {
                 self.collect_inner_items(item.syntax());
                 let assoc = self.lower_assoc_item(&item)?;
-                let attrs = RawAttrs::new(&item, &self.hygiene);
+                let attrs = RawAttrs::new(self.db, &item, &self.hygiene);
                 self.add_attrs(ModItem::from(assoc).into(), attrs);
                 Some(assoc)
             })
@@ -577,29 +533,13 @@ impl Ctx {
         Some(id(self.data().impls.alloc(res)))
     }
 
-    fn lower_use(&mut self, use_item: &ast::Use) -> Vec<FileItemTreeId<Import>> {
+    fn lower_use(&mut self, use_item: &ast::Use) -> Option<FileItemTreeId<Import>> {
         let visibility = self.lower_visibility(use_item);
         let ast_id = self.source_ast_id_map.ast_id(use_item);
+        let (use_tree, _) = lower_use_tree(self.db, &self.hygiene, use_item.use_tree()?)?;
 
-        // Every use item can expand to many `Import`s.
-        let mut imports = Vec::new();
-        let tree = self.tree.data_mut();
-        ModPath::expand_use_item(
-            InFile::new(self.file, use_item.clone()),
-            &self.hygiene,
-            |path, _use_tree, is_glob, alias| {
-                imports.push(id(tree.imports.alloc(Import {
-                    path: Interned::new(path),
-                    alias,
-                    visibility,
-                    is_glob,
-                    ast_id,
-                    index: imports.len(),
-                })));
-            },
-        );
-
-        imports
+        let res = Import { visibility, ast_id, use_tree };
+        Some(id(self.data().imports.alloc(res)))
     }
 
     fn lower_extern_crate(
@@ -618,9 +558,10 @@ impl Ctx {
     }
 
     fn lower_macro_call(&mut self, m: &ast::MacroCall) -> Option<FileItemTreeId<MacroCall>> {
-        let path = Interned::new(ModPath::from_src(m.path()?, &self.hygiene)?);
+        let path = Interned::new(ModPath::from_src(self.db, m.path()?, &self.hygiene)?);
         let ast_id = self.source_ast_id_map.ast_id(m);
-        let res = MacroCall { path, ast_id };
+        let fragment = hir_expand::to_fragment_kind(m);
+        let res = MacroCall { path, ast_id, fragment };
         Some(id(self.data().macro_calls.alloc(res)))
     }
 
@@ -642,12 +583,14 @@ impl Ctx {
         Some(id(self.data().macro_defs.alloc(res)))
     }
 
-    fn lower_extern_block(&mut self, block: &ast::ExternBlock) -> Vec<ModItem> {
-        block.extern_item_list().map_or(Vec::new(), |list| {
+    fn lower_extern_block(&mut self, block: &ast::ExternBlock) -> FileItemTreeId<ExternBlock> {
+        let ast_id = self.source_ast_id_map.ast_id(block);
+        let abi = block.abi().map(lower_abi);
+        let children: Box<[_]> = block.extern_item_list().map_or(Box::new([]), |list| {
             list.extern_items()
                 .filter_map(|item| {
                     self.collect_inner_items(item.syntax());
-                    let attrs = RawAttrs::new(&item, &self.hygiene);
+                    let attrs = RawAttrs::new(self.db, &item, &self.hygiene);
                     let id: ModItem = match item {
                         ast::ExternItem::Fn(ast) => {
                             let func_id = self.lower_function(&ast)?;
@@ -668,13 +611,20 @@ impl Ctx {
                             self.data().type_aliases[foreign_ty.index].is_extern = true;
                             foreign_ty.into()
                         }
-                        ast::ExternItem::MacroCall(_) => return None,
+                        ast::ExternItem::MacroCall(call) => {
+                            // FIXME: we need some way of tracking that the macro call is in an
+                            // extern block
+                            self.lower_macro_call(&call)?.into()
+                        }
                     };
                     self.add_attrs(id.into(), attrs);
                     Some(id)
                 })
                 .collect()
-        })
+        });
+
+        let res = ExternBlock { abi, ast_id, children };
+        id(self.data().extern_blocks.alloc(res))
     }
 
     /// Lowers generics defined on `node` and collects inner items defined within.
@@ -724,7 +674,7 @@ impl Ctx {
                     default: None,
                     provenance: TypeParamProvenance::TraitSelf,
                 });
-                sm.type_params.insert(self_param_id, Either::Left(trait_def.clone()));
+                sm.type_params.insert(self_param_id, Either::Right(trait_def.clone()));
                 // add super traits as bounds on Self
                 // i.e., trait Foo: Bar is equivalent to trait Foo where Self: Bar
                 let self_param = TypeRef::Path(name![Self].into());
@@ -743,11 +693,12 @@ impl Ctx {
         Interned::new(generics)
     }
 
-    fn lower_type_bounds(&mut self, node: &impl ast::TypeBoundsOwner) -> Vec<TypeBound> {
+    fn lower_type_bounds(&mut self, node: &impl ast::TypeBoundsOwner) -> Vec<Interned<TypeBound>> {
         match node.type_bound_list() {
-            Some(bound_list) => {
-                bound_list.bounds().map(|it| TypeBound::from_ast(&self.body_ctx, it)).collect()
-            }
+            Some(bound_list) => bound_list
+                .bounds()
+                .map(|it| Interned::new(TypeBound::from_ast(&self.body_ctx, it)))
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -755,7 +706,7 @@ impl Ctx {
     fn lower_visibility(&mut self, item: &impl ast::VisibilityOwner) -> RawVisibilityId {
         let vis = match self.forced_visibility {
             Some(vis) => return vis,
-            None => RawVisibility::from_ast_with_hygiene(item.visibility(), &self.hygiene),
+            None => RawVisibility::from_ast_with_hygiene(self.db, item.visibility(), &self.hygiene),
         };
 
         self.data().vis.alloc(vis)
@@ -815,7 +766,7 @@ fn desugar_future_path(orig: TypeRef) -> Path {
     let binding =
         AssociatedTypeBinding { name: name![Output], type_ref: Some(orig), bounds: Vec::new() };
     last.bindings.push(binding);
-    generic_args.push(Some(Arc::new(last)));
+    generic_args.push(Some(Interned::new(last)));
 
     Path::from_known_path(path, generic_args)
 }
@@ -872,5 +823,97 @@ fn is_intrinsic_fn_unsafe(name: &Name) -> bool {
         known::type_name,
         known::variant_count,
     ]
-    .contains(&name)
+    .contains(name)
+}
+
+fn lower_abi(abi: ast::Abi) -> Interned<str> {
+    // FIXME: Abi::abi() -> Option<SyntaxToken>?
+    match abi.syntax().last_token() {
+        Some(tok) if tok.kind() == SyntaxKind::STRING => {
+            // FIXME: Better way to unescape?
+            Interned::new_str(tok.text().trim_matches('"'))
+        }
+        _ => {
+            // `extern` default to be `extern "C"`.
+            Interned::new_str("C")
+        }
+    }
+}
+
+struct UseTreeLowering<'a> {
+    db: &'a dyn DefDatabase,
+    hygiene: &'a Hygiene,
+    mapping: Arena<ast::UseTree>,
+}
+
+impl UseTreeLowering<'_> {
+    fn lower_use_tree(&mut self, tree: ast::UseTree) -> Option<UseTree> {
+        if let Some(use_tree_list) = tree.use_tree_list() {
+            let prefix = match tree.path() {
+                // E.g. use something::{{{inner}}};
+                None => None,
+                // E.g. `use something::{inner}` (prefix is `None`, path is `something`)
+                // or `use something::{path::{inner::{innerer}}}` (prefix is `something::path`, path is `inner`)
+                Some(path) => {
+                    match ModPath::from_src(self.db, path, self.hygiene) {
+                        Some(it) => Some(it),
+                        None => return None, // FIXME: report errors somewhere
+                    }
+                }
+            };
+
+            let list =
+                use_tree_list.use_trees().filter_map(|tree| self.lower_use_tree(tree)).collect();
+
+            Some(
+                self.use_tree(
+                    UseTreeKind::Prefixed { prefix: prefix.map(Interned::new), list },
+                    tree,
+                ),
+            )
+        } else {
+            let is_glob = tree.star_token().is_some();
+            let path = match tree.path() {
+                Some(path) => Some(ModPath::from_src(self.db, path, self.hygiene)?),
+                None => None,
+            };
+            let alias = tree.rename().map(|a| {
+                a.name().map(|it| it.as_name()).map_or(ImportAlias::Underscore, ImportAlias::Alias)
+            });
+            if alias.is_some() && is_glob {
+                return None;
+            }
+
+            match (path, alias, is_glob) {
+                (path, None, true) => {
+                    if path.is_none() {
+                        cov_mark::hit!(glob_enum_group);
+                    }
+                    Some(self.use_tree(UseTreeKind::Glob { path: path.map(Interned::new) }, tree))
+                }
+                // Globs can't be renamed
+                (_, Some(_), true) | (None, None, false) => None,
+                // `bla::{ as Name}` is invalid
+                (None, Some(_), false) => None,
+                (Some(path), alias, false) => Some(
+                    self.use_tree(UseTreeKind::Single { path: Interned::new(path), alias }, tree),
+                ),
+            }
+        }
+    }
+
+    fn use_tree(&mut self, kind: UseTreeKind, ast: ast::UseTree) -> UseTree {
+        let index = self.mapping.alloc(ast);
+        UseTree { index, kind }
+    }
+}
+
+pub(super) fn lower_use_tree(
+    db: &dyn DefDatabase,
+    hygiene: &Hygiene,
+    tree: ast::UseTree,
+) -> Option<(UseTree, Arena<ast::UseTree>)> {
+    let mut lowering = UseTreeLowering { db, hygiene, mapping: Arena::new() };
+    let tree = lowering.lower_use_tree(tree)?;
+    Some((tree, lowering.mapping))
 }

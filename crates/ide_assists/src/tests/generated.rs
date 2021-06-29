@@ -50,7 +50,6 @@ trait Trait {
 impl Trait for () {
     type X = ();
     fn foo(&self) {}$0
-
 }
 "#####,
         r#####"
@@ -210,10 +209,7 @@ fn doctest_convert_into_to_from() {
     check_doc_test(
         "convert_into_to_from",
         r#####"
-//- /lib.rs crate:core
-pub mod convert { pub trait Into<T> { pub fn into(self) -> T; } }
-//- /lib.rs crate:main deps:core
-use core::convert::Into;
+//- minicore: from
 impl $0Into<Thing> for usize {
     fn into(self) -> Thing {
         Thing {
@@ -224,7 +220,6 @@ impl $0Into<Thing> for usize {
 }
 "#####,
         r#####"
-use core::convert::Into;
 impl From<usize> for Thing {
     fn from(val: usize) -> Self {
         Thing {
@@ -242,23 +237,19 @@ fn doctest_convert_iter_for_each_to_for() {
     check_doc_test(
         "convert_iter_for_each_to_for",
         r#####"
-//- /lib.rs crate:core
-pub mod iter { pub mod traits { pub mod iterator { pub trait Iterator {} } } }
-pub struct SomeIter;
-impl self::iter::traits::iterator::Iterator for SomeIter {}
-//- /lib.rs crate:main deps:core
-use core::SomeIter;
+//- minicore: iterators
+use core::iter;
 fn main() {
-    let iter = SomeIter;
+    let iter = iter::repeat((9, 2));
     iter.for_each$0(|(x, y)| {
         println!("x: {}, y: {}", x, y);
     });
 }
 "#####,
         r#####"
-use core::SomeIter;
+use core::iter;
 fn main() {
-    let iter = SomeIter;
+    let iter = iter::repeat((9, 2));
     for (x, y) in iter {
         println!("x: {}, y: {}", x, y);
     }
@@ -456,8 +447,8 @@ enum Action { Move { distance: u32 }, Stop }
 
 fn handle(action: Action) {
     match action {
-        $0Action::Move { distance } => {}
-        Action::Stop => {}
+        $0Action::Move { distance } => todo!(),
+        Action::Stop => todo!(),
     }
 }
 "#####,
@@ -787,8 +778,8 @@ struct Person {
 
 impl Person {
     /// Get a reference to the person's name.
-    fn name(&self) -> &String {
-        &self.name
+    fn $0name(&self) -> &str {
+        self.name.as_str()
     }
 }
 "#####,
@@ -811,7 +802,7 @@ struct Person {
 
 impl Person {
     /// Get a mutable reference to the person's name.
-    fn name_mut(&mut self) -> &mut String {
+    fn $0name_mut(&mut self) -> &mut String {
         &mut self.name
     }
 }
@@ -1520,18 +1511,17 @@ fn doctest_replace_unwrap_with_match() {
     check_doc_test(
         "replace_unwrap_with_match",
         r#####"
-enum Result<T, E> { Ok(T), Err(E) }
+//- minicore: result
 fn main() {
-    let x: Result<i32, i32> = Result::Ok(92);
+    let x: Result<i32, i32> = Ok(92);
     let y = x.$0unwrap();
 }
 "#####,
         r#####"
-enum Result<T, E> { Ok(T), Err(E) }
 fn main() {
-    let x: Result<i32, i32> = Result::Ok(92);
+    let x: Result<i32, i32> = Ok(92);
     let y = match x {
-        Ok(a) => a,
+        Ok(it) => it,
         $0_ => unreachable!(),
     };
 }

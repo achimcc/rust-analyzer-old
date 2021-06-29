@@ -3,24 +3,27 @@
 //! It is mainly a `HirDatabase` for semantic analysis, plus a `SymbolsDatabase`, for fuzzy search.
 
 mod apply_change;
+pub mod assists;
 pub mod label;
 pub mod line_index;
 pub mod symbol_index;
 pub mod defs;
-pub mod search;
 pub mod items_locator;
 pub mod source_change;
 pub mod ty_filter;
 pub mod traits;
 pub mod call_info;
 pub mod helpers;
+pub mod path_transform;
+
+pub mod search;
+pub mod rename;
 
 use std::{fmt, sync::Arc};
 
 use base_db::{
     salsa::{self, Durability},
-    AnchoredPath, Canceled, CheckCanceled, CrateId, FileId, FileLoader, FileLoaderDelegate,
-    SourceDatabase, Upcast,
+    AnchoredPath, CrateId, FileId, FileLoader, FileLoaderDelegate, SourceDatabase, Upcast,
 };
 use hir::db::{AstDatabase, DefDatabase, HirDatabase};
 use rustc_hash::FxHashSet;
@@ -80,20 +83,7 @@ impl FileLoader for RootDatabase {
     }
 }
 
-impl salsa::Database for RootDatabase {
-    fn on_propagated_panic(&self) -> ! {
-        Canceled::throw()
-    }
-    fn salsa_event(&self, event: salsa::Event) {
-        match event.kind {
-            salsa::EventKind::DidValidateMemoizedValue { .. }
-            | salsa::EventKind::WillExecute { .. } => {
-                self.check_canceled();
-            }
-            _ => (),
-        }
-    }
-}
+impl salsa::Database for RootDatabase {}
 
 impl Default for RootDatabase {
     fn default() -> RootDatabase {
@@ -107,6 +97,7 @@ impl RootDatabase {
         db.set_crate_graph_with_durability(Default::default(), Durability::HIGH);
         db.set_local_roots_with_durability(Default::default(), Durability::HIGH);
         db.set_library_roots_with_durability(Default::default(), Durability::HIGH);
+        db.set_enable_proc_attr_macros(Default::default());
         db.update_lru_capacity(lru_capacity);
         db
     }
@@ -126,7 +117,7 @@ impl salsa::ParallelDatabase for RootDatabase {
 }
 
 #[salsa::query_group(LineIndexDatabaseStorage)]
-pub trait LineIndexDatabase: base_db::SourceDatabase + CheckCanceled {
+pub trait LineIndexDatabase: base_db::SourceDatabase {
     fn line_index(&self, file_id: FileId) -> Arc<LineIndex>;
 }
 

@@ -10,10 +10,12 @@
 use std::{ffi::OsString, iter, path::PathBuf};
 
 use flycheck::FlycheckConfig;
-use ide::{AssistConfig, CompletionConfig, DiagnosticsConfig, HoverConfig, InlayHintsConfig};
+use ide::{
+    AssistConfig, CompletionConfig, DiagnosticsConfig, HoverConfig, HoverDocFormat,
+    InlayHintsConfig,
+};
 use ide_db::helpers::{
-    insert_use::{InsertUseConfig, PrefixKind},
-    merge_imports::MergeBehavior,
+    insert_use::{ImportGranularity, InsertUseConfig, PrefixKind},
     SnippetCap,
 };
 use lsp_types::{ClientCapabilities, MarkupKind};
@@ -24,7 +26,8 @@ use vfs::AbsPathBuf;
 
 use crate::{
     caps::completion_item_edit_resolve, diagnostics::DiagnosticsMapConfig,
-    line_index::OffsetEncoding, lsp_ext::supports_utf8,
+    line_index::OffsetEncoding, lsp_ext::supports_utf8, lsp_ext::WorkspaceSymbolSearchKind,
+    lsp_ext::WorkspaceSymbolSearchScope,
 };
 
 // Defines the server-side configuration of the rust-analyzer. We generate
@@ -32,23 +35,34 @@ use crate::{
 //
 // However, editor specific config, which the server doesn't know about, should
 // be specified directly in `package.json`.
+//
+// To deprecate an option by replacing it with another name use `new_name | `old_name` so that we keep
+// parsing the old name.
 config_data! {
     struct ConfigData {
-        /// The strategy to use when inserting new imports or merging imports.
+        /// How imports should be grouped into use statements.
+        assist_importGranularity |
         assist_importMergeBehavior |
-        assist_importMergeBehaviour: MergeBehaviorDef  = "\"full\"",
+        assist_importMergeBehaviour: ImportGranularityDef  = "\"crate\"",
+        /// Whether to enforce the import granularity setting for all files. If set to false rust-analyzer will try to keep import styles consistent per file.
+        assist_importEnforceGranularity: bool              = "false",
         /// The path structure for newly inserted paths to use.
-        assist_importPrefix: ImportPrefixDef           = "\"plain\"",
+        assist_importPrefix: ImportPrefixDef               = "\"plain\"",
         /// Group inserted imports by the [following order](https://rust-analyzer.github.io/manual.html#auto-import). Groups are separated by newlines.
-        assist_importGroup: bool                       = "true",
+        assist_importGroup: bool                           = "true",
+        /// Whether to allow import insertion to merge new imports into single path glob imports like `use std::fmt::*;`.
+        assist_allowMergingIntoGlobImports: bool           = "true",
+
         /// Show function name and docs in parameter hints.
-        callInfo_full: bool = "true",
+        callInfo_full: bool                                = "true",
 
         /// Automatically refresh project info via `cargo metadata` on
         /// `Cargo.toml` changes.
         cargo_autoreload: bool           = "true",
         /// Activate all available features (`--all-features`).
         cargo_allFeatures: bool          = "false",
+        /// Unsets `#[cfg(test)]` for the specified crates.
+        cargo_unsetTest: Vec<String>   = "[\"core\"]",
         /// List of features to activate.
         cargo_features: Vec<String>      = "[]",
         /// Run build scripts (`build.rs`) for more precise code analysis.
@@ -89,6 +103,7 @@ config_data! {
         checkOnSave_overrideCommand: Option<Vec<String>> = "null",
 
         /// Whether to add argument snippets when completing functions.
+        /// Only applies when `#rust-analyzer.completion.addCallParenthesis#` is set.
         completion_addCallArgumentSnippets: bool = "true",
         /// Whether to add parenthesis when completing functions.
         completion_addCallParenthesis: bool      = "true",
@@ -97,6 +112,9 @@ config_data! {
         /// Toggles the additional completions that automatically add imports when completed.
         /// Note that your client must specify the `additionalTextEdits` LSP client capability to truly have this feature enabled.
         completion_autoimport_enable: bool       = "true",
+        /// Toggles the additional completions that automatically show method calls and field accesses
+        /// with `self` prefixed to them when inside a method.
+        completion_autoself_enable: bool       = "true",
 
         /// Whether to show native rust-analyzer diagnostics.
         diagnostics_enable: bool                = "true",
@@ -108,21 +126,37 @@ config_data! {
         /// Map of prefixes to be substituted when parsing diagnostic file paths.
         /// This should be the reverse mapping of what is passed to `rustc` as `--remap-path-prefix`.
         diagnostics_remapPrefix: FxHashMap<String, String> = "{}",
-        /// List of warnings that should be displayed with info severity.
-        ///
-        /// The warnings will be indicated by a blue squiggly underline in code
-        /// and a blue icon in the `Problems Panel`.
-        diagnostics_warningsAsHint: Vec<String> = "[]",
         /// List of warnings that should be displayed with hint severity.
         ///
         /// The warnings will be indicated by faded text or three dots in code
         /// and will not show up in the `Problems Panel`.
+        diagnostics_warningsAsHint: Vec<String> = "[]",
+        /// List of warnings that should be displayed with info severity.
+        ///
+        /// The warnings will be indicated by a blue squiggly underline in code
+        /// and a blue icon in the `Problems Panel`.
         diagnostics_warningsAsInfo: Vec<String> = "[]",
+
+        /// Expand attribute macros.
+        experimental_procAttrMacros: bool = "false",
 
         /// Controls file watching implementation.
         files_watcher: String = "\"client\"",
         /// These directories will be ignored by rust-analyzer.
         files_excludeDirs: Vec<PathBuf> = "[]",
+
+        /// Use semantic tokens for strings.
+        ///
+        /// In some editors (e.g. vscode) semantic tokens override other highlighting grammars.
+        /// By disabling semantic tokens for strings, other grammars can be used to highlight
+        /// their contents.
+        highlighting_strings: bool = "true",
+
+        /// Whether to show documentation on hover.
+        hover_documentation: bool       = "true",
+        /// Use markdown syntax for links in hover.
+        hover_linksInHover |
+        hoverActions_linksInHover: bool = "true",
 
         /// Whether to show `Debug` action. Only applies when
         /// `#rust-analyzer.hoverActions.enable#` is set.
@@ -135,11 +169,12 @@ config_data! {
         /// Whether to show `Implementations` action. Only applies when
         /// `#rust-analyzer.hoverActions.enable#` is set.
         hoverActions_implementations: bool = "true",
+        /// Whether to show `References` action. Only applies when
+        /// `#rust-analyzer.hoverActions.enable#` is set.
+        hoverActions_references: bool      = "false",
         /// Whether to show `Run` action. Only applies when
         /// `#rust-analyzer.hoverActions.enable#` is set.
         hoverActions_run: bool             = "true",
-        /// Use markdown syntax for links in hover.
-        hoverActions_linksInHover: bool    = "true",
 
         /// Whether to show inlay type hints for method chains.
         inlayHints_chainingHints: bool      = "true",
@@ -208,6 +243,15 @@ config_data! {
         /// Advanced option, fully override the command rust-analyzer uses for
         /// formatting.
         rustfmt_overrideCommand: Option<Vec<String>> = "null",
+        /// Enables the use of rustfmt's unstable range formatting command for the
+        /// `textDocument/rangeFormatting` request. The rustfmt option is unstable and only
+        /// available on a nightly build.
+        rustfmt_enableRangeFormatting: bool = "false",
+
+        /// Workspace symbol search scope.
+        workspace_symbol_search_scope: WorskpaceSymbolSearchScopeDef = "\"workspace\"",
+        /// Workspace symbol search kind.
+        workspace_symbol_search_kind: WorskpaceSymbolSearchKindDef = "\"only_types\"",
     }
 }
 
@@ -219,8 +263,9 @@ impl Default for ConfigData {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    caps: lsp_types::ClientCapabilities,
+    pub caps: lsp_types::ClientCapabilities,
     data: ConfigData,
+    detached_files: Vec<AbsPathBuf>,
     pub discovered_projects: Option<Vec<ProjectManifest>>,
     pub root_path: AbsPathBuf,
 }
@@ -270,6 +315,37 @@ impl LensConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HoverActionsConfig {
+    pub implementations: bool,
+    pub references: bool,
+    pub run: bool,
+    pub debug: bool,
+    pub goto_type_def: bool,
+}
+
+impl HoverActionsConfig {
+    pub const NO_ACTIONS: Self = Self {
+        implementations: false,
+        references: false,
+        run: false,
+        debug: false,
+        goto_type_def: false,
+    };
+
+    pub fn any(&self) -> bool {
+        self.implementations || self.references || self.runnable() || self.goto_type_def
+    }
+
+    pub fn none(&self) -> bool {
+        !self.any()
+    }
+
+    pub fn runnable(&self) -> bool {
+        self.run || self.debug
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FilesConfig {
     pub watcher: FilesWatcher,
@@ -289,7 +365,7 @@ pub struct NotificationsConfig {
 
 #[derive(Debug, Clone)]
 pub enum RustfmtConfig {
-    Rustfmt { extra_args: Vec<String> },
+    Rustfmt { extra_args: Vec<String>, enable_range_formatting: bool },
     CustomCommand { command: String, args: Vec<String> },
 }
 
@@ -302,15 +378,34 @@ pub struct RunnablesConfig {
     pub cargo_extra_args: Vec<String>,
 }
 
+/// Configuration for workspace symbol search requests.
+#[derive(Debug, Clone)]
+pub struct WorkspaceSymbolConfig {
+    /// In what scope should the symbol be searched in.
+    pub search_scope: WorkspaceSymbolSearchScope,
+    /// What kind of symbol is being search for.
+    pub search_kind: WorkspaceSymbolSearchKind,
+}
+
 impl Config {
     pub fn new(root_path: AbsPathBuf, caps: ClientCapabilities) -> Self {
-        Config { caps, data: ConfigData::default(), discovered_projects: None, root_path }
+        Config {
+            caps,
+            data: ConfigData::default(),
+            detached_files: Vec::new(),
+            discovered_projects: None,
+            root_path,
+        }
     }
-    pub fn update(&mut self, json: serde_json::Value) {
+    pub fn update(&mut self, mut json: serde_json::Value) {
         log::info!("updating config from JSON: {:#}", json);
         if json.is_null() || json.as_object().map_or(false, |it| it.is_empty()) {
             return;
         }
+        self.detached_files = get_field::<Vec<PathBuf>>(&mut json, "detachedFiles", None, "[]")
+            .into_iter()
+            .map(AbsPathBuf::assert)
+            .collect();
         self.data = ConfigData::from_json(json);
     }
 
@@ -361,6 +456,10 @@ impl Config {
                 })
                 .collect()
         }
+    }
+
+    pub fn detached_files(&self) -> &[AbsPathBuf] {
+        &self.detached_files
     }
 
     pub fn did_save_text_document_dynamic_registration(&self) -> bool {
@@ -465,7 +564,7 @@ impl Config {
     pub fn code_action_group(&self) -> bool {
         self.experimental("codeActionGroup")
     }
-    pub fn hover_actions(&self) -> bool {
+    pub fn experimental_hover_actions(&self) -> bool {
         self.experimental("hoverActions")
     }
     pub fn server_status_notification(&self) -> bool {
@@ -498,6 +597,9 @@ impl Config {
 
         let path = self.data.procMacro_server.clone().or_else(|| std::env::current_exe().ok())?;
         Some((path, vec!["proc-macro".into()]))
+    }
+    pub fn expand_proc_attr_macros(&self) -> bool {
+        self.data.experimental_procAttrMacros
     }
     pub fn files(&self) -> FilesConfig {
         FilesConfig {
@@ -536,8 +638,10 @@ impl Config {
             target: self.data.cargo_target.clone(),
             rustc_source,
             no_sysroot: self.data.cargo_noSysroot,
+            unset_test_crates: self.data.cargo_unsetTest.clone(),
         }
     }
+
     pub fn rustfmt(&self) -> RustfmtConfig {
         match &self.data.rustfmt_overrideCommand {
             Some(args) if !args.is_empty() => {
@@ -545,9 +649,10 @@ impl Config {
                 let command = args.remove(0);
                 RustfmtConfig::CustomCommand { command, args }
             }
-            Some(_) | None => {
-                RustfmtConfig::Rustfmt { extra_args: self.data.rustfmt_extraArgs.clone() }
-            }
+            Some(_) | None => RustfmtConfig::Rustfmt {
+                extra_args: self.data.rustfmt_extraArgs.clone(),
+                enable_range_formatting: self.data.rustfmt_enableRangeFormatting,
+            },
         }
     }
     pub fn flycheck(&self) -> Option<FlycheckConfig> {
@@ -602,17 +707,20 @@ impl Config {
     }
     fn insert_use_config(&self) -> InsertUseConfig {
         InsertUseConfig {
-            merge: match self.data.assist_importMergeBehavior {
-                MergeBehaviorDef::None => None,
-                MergeBehaviorDef::Full => Some(MergeBehavior::Full),
-                MergeBehaviorDef::Last => Some(MergeBehavior::Last),
+            granularity: match self.data.assist_importGranularity {
+                ImportGranularityDef::Preserve => ImportGranularity::Preserve,
+                ImportGranularityDef::Item => ImportGranularity::Item,
+                ImportGranularityDef::Crate => ImportGranularity::Crate,
+                ImportGranularityDef::Module => ImportGranularity::Module,
             },
+            enforce_granularity: self.data.assist_importEnforceGranularity,
             prefix_kind: match self.data.assist_importPrefix {
                 ImportPrefixDef::Plain => PrefixKind::Plain,
                 ImportPrefixDef::ByCrate => PrefixKind::ByCrate,
                 ImportPrefixDef::BySelf => PrefixKind::BySelf,
             },
             group: self.data.assist_importGroup,
+            skip_glob_imports: !self.data.assist_allowMergingIntoGlobImports,
         }
     }
     pub fn completion(&self) -> CompletionConfig {
@@ -620,6 +728,7 @@ impl Config {
             enable_postfix_completions: self.data.completion_postfix_enable,
             enable_imports_on_the_fly: self.data.completion_autoimport_enable
                 && completion_item_edit_resolve(&self.caps),
+            enable_self_on_the_fly: self.data.completion_autoself_enable,
             add_call_parenthesis: self.data.completion_addCallParenthesis,
             add_call_argument_snippets: self.data.completion_addCallArgumentSnippets,
             insert_use: self.insert_use_config(),
@@ -655,28 +764,59 @@ impl Config {
             refs: self.data.lens_enable && self.data.lens_references,
         }
     }
-    pub fn hover(&self) -> HoverConfig {
-        HoverConfig {
+    pub fn hover_actions(&self) -> HoverActionsConfig {
+        HoverActionsConfig {
             implementations: self.data.hoverActions_enable
                 && self.data.hoverActions_implementations,
+            references: self.data.hoverActions_enable && self.data.hoverActions_references,
             run: self.data.hoverActions_enable && self.data.hoverActions_run,
             debug: self.data.hoverActions_enable && self.data.hoverActions_debug,
             goto_type_def: self.data.hoverActions_enable && self.data.hoverActions_gotoTypeDef,
-            links_in_hover: self.data.hoverActions_linksInHover,
-            markdown: try_or!(
-                self.caps
-                    .text_document
-                    .as_ref()?
-                    .hover
-                    .as_ref()?
-                    .content_format
-                    .as_ref()?
-                    .as_slice(),
-                &[]
-            )
-            .contains(&MarkupKind::Markdown),
         }
     }
+    pub fn highlighting_strings(&self) -> bool {
+        self.data.highlighting_strings
+    }
+    pub fn hover(&self) -> HoverConfig {
+        HoverConfig {
+            links_in_hover: self.data.hover_linksInHover,
+            documentation: self.data.hover_documentation.then(|| {
+                let is_markdown = try_or!(
+                    self.caps
+                        .text_document
+                        .as_ref()?
+                        .hover
+                        .as_ref()?
+                        .content_format
+                        .as_ref()?
+                        .as_slice(),
+                    &[]
+                )
+                .contains(&MarkupKind::Markdown);
+                if is_markdown {
+                    HoverDocFormat::Markdown
+                } else {
+                    HoverDocFormat::PlainText
+                }
+            }),
+        }
+    }
+
+    pub fn workspace_symbol(&self) -> WorkspaceSymbolConfig {
+        WorkspaceSymbolConfig {
+            search_scope: match self.data.workspace_symbol_search_scope {
+                WorskpaceSymbolSearchScopeDef::Workspace => WorkspaceSymbolSearchScope::Workspace,
+                WorskpaceSymbolSearchScopeDef::WorkspaceAndDependencies => {
+                    WorkspaceSymbolSearchScope::WorkspaceAndDependencies
+                }
+            },
+            search_kind: match self.data.workspace_symbol_search_kind {
+                WorskpaceSymbolSearchKindDef::OnlyTypes => WorkspaceSymbolSearchKind::OnlyTypes,
+                WorskpaceSymbolSearchKindDef::AllSymbols => WorkspaceSymbolSearchKind::AllSymbols,
+            },
+        }
+    }
+
     pub fn semantic_tokens_refresh(&self) -> bool {
         try_or!(self.caps.workspace.as_ref()?.semantic_tokens.as_ref()?.refresh_support?, false)
     }
@@ -707,25 +847,45 @@ enum ManifestOrProjectJson {
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
-enum MergeBehaviorDef {
-    None,
-    Full,
-    Last,
+enum ImportGranularityDef {
+    Preserve,
+    #[serde(alias = "none")]
+    Item,
+    #[serde(alias = "full")]
+    Crate,
+    #[serde(alias = "last")]
+    Module,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
 enum ImportPrefixDef {
     Plain,
+    #[serde(alias = "self")]
     BySelf,
+    #[serde(alias = "crate")]
     ByCrate,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case")]
+enum WorskpaceSymbolSearchScopeDef {
+    Workspace,
+    WorkspaceAndDependencies,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case")]
+enum WorskpaceSymbolSearchKindDef {
+    OnlyTypes,
+    AllSymbols,
 }
 
 macro_rules! _config_data {
     (struct $name:ident {
         $(
             $(#[doc=$doc:literal])*
-            $field:ident $(| $alias:ident)?: $ty:ty = $default:expr,
+            $field:ident $(| $alias:ident)*: $ty:ty = $default:expr,
         )*
     }) => {
         #[allow(non_snake_case)]
@@ -737,7 +897,7 @@ macro_rules! _config_data {
                     $field: get_field(
                         &mut json,
                         stringify!($field),
-                        None$(.or(Some(stringify!($alias))))?,
+                        None$(.or(Some(stringify!($alias))))*,
                         $default,
                     ),
                 )*}
@@ -748,6 +908,7 @@ macro_rules! _config_data {
                     $({
                         let field = stringify!($field);
                         let ty = stringify!($ty);
+
                         (field, ty, &[$($doc),*], $default)
                     },)*
                 ])
@@ -759,6 +920,7 @@ macro_rules! _config_data {
                     $({
                         let field = stringify!($field);
                         let ty = stringify!($ty);
+
                         (field, ty, &[$($doc),*], $default)
                     },)*
                 ])
@@ -867,29 +1029,55 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
         },
         "MergeBehaviorDef" => set! {
             "type": "string",
-            "enum": ["none", "full", "last"],
+            "enum": ["none", "crate", "module"],
             "enumDescriptions": [
-                "No merging",
-                "Merge all layers of the import trees",
-                "Only merge the last layer of the import trees"
+                "Do not merge imports at all.",
+                "Merge imports from the same crate into a single `use` statement.",
+                "Merge imports from the same module into a single `use` statement."
+            ],
+        },
+        "ImportGranularityDef" => set! {
+            "type": "string",
+            "enum": ["preserve", "crate", "module", "item"],
+            "enumDescriptions": [
+                "Do not change the granularity of any imports and preserve the original structure written by the developer.",
+                "Merge imports from the same crate into a single use statement. Conversely, imports from different crates are split into separate statements.",
+                "Merge imports from the same module into a single use statement. Conversely, imports from different modules are split into separate statements.",
+                "Flatten imports so that each has its own use statement."
             ],
         },
         "ImportPrefixDef" => set! {
             "type": "string",
             "enum": [
                 "plain",
-                "by_self",
-                "by_crate"
+                "self",
+                "crate"
             ],
             "enumDescriptions": [
                 "Insert import paths relative to the current module, using up to one `super` prefix if the parent module contains the requested item.",
-                "Prefix all import paths with `self` if they don't begin with `self`, `super`, `crate` or a crate name.",
-                "Force import paths to be absolute by always starting them with `crate` or the crate name they refer to."
+                "Insert import paths relative to the current module, using up to one `super` prefix if the parent module contains the requested item. Prefixes `self` in front of the path if it starts with a module.",
+                "Force import paths to be absolute by always starting them with `crate` or the extern crate name they come from."
             ],
         },
         "Vec<ManifestOrProjectJson>" => set! {
             "type": "array",
             "items": { "type": ["string", "object"] },
+        },
+        "WorskpaceSymbolSearchScopeDef" => set! {
+            "type": "string",
+            "enum": ["workspace", "workspace_and_dependencies"],
+            "enumDescriptions": [
+                "Search in current workspace only",
+                "Search in current workspace and dependencies"
+            ],
+        },
+        "WorskpaceSymbolSearchKindDef" => set! {
+            "type": "string",
+            "enum": ["only_types", "all_symbols"],
+            "enumDescriptions": [
+                "Search for types only",
+                "Search for all symbols kinds"
+            ],
         },
         _ => panic!("{}: {}", ty, default),
     }
@@ -938,8 +1126,8 @@ mod tests {
         let package_json_path = project_root().join("editors/code/package.json");
         let mut package_json = fs::read_to_string(&package_json_path).unwrap();
 
-        let start_marker = "                \"$generated-start\": false,\n";
-        let end_marker = "                \"$generated-end\": false\n";
+        let start_marker = "                \"$generated-start\": {},\n";
+        let end_marker = "                \"$generated-end\": {}\n";
 
         let start = package_json.find(start_marker).unwrap() + start_marker.len();
         let end = package_json.find(end_marker).unwrap();

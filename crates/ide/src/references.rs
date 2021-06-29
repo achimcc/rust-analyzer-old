@@ -9,8 +9,6 @@
 //! at the index that the match starts at and its tree parent is
 //! resolved to the search element definition, we get a reference.
 
-pub(crate) mod rename;
-
 use hir::{PathResolution, Semantics};
 use ide_db::{
     base_db::FileId,
@@ -22,7 +20,7 @@ use rustc_hash::FxHashMap;
 use syntax::{
     algo::find_node_at_offset,
     ast::{self, NameOwner},
-    match_ast, AstNode, SyntaxNode, TextRange, T,
+    match_ast, AstNode, SyntaxNode, TextRange, TextSize, T,
 };
 
 use crate::{display::TryToNav, FilePosition, NavigationTarget};
@@ -62,10 +60,10 @@ pub(crate) fn find_all_refs(
         if let Some(name) = get_name_of_item_declaration(&syntax, position) {
             (NameClass::classify(sema, &name)?.referenced_or_defined(sema.db), true)
         } else {
-            (find_def(&sema, &syntax, position)?, false)
+            (find_def(sema, &syntax, position.offset)?, false)
         };
 
-    let mut usages = def.usages(sema).set_scope(search_scope).all();
+    let mut usages = def.usages(sema).set_scope(search_scope).include_self_refs().all();
     if is_literal_search {
         // filter for constructor-literals
         let refs = usages.references.values_mut();
@@ -81,8 +79,7 @@ pub(crate) fn find_all_refs(
                 });
                 usages.references.retain(|_, it| !it.is_empty());
             }
-            Definition::ModuleDef(hir::ModuleDef::Adt(_))
-            | Definition::ModuleDef(hir::ModuleDef::Variant(_)) => {
+            Definition::ModuleDef(hir::ModuleDef::Adt(_) | hir::ModuleDef::Variant(_)) => {
                 refs.for_each(|it| {
                     it.retain(|reference| {
                         reference.name.as_name_ref().map_or(false, is_lit_name_ref)
@@ -93,7 +90,13 @@ pub(crate) fn find_all_refs(
             _ => {}
         }
     }
-    let declaration = def.try_to_nav(sema.db).map(|nav| {
+    let declaration = match def {
+        Definition::ModuleDef(hir::ModuleDef::Module(module)) => {
+            Some(NavigationTarget::from_module_to_decl(sema.db, module))
+        }
+        def => def.try_to_nav(sema.db),
+    }
+    .map(|nav| {
         let decl_range = nav.focus_or_full_range();
         Declaration { nav, access: decl_access(&def, &syntax, decl_range) }
     });
@@ -107,12 +110,12 @@ pub(crate) fn find_all_refs(
     Some(ReferenceSearchResult { declaration, references })
 }
 
-fn find_def(
+pub(crate) fn find_def(
     sema: &Semantics<RootDatabase>,
     syntax: &SyntaxNode,
-    position: FilePosition,
+    offset: TextSize,
 ) -> Option<Definition> {
-    let def = match sema.find_node_at_offset_with_descend(syntax, position.offset)? {
+    let def = match sema.find_node_at_offset_with_descend(syntax, offset)? {
         ast::NameLike::NameRef(name_ref) => {
             NameRefClass::classify(sema, &name_ref)?.referenced(sema.db)
         }
@@ -129,7 +132,11 @@ fn find_def(
     Some(def)
 }
 
-fn decl_access(def: &Definition, syntax: &SyntaxNode, range: TextRange) -> Option<ReferenceAccess> {
+pub(crate) fn decl_access(
+    def: &Definition,
+    syntax: &SyntaxNode,
+    range: TextRange,
+) -> Option<ReferenceAccess> {
     match def {
         Definition::Local(_) | Definition::Field(_) => {}
         _ => return None,
@@ -661,9 +668,6 @@ fn f() {
         );
     }
 
-    // `mod foo;` is not in the results because `foo` is an `ast::Name`.
-    // So, there are two references: the first one is a definition of the `foo` module,
-    // which is the whole `foo.rs`, and the second one is in `use foo::Foo`.
     #[test]
     fn test_find_all_refs_decl_module() {
         check(
@@ -683,9 +687,40 @@ pub struct Foo {
 }
 "#,
             expect![[r#"
-                foo Module FileId(1) 0..35
+                foo Module FileId(0) 0..8 4..7
 
                 FileId(0) 14..17
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_find_all_refs_decl_module_on_self() {
+        check(
+            r#"
+//- /lib.rs
+mod foo;
+
+//- /foo.rs
+use self$0;
+"#,
+            expect![[r#"
+                foo Module FileId(0) 0..8 4..7
+
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_find_all_refs_decl_module_on_self_crate_root() {
+        check(
+            r#"
+//- /lib.rs
+use self$0;
+"#,
+            expect![[r#"
+                Module FileId(0) 0..10
+
             "#]],
         );
     }
@@ -1024,7 +1059,7 @@ impl Foo {
                 actual += "\n";
             }
         }
-        expect.assert_eq(&actual)
+        expect.assert_eq(actual.trim_start())
     }
 
     #[test]
@@ -1163,21 +1198,75 @@ fn foo<const FOO$0: usize>() -> usize {
     }
 
     #[test]
-    fn test_find_self_ty_in_trait_def() {
+    fn test_trait() {
         check(
             r#"
-trait Foo {
-    fn f() -> Self$0;
-}
+trait Foo$0 where Self: {}
+
+impl Foo for () {}
 "#,
             expect![[r#"
-                Self TypeParam FileId(0) 6..9 6..9
+                Foo Trait FileId(0) 0..24 6..9
 
-                FileId(0) 26..30
+                FileId(0) 31..34
             "#]],
         );
     }
 
+    #[test]
+    fn test_trait_self() {
+        check(
+            r#"
+trait Foo where Self$0 {
+    fn f() -> Self;
+}
+
+impl Foo for () {}
+"#,
+            expect![[r#"
+                Self TypeParam FileId(0) 6..9 6..9
+
+                FileId(0) 16..20
+                FileId(0) 37..41
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_self_ty() {
+        check(
+            r#"
+        struct $0Foo;
+
+        impl Foo where Self: {
+            fn f() -> Self;
+        }
+        "#,
+            expect![[r#"
+                Foo Struct FileId(0) 0..11 7..10
+
+                FileId(0) 18..21
+                FileId(0) 28..32
+                FileId(0) 50..54
+            "#]],
+        );
+        check(
+            r#"
+struct Foo;
+
+impl Foo where Self: {
+    fn f() -> Self$0;
+}
+"#,
+            expect![[r#"
+                impl Impl FileId(0) 13..57 18..21
+
+                FileId(0) 18..21
+                FileId(0) 28..32
+                FileId(0) 50..54
+            "#]],
+        );
+    }
     #[test]
     fn test_self_variant_with_payload() {
         check(
@@ -1323,6 +1412,26 @@ lib::foo!();
                 FileId(0) 46..49
                 FileId(2) 0..3
                 FileId(3) 5..8
+            "#]],
+        );
+    }
+
+    #[test]
+    fn macro_doesnt_reference_attribute_on_call() {
+        check(
+            r#"
+macro_rules! m {
+    () => {};
+}
+
+#[proc_macro_test::attr_noop]
+m$0!();
+
+"#,
+            expect![[r#"
+                m Macro FileId(0) 0..32 13..14
+
+                FileId(0) 64..65
             "#]],
         );
     }

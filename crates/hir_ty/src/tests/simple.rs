@@ -11,7 +11,7 @@ fn test() {
     let x = box 1;
     let t = (x, box x, box &1, box [1]);
     t;
-} //^ (Box<i32>, Box<Box<i32>>, Box<&i32>, Box<[i32; _]>)
+} //^ (Box<i32>, Box<Box<i32>>, Box<&i32>, Box<[i32; 1]>)
 
 //- /std.rs crate:std
 #[prelude_import] use prelude::*;
@@ -36,7 +36,7 @@ fn test() {
     let x = box 1;
     let t = (x, box x, box &1, box [1]);
     t;
-} //^ (Box<i32, {unknown}>, Box<Box<i32, {unknown}>, {unknown}>, Box<&i32, {unknown}>, Box<[i32; _], {unknown}>)
+} //^ (Box<i32, {unknown}>, Box<Box<i32, {unknown}>, {unknown}>, Box<&i32, {unknown}>, Box<[i32; 1], {unknown}>)
 
 //- /std.rs crate:std
 #[prelude_import] use prelude::*;
@@ -60,7 +60,7 @@ enum Nat { Succ(Self), Demo(Nat), Zero }
 fn test() {
     let foo: Nat = Nat::Zero;
     if let Nat::Succ(x) = foo {
-        x
+        x;
     } //^ Nat
 }
 "#,
@@ -113,7 +113,7 @@ fn type_alias_in_struct_lit() {
 fn infer_ranges() {
     check_types(
         r#"
-//- /main.rs crate:main deps:core
+//- minicore: range
 fn test() {
     let a = ..;
     let b = 1..;
@@ -125,32 +125,6 @@ fn test() {
     let t = (a, b, c, d, e, f);
     t;
 } //^ (RangeFull, RangeFrom<i32>, RangeTo<u32>, Range<usize>, RangeToInclusive<i32>, RangeInclusive<char>)
-
-//- /core.rs crate:core
-#[prelude_import] use prelude::*;
-mod prelude {}
-
-pub mod ops {
-    pub struct Range<Idx> {
-        pub start: Idx,
-        pub end: Idx,
-    }
-    pub struct RangeFrom<Idx> {
-        pub start: Idx,
-    }
-    struct RangeFull;
-    pub struct RangeInclusive<Idx> {
-        start: Idx,
-        end: Idx,
-        is_empty: u8,
-    }
-    pub struct RangeTo<Idx> {
-        pub end: Idx,
-    }
-    pub struct RangeToInclusive<Idx> {
-        pub end: Idx,
-    }
-}
 "#,
     );
 }
@@ -164,7 +138,7 @@ enum Option<T> { Some(T), None }
 fn test() {
     let foo: Option<f32> = None;
     while let Option::Some(x) = foo {
-        x
+        x;
     } //^ f32
 }
 "#,
@@ -175,16 +149,17 @@ fn test() {
 fn infer_basics() {
     check_infer(
         r#"
-        fn test(a: u32, b: isize, c: !, d: &str) {
-            a;
-            b;
-            c;
-            d;
-            1usize;
-            1isize;
-            "test";
-            1.0f32;
-        }"#,
+fn test(a: u32, b: isize, c: !, d: &str) {
+    a;
+    b;
+    c;
+    d;
+    1usize;
+    1isize;
+    "test";
+    1.0f32;
+}
+"#,
         expect![[r#"
             8..9 'a': u32
             16..17 'b': isize
@@ -207,15 +182,15 @@ fn infer_basics() {
 fn infer_let() {
     check_infer(
         r#"
-        fn test() {
-            let a = 1isize;
-            let b: usize = 1;
-            let c = b;
-            let d: u32;
-            let e;
-            let f: i32 = e;
-        }
-        "#,
+fn test() {
+    let a = 1isize;
+    let b: usize = 1;
+    let c = b;
+    let d: u32;
+    let e;
+    let f: i32 = e;
+}
+"#,
         expect![[r#"
             10..117 '{     ...= e; }': ()
             20..21 'a': isize
@@ -236,17 +211,17 @@ fn infer_let() {
 fn infer_paths() {
     check_infer(
         r#"
-        fn a() -> u32 { 1 }
+fn a() -> u32 { 1 }
 
-        mod b {
-            fn c() -> u32 { 1 }
-        }
+mod b {
+    fn c() -> u32 { 1 }
+}
 
-        fn test() {
-            a();
-            b::c();
-        }
-        "#,
+fn test() {
+    a();
+    b::c();
+}
+"#,
         expect![[r#"
             14..19 '{ 1 }': u32
             16..17 '1': u32
@@ -265,17 +240,17 @@ fn infer_paths() {
 fn infer_path_type() {
     check_infer(
         r#"
-        struct S;
+struct S;
 
-        impl S {
-            fn foo() -> i32 { 1 }
-        }
+impl S {
+    fn foo() -> i32 { 1 }
+}
 
-        fn test() {
-            S::foo();
-            <S>::foo();
-        }
-        "#,
+fn test() {
+    S::foo();
+    <S>::foo();
+}
+"#,
         expect![[r#"
             40..45 '{ 1 }': i32
             42..43 '1': i32
@@ -292,21 +267,21 @@ fn infer_path_type() {
 fn infer_struct() {
     check_infer(
         r#"
-        struct A {
-            b: B,
-            c: C,
-        }
-        struct B;
-        struct C(usize);
+struct A {
+    b: B,
+    c: C,
+}
+struct B;
+struct C(usize);
 
-        fn test() {
-            let c = C(1);
-            B;
-            let a: A = A { b: B, c: C(1) };
-            a.b;
-            a.c;
-        }
-        "#,
+fn test() {
+    let c = C(1);
+    B;
+    let a: A = A { b: B, c: C(1) };
+    a.b;
+    a.c;
+}
+"#,
         expect![[r#"
             71..153 '{     ...a.c; }': ()
             81..82 'c': C
@@ -332,14 +307,15 @@ fn infer_struct() {
 fn infer_enum() {
     check_infer(
         r#"
-        enum E {
-            V1 { field: u32 },
-            V2
-        }
-        fn test() {
-            E::V1 { field: 1 };
-            E::V2;
-        }"#,
+enum E {
+    V1 { field: u32 },
+    V2
+}
+fn test() {
+    E::V1 { field: 1 };
+    E::V2;
+}
+"#,
         expect![[r#"
             51..89 '{     ...:V2; }': ()
             57..75 'E::V1 ...d: 1 }': E
@@ -353,23 +329,23 @@ fn infer_enum() {
 fn infer_union() {
     check_infer(
         r#"
-        union MyUnion {
-            foo: u32,
-            bar: f32,
-        }
+union MyUnion {
+    foo: u32,
+    bar: f32,
+}
 
-        fn test() {
-            let u = MyUnion { foo: 0 };
-            unsafe { baz(u); }
-            let u = MyUnion { bar: 0.0 };
-            unsafe { baz(u); }
-        }
+fn test() {
+    let u = MyUnion { foo: 0 };
+    unsafe { baz(u); }
+    let u = MyUnion { bar: 0.0 };
+    unsafe { baz(u); }
+}
 
-        unsafe fn baz(u: MyUnion) {
-            let inner = u.foo;
-            let inner = u.bar;
-        }
-        "#,
+unsafe fn baz(u: MyUnion) {
+    let inner = u.foo;
+    let inner = u.bar;
+}
+"#,
         expect![[r#"
             57..172 '{     ...); } }': ()
             67..68 'u': MyUnion
@@ -404,19 +380,19 @@ fn infer_union() {
 fn infer_refs() {
     check_infer(
         r#"
-        fn test(a: &u32, b: &mut u32, c: *const u32, d: *mut u32) {
-            a;
-            *a;
-            &a;
-            &mut a;
-            b;
-            *b;
-            &b;
-            c;
-            *c;
-            d;
-            *d;
-        }
+fn test(a: &u32, b: &mut u32, c: *const u32, d: *mut u32) {
+    a;
+    *a;
+    &a;
+    &mut a;
+    b;
+    *b;
+    &b;
+    c;
+    *c;
+    d;
+    *d;
+}
         "#,
         expect![[r#"
             8..9 'a': &u32
@@ -450,11 +426,11 @@ fn infer_refs() {
 fn infer_raw_ref() {
     check_infer(
         r#"
-        fn test(a: i32) {
-            &raw mut a;
-            &raw const a;
-        }
-        "#,
+fn test(a: i32) {
+    &raw mut a;
+    &raw const a;
+}
+"#,
         expect![[r#"
             8..9 'a': i32
             16..53 '{     ...t a; }': ()
@@ -488,23 +464,34 @@ fn infer_literals() {
                 mod foo {}
             "#;
             br#"yolo"#;
+            let a = b"a\x20b\
+            c";
+            let b = br"g\
+h";
+            let c = br#"x"\"yb"#;
         }
         "##,
         expect![[r##"
-            10..216 '{     ...o"#; }': ()
-            16..20 '5i32': i32
-            26..30 '5f32': f32
-            36..40 '5f64': f64
-            46..53 '"hello"': &str
-            59..67 'b"bytes"': &[u8; _]
-            73..76 ''c'': char
-            82..86 'b'b'': u8
-            92..96 '3.14': f64
-            102..106 '5000': i32
-            112..117 'false': bool
-            123..127 'true': bool
-            133..197 'r#"   ...    "#': &str
-            203..213 'br#"yolo"#': &[u8; _]
+            18..478 '{     ...     }': ()
+            32..36 '5i32': i32
+            50..54 '5f32': f32
+            68..72 '5f64': f64
+            86..93 '"hello"': &str
+            107..115 'b"bytes"': &[u8; 5]
+            129..132 ''c'': char
+            146..150 'b'b'': u8
+            164..168 '3.14': f64
+            182..186 '5000': i32
+            200..205 'false': bool
+            219..223 'true': bool
+            237..333 'r#"   ...    "#': &str
+            347..357 'br#"yolo"#': &[u8; 4]
+            375..376 'a': &[u8; 4]
+            379..403 'b"a\x2...    c"': &[u8; 4]
+            421..422 'b': &[u8; 4]
+            425..433 'br"g\ h"': &[u8; 4]
+            451..452 'c': &[u8; 6]
+            455..467 'br#"x"\"yb"#': &[u8; 6]
         "##]],
     );
 }
@@ -513,26 +500,26 @@ fn infer_literals() {
 fn infer_unary_op() {
     check_infer(
         r#"
-        enum SomeType {}
+enum SomeType {}
 
-        fn test(x: SomeType) {
-            let b = false;
-            let c = !b;
-            let a = 100;
-            let d: i128 = -a;
-            let e = -100;
-            let f = !!!true;
-            let g = !42;
-            let h = !10u32;
-            let j = !a;
-            -3.14;
-            !3;
-            -x;
-            !x;
-            -"hello";
-            !"hello";
-        }
-        "#,
+fn test(x: SomeType) {
+    let b = false;
+    let c = !b;
+    let a = 100;
+    let d: i128 = -a;
+    let e = -100;
+    let f = !!!true;
+    let g = !42;
+    let h = !10u32;
+    let j = !a;
+    -3.14;
+    !3;
+    -x;
+    !x;
+    -"hello";
+    !"hello";
+}
+"#,
         expect![[r#"
             26..27 'x': SomeType
             39..271 '{     ...lo"; }': ()
@@ -583,19 +570,19 @@ fn infer_unary_op() {
 fn infer_backwards() {
     check_infer(
         r#"
-        fn takes_u32(x: u32) {}
+fn takes_u32(x: u32) {}
 
-        struct S { i32_field: i32 }
+struct S { i32_field: i32 }
 
-        fn test() -> &mut &f64 {
-            let a = unknown_function();
-            takes_u32(a);
-            let b = unknown_function();
-            S { i32_field: b };
-            let c = unknown_function();
-            &mut &c
-        }
-        "#,
+fn test() -> &mut &f64 {
+    let a = unknown_function();
+    takes_u32(a);
+    let b = unknown_function();
+    S { i32_field: b };
+    let c = unknown_function();
+    &mut &c
+}
+"#,
         expect![[r#"
             13..14 'x': u32
             21..23 '{}': ()
@@ -625,23 +612,23 @@ fn infer_backwards() {
 fn infer_self() {
     check_infer(
         r#"
-        struct S;
+struct S;
 
-        impl S {
-            fn test(&self) {
-                self;
-            }
-            fn test2(self: &Self) {
-                self;
-            }
-            fn test3() -> Self {
-                S {}
-            }
-            fn test4() -> Self {
-                Self {}
-            }
-        }
-        "#,
+impl S {
+    fn test(&self) {
+        self;
+    }
+    fn test2(self: &Self) {
+        self;
+    }
+    fn test3() -> Self {
+        S {}
+    }
+    fn test4() -> Self {
+        Self {}
+    }
+}
+"#,
         expect![[r#"
             33..37 'self': &S
             39..60 '{     ...     }': ()
@@ -661,30 +648,30 @@ fn infer_self() {
 fn infer_self_as_path() {
     check_infer(
         r#"
-        struct S1;
-        struct S2(isize);
-        enum E {
-            V1,
-            V2(u32),
-        }
+struct S1;
+struct S2(isize);
+enum E {
+    V1,
+    V2(u32),
+}
 
-        impl S1 {
-            fn test() {
-                Self;
-            }
-        }
-        impl S2 {
-            fn test() {
-                Self(1);
-            }
-        }
-        impl E {
-            fn test() {
-                Self::V1;
-                Self::V2(1);
-            }
-        }
-        "#,
+impl S1 {
+    fn test() {
+        Self;
+    }
+}
+impl S2 {
+    fn test() {
+        Self(1);
+    }
+}
+impl E {
+    fn test() {
+        Self::V1;
+        Self::V2(1);
+    }
+}
+"#,
         expect![[r#"
             86..107 '{     ...     }': ()
             96..100 'Self': S1
@@ -705,26 +692,26 @@ fn infer_self_as_path() {
 fn infer_binary_op() {
     check_infer(
         r#"
-        fn f(x: bool) -> i32 {
-            0i32
-        }
+fn f(x: bool) -> i32 {
+    0i32
+}
 
-        fn test() -> bool {
-            let x = a && b;
-            let y = true || false;
-            let z = x == y;
-            let t = x != y;
-            let minus_forty: isize = -40isize;
-            let h = minus_forty <= CONST_2;
-            let c = f(z || y) + 5;
-            let d = b;
-            let g = minus_forty ^= i;
-            let ten: usize = 10;
-            let ten_is_eleven = ten == some_num;
+fn test() -> bool {
+    let x = a && b;
+    let y = true || false;
+    let z = x == y;
+    let t = x != y;
+    let minus_forty: isize = -40isize;
+    let h = minus_forty <= CONST_2;
+    let c = f(z || y) + 5;
+    let d = b;
+    let g = minus_forty ^= i;
+    let ten: usize = 10;
+    let ten_is_eleven = ten == some_num;
 
-            ten < 3
-        }
-        "#,
+    ten < 3
+}
+"#,
         expect![[r#"
             5..6 'x': bool
             21..33 '{     0i32 }': i32
@@ -784,11 +771,11 @@ fn infer_binary_op() {
 fn infer_shift_op() {
     check_infer(
         r#"
-        fn test() {
-            1u32 << 5u8;
-            1u32 >> 5u8;
-        }
-        "#,
+fn test() {
+    1u32 << 5u8;
+    1u32 >> 5u8;
+}
+"#,
         expect![[r#"
             10..47 '{     ...5u8; }': ()
             16..20 '1u32': u32
@@ -805,29 +792,29 @@ fn infer_shift_op() {
 fn infer_field_autoderef() {
     check_infer(
         r#"
-        struct A {
-            b: B,
-        }
-        struct B;
+struct A {
+    b: B,
+}
+struct B;
 
-        fn test1(a: A) {
-            let a1 = a;
-            a1.b;
-            let a2 = &a;
-            a2.b;
-            let a3 = &mut a;
-            a3.b;
-            let a4 = &&&&&&&a;
-            a4.b;
-            let a5 = &mut &&mut &&mut a;
-            a5.b;
-        }
+fn test1(a: A) {
+    let a1 = a;
+    a1.b;
+    let a2 = &a;
+    a2.b;
+    let a3 = &mut a;
+    a3.b;
+    let a4 = &&&&&&&a;
+    a4.b;
+    let a5 = &mut &&mut &&mut a;
+    a5.b;
+}
 
-        fn test2(a1: *const A, a2: *mut A) {
-            a1.b;
-            a2.b;
-        }
-        "#,
+fn test2(a1: *const A, a2: *mut A) {
+    a1.b;
+    a2.b;
+}
+"#,
         expect![[r#"
             43..44 'a': A
             49..212 '{     ...5.b; }': ()
@@ -880,58 +867,53 @@ fn infer_field_autoderef() {
 fn infer_argument_autoderef() {
     check_infer(
         r#"
-        #[lang = "deref"]
-        pub trait Deref {
-            type Target;
-            fn deref(&self) -> &Self::Target;
-        }
+//- minicore: deref
+use core::ops::Deref;
+struct A<T>(T);
 
-        struct A<T>(T);
+impl<T> A<T> {
+    fn foo(&self) -> &T {
+        &self.0
+    }
+}
 
-        impl<T> A<T> {
-            fn foo(&self) -> &T {
-                &self.0
-            }
-        }
+struct B<T>(T);
 
-        struct B<T>(T);
+impl<T> Deref for B<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
-        impl<T> Deref for B<T> {
-            type Target = T;
-            fn deref(&self) -> &Self::Target {
-                &self.0
-            }
-        }
-
-        fn test() {
-            let t = A::foo(&&B(B(A(42))));
-        }
-        "#,
+fn test() {
+    let t = A::foo(&&B(B(A(42))));
+}
+"#,
         expect![[r#"
-            67..71 'self': &Self
-            138..142 'self': &A<T>
-            150..173 '{     ...     }': &T
-            160..167 '&self.0': &T
-            161..165 'self': &A<T>
-            161..167 'self.0': T
-            254..258 'self': &B<T>
-            277..300 '{     ...     }': &T
-            287..294 '&self.0': &T
-            288..292 'self': &B<T>
-            288..294 'self.0': T
-            314..352 '{     ...))); }': ()
-            324..325 't': &i32
-            328..334 'A::foo': fn foo<i32>(&A<i32>) -> &i32
-            328..349 'A::foo...42))))': &i32
-            335..348 '&&B(B(A(42)))': &&B<B<A<i32>>>
-            336..348 '&B(B(A(42)))': &B<B<A<i32>>>
-            337..338 'B': B<B<A<i32>>>(B<A<i32>>) -> B<B<A<i32>>>
-            337..348 'B(B(A(42)))': B<B<A<i32>>>
-            339..340 'B': B<A<i32>>(A<i32>) -> B<A<i32>>
-            339..347 'B(A(42))': B<A<i32>>
-            341..342 'A': A<i32>(i32) -> A<i32>
-            341..346 'A(42)': A<i32>
-            343..345 '42': i32
+            66..70 'self': &A<T>
+            78..101 '{     ...     }': &T
+            88..95 '&self.0': &T
+            89..93 'self': &A<T>
+            89..95 'self.0': T
+            182..186 'self': &B<T>
+            205..228 '{     ...     }': &T
+            215..222 '&self.0': &T
+            216..220 'self': &B<T>
+            216..222 'self.0': T
+            242..280 '{     ...))); }': ()
+            252..253 't': &i32
+            256..262 'A::foo': fn foo<i32>(&A<i32>) -> &i32
+            256..277 'A::foo...42))))': &i32
+            263..276 '&&B(B(A(42)))': &&B<B<A<i32>>>
+            264..276 '&B(B(A(42)))': &B<B<A<i32>>>
+            265..266 'B': B<B<A<i32>>>(B<A<i32>>) -> B<B<A<i32>>>
+            265..276 'B(B(A(42)))': B<B<A<i32>>>
+            267..268 'B': B<A<i32>>(A<i32>) -> B<A<i32>>
+            267..275 'B(A(42))': B<A<i32>>
+            269..270 'A': A<i32>(i32) -> A<i32>
+            269..274 'A(42)': A<i32>
+            271..273 '42': i32
         "#]],
     );
 }
@@ -940,62 +922,57 @@ fn infer_argument_autoderef() {
 fn infer_method_argument_autoderef() {
     check_infer(
         r#"
-        #[lang = "deref"]
-        pub trait Deref {
-            type Target;
-            fn deref(&self) -> &Self::Target;
-        }
+//- minicore: deref
+use core::ops::Deref;
+struct A<T>(*mut T);
 
-        struct A<T>(*mut T);
+impl<T> A<T> {
+    fn foo(&self, x: &A<T>) -> &T {
+        &*x.0
+    }
+}
 
-        impl<T> A<T> {
-            fn foo(&self, x: &A<T>) -> &T {
-                &*x.0
-            }
-        }
+struct B<T>(T);
 
-        struct B<T>(T);
+impl<T> Deref for B<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
-        impl<T> Deref for B<T> {
-            type Target = T;
-            fn deref(&self) -> &Self::Target {
-                &self.0
-            }
-        }
-
-        fn test(a: A<i32>) {
-            let t = A(0 as *mut _).foo(&&B(B(a)));
-        }
-        "#,
+fn test(a: A<i32>) {
+    let t = A(0 as *mut _).foo(&&B(B(a)));
+}
+"#,
         expect![[r#"
-            67..71 'self': &Self
-            143..147 'self': &A<T>
-            149..150 'x': &A<T>
-            165..186 '{     ...     }': &T
-            175..180 '&*x.0': &T
-            176..180 '*x.0': T
-            177..178 'x': &A<T>
-            177..180 'x.0': *mut T
-            267..271 'self': &B<T>
-            290..313 '{     ...     }': &T
-            300..307 '&self.0': &T
-            301..305 'self': &B<T>
-            301..307 'self.0': T
-            325..326 'a': A<i32>
-            336..382 '{     ...))); }': ()
-            346..347 't': &i32
-            350..351 'A': A<i32>(*mut i32) -> A<i32>
-            350..364 'A(0 as *mut _)': A<i32>
-            350..379 'A(0 as...B(a)))': &i32
-            352..353 '0': i32
-            352..363 '0 as *mut _': *mut i32
-            369..378 '&&B(B(a))': &&B<B<A<i32>>>
-            370..378 '&B(B(a))': &B<B<A<i32>>>
-            371..372 'B': B<B<A<i32>>>(B<A<i32>>) -> B<B<A<i32>>>
-            371..378 'B(B(a))': B<B<A<i32>>>
-            373..374 'B': B<A<i32>>(A<i32>) -> B<A<i32>>
-            373..377 'B(a)': B<A<i32>>
-            375..376 'a': A<i32>
+            71..75 'self': &A<T>
+            77..78 'x': &A<T>
+            93..114 '{     ...     }': &T
+            103..108 '&*x.0': &T
+            104..108 '*x.0': T
+            105..106 'x': &A<T>
+            105..108 'x.0': *mut T
+            195..199 'self': &B<T>
+            218..241 '{     ...     }': &T
+            228..235 '&self.0': &T
+            229..233 'self': &B<T>
+            229..235 'self.0': T
+            253..254 'a': A<i32>
+            264..310 '{     ...))); }': ()
+            274..275 't': &i32
+            278..279 'A': A<i32>(*mut i32) -> A<i32>
+            278..292 'A(0 as *mut _)': A<i32>
+            278..307 'A(0 as...B(a)))': &i32
+            280..281 '0': i32
+            280..291 '0 as *mut _': *mut i32
+            297..306 '&&B(B(a))': &&B<B<A<i32>>>
+            298..306 '&B(B(a))': &B<B<A<i32>>>
+            299..300 'B': B<B<A<i32>>>(B<A<i32>>) -> B<B<A<i32>>>
+            299..306 'B(B(a))': B<B<A<i32>>>
+            301..302 'B': B<A<i32>>(A<i32>) -> B<A<i32>>
+            301..305 'B(a)': B<A<i32>>
+            303..304 'a': A<i32>
         "#]],
     );
 }
@@ -1004,15 +981,15 @@ fn infer_method_argument_autoderef() {
 fn infer_in_elseif() {
     check_infer(
         r#"
-        struct Foo { field: i32 }
-        fn main(foo: Foo) {
-            if true {
+struct Foo { field: i32 }
+fn main(foo: Foo) {
+    if true {
 
-            } else if false {
-                foo.field
-            }
-        }
-        "#,
+    } else if false {
+        foo.field
+    }
+}
+"#,
         expect![[r#"
             34..37 'foo': Foo
             44..108 '{     ...   } }': ()
@@ -1029,67 +1006,32 @@ fn infer_in_elseif() {
 }
 
 #[test]
-fn infer_closure_unify() {
-    check_infer(
-        r#"
-        fn foo(f: bool) {
-            let a = |x| x;
-            let b = |x| x;
-            let id = if f { a } else { b };
-            id(123);
-        }
-        "#,
-        expect![[r#"
-            7..8 'f': bool
-            16..106 '{     ...23); }': ()
-            26..27 'a': |i32| -> i32
-            30..35 '|x| x': |i32| -> i32
-            31..32 'x': i32
-            34..35 'x': i32
-            45..46 'b': |i32| -> i32
-            49..54 '|x| x': |i32| -> i32
-            50..51 'x': i32
-            53..54 'x': i32
-            64..66 'id': |i32| -> i32
-            69..90 'if f {... { b }': |i32| -> i32
-            72..73 'f': bool
-            74..79 '{ a }': |i32| -> i32
-            76..77 'a': |i32| -> i32
-            85..90 '{ b }': |i32| -> i32
-            87..88 'b': |i32| -> i32
-            96..98 'id': |i32| -> i32
-            96..103 'id(123)': i32
-            99..102 '123': i32
-        "#]],
-    )
-}
-
-#[test]
 fn infer_if_match_with_return() {
     check_infer(
         r#"
-        fn foo() {
-            let _x1 = if true {
-                1
-            } else {
-                return;
-            };
-            let _x2 = if true {
-                2
-            } else {
-                return
-            };
-            let _x3 = match true {
-                true => 3,
-                _ => {
-                    return;
-                }
-            };
-            let _x4 = match true {
-                true => 4,
-                _ => return
-            };
-        }"#,
+fn foo() {
+    let _x1 = if true {
+        1
+    } else {
+        return;
+    };
+    let _x2 = if true {
+        2
+    } else {
+        return
+    };
+    let _x3 = match true {
+        true => 3,
+        _ => {
+            return;
+        }
+    };
+    let _x4 = match true {
+        true => 4,
+        _ => return
+    };
+}
+"#,
         expect![[r#"
             9..322 '{     ...  }; }': ()
             19..22 '_x1': i32
@@ -1260,61 +1202,69 @@ fn infer_array() {
 
             let b = [a, ["b"]];
             let x: [u8; 0] = [];
+            // FIXME: requires const evaluation/taking type from rhs somehow
+            let y: [u8; 2+2] = [1,2,3,4];
         }
         "#,
         expect![[r#"
             8..9 'x': &str
             17..18 'y': isize
-            27..292 '{     ... []; }': ()
-            37..38 'a': [&str; _]
-            41..44 '[x]': [&str; _]
+            27..395 '{     ...,4]; }': ()
+            37..38 'a': [&str; 1]
+            41..44 '[x]': [&str; 1]
             42..43 'x': &str
-            54..55 'b': [[&str; _]; _]
-            58..64 '[a, a]': [[&str; _]; _]
-            59..60 'a': [&str; _]
-            62..63 'a': [&str; _]
-            74..75 'c': [[[&str; _]; _]; _]
-            78..84 '[b, b]': [[[&str; _]; _]; _]
-            79..80 'b': [[&str; _]; _]
-            82..83 'b': [[&str; _]; _]
-            95..96 'd': [isize; _]
-            99..111 '[y, 1, 2, 3]': [isize; _]
+            54..55 'b': [[&str; 1]; 2]
+            58..64 '[a, a]': [[&str; 1]; 2]
+            59..60 'a': [&str; 1]
+            62..63 'a': [&str; 1]
+            74..75 'c': [[[&str; 1]; 2]; 2]
+            78..84 '[b, b]': [[[&str; 1]; 2]; 2]
+            79..80 'b': [[&str; 1]; 2]
+            82..83 'b': [[&str; 1]; 2]
+            95..96 'd': [isize; 4]
+            99..111 '[y, 1, 2, 3]': [isize; 4]
             100..101 'y': isize
             103..104 '1': isize
             106..107 '2': isize
             109..110 '3': isize
-            121..122 'd': [isize; _]
-            125..137 '[1, y, 2, 3]': [isize; _]
+            121..122 'd': [isize; 4]
+            125..137 '[1, y, 2, 3]': [isize; 4]
             126..127 '1': isize
             129..130 'y': isize
             132..133 '2': isize
             135..136 '3': isize
-            147..148 'e': [isize; _]
-            151..154 '[y]': [isize; _]
+            147..148 'e': [isize; 1]
+            151..154 '[y]': [isize; 1]
             152..153 'y': isize
-            164..165 'f': [[isize; _]; _]
-            168..174 '[d, d]': [[isize; _]; _]
-            169..170 'd': [isize; _]
-            172..173 'd': [isize; _]
-            184..185 'g': [[isize; _]; _]
-            188..194 '[e, e]': [[isize; _]; _]
-            189..190 'e': [isize; _]
-            192..193 'e': [isize; _]
-            205..206 'h': [i32; _]
-            209..215 '[1, 2]': [i32; _]
+            164..165 'f': [[isize; 4]; 2]
+            168..174 '[d, d]': [[isize; 4]; 2]
+            169..170 'd': [isize; 4]
+            172..173 'd': [isize; 4]
+            184..185 'g': [[isize; 1]; 2]
+            188..194 '[e, e]': [[isize; 1]; 2]
+            189..190 'e': [isize; 1]
+            192..193 'e': [isize; 1]
+            205..206 'h': [i32; 2]
+            209..215 '[1, 2]': [i32; 2]
             210..211 '1': i32
             213..214 '2': i32
-            225..226 'i': [&str; _]
-            229..239 '["a", "b"]': [&str; _]
+            225..226 'i': [&str; 2]
+            229..239 '["a", "b"]': [&str; 2]
             230..233 '"a"': &str
             235..238 '"b"': &str
-            250..251 'b': [[&str; _]; _]
-            254..264 '[a, ["b"]]': [[&str; _]; _]
-            255..256 'a': [&str; _]
-            258..263 '["b"]': [&str; _]
+            250..251 'b': [[&str; 1]; 2]
+            254..264 '[a, ["b"]]': [[&str; 1]; 2]
+            255..256 'a': [&str; 1]
+            258..263 '["b"]': [&str; 1]
             259..262 '"b"': &str
-            274..275 'x': [u8; _]
-            287..289 '[]': [u8; _]
+            274..275 'x': [u8; 0]
+            287..289 '[]': [u8; 0]
+            368..369 'y': [u8; _]
+            383..392 '[1,2,3,4]': [u8; 4]
+            384..385 '1': u8
+            386..387 '2': u8
+            388..389 '3': u8
+            390..391 '4': u8
         "#]],
     );
 }
@@ -1795,7 +1745,7 @@ impl i32 { fn foo(&self) -> Foo { Foo } }
 fn main() {
     let x: i32 = i32;
     x.foo();
-        //^ Foo
+  //^^^^^^^ Foo
 }"#,
     );
 }
@@ -1813,7 +1763,7 @@ fn main() {
     fn inner() {}
     let x: i32 = i32;
     x.foo();
-        //^ Foo
+  //^^^^^^^ Foo
 }"#,
     );
 }
@@ -1831,7 +1781,7 @@ fn foo() -> &'static str { "" }
 
 fn main() {
     foo();
-      //^ &str
+  //^^^^^ &str
 }"#,
     );
 }
@@ -1849,7 +1799,7 @@ fn foo() -> &'static str { "" }
 
 fn main() {
     str::foo();
-           //^ u32
+  //^^^^^^^^^^ u32
 }"#,
     );
 }
@@ -1875,9 +1825,9 @@ mod d {
 
 fn main() {
     d::foo();
-         //^ u8
+  //^^^^^^^^ u8
     d::foo{a:0};
-           //^ u8
+  //^^^^^^^^^^^ foo
 }"#,
     );
 }
@@ -1967,19 +1917,13 @@ fn fn_pointer_return() {
 fn effects_smoke_test() {
     check_infer(
         r#"
+        //- minicore: future
         async fn main() {
             let x = unsafe { 92 };
             let y = async { async { () }.await };
             let z = try { () };
             let w = const { 92 };
             let t = 'a: { 92 };
-        }
-
-        #[prelude_import] use future::*;
-
-        mod future {
-            #[lang = "future_trait"]
-            pub trait Future { type Output; }
         }
         "#,
         expect![[r#"
@@ -2409,40 +2353,40 @@ fn infer_operator_overload() {
             320..422 '{     ...     }': V2
             334..335 'x': f32
             338..342 'self': V2
-            338..344 'self.0': [f32; _]
+            338..344 'self.0': [f32; 2]
             338..347 'self.0[0]': {unknown}
             338..358 'self.0...s.0[0]': f32
             345..346 '0': i32
             350..353 'rhs': V2
-            350..355 'rhs.0': [f32; _]
+            350..355 'rhs.0': [f32; 2]
             350..358 'rhs.0[0]': {unknown}
             356..357 '0': i32
             372..373 'y': f32
             376..380 'self': V2
-            376..382 'self.0': [f32; _]
+            376..382 'self.0': [f32; 2]
             376..385 'self.0[1]': {unknown}
             376..396 'self.0...s.0[1]': f32
             383..384 '1': i32
             388..391 'rhs': V2
-            388..393 'rhs.0': [f32; _]
+            388..393 'rhs.0': [f32; 2]
             388..396 'rhs.0[1]': {unknown}
             394..395 '1': i32
-            406..408 'V2': V2([f32; _]) -> V2
+            406..408 'V2': V2([f32; 2]) -> V2
             406..416 'V2([x, y])': V2
-            409..415 '[x, y]': [f32; _]
+            409..415 '[x, y]': [f32; 2]
             410..411 'x': f32
             413..414 'y': f32
             436..519 '{     ... vb; }': ()
             446..448 'va': V2
-            451..453 'V2': V2([f32; _]) -> V2
+            451..453 'V2': V2([f32; 2]) -> V2
             451..465 'V2([0.0, 1.0])': V2
-            454..464 '[0.0, 1.0]': [f32; _]
+            454..464 '[0.0, 1.0]': [f32; 2]
             455..458 '0.0': f32
             460..463 '1.0': f32
             475..477 'vb': V2
-            480..482 'V2': V2([f32; _]) -> V2
+            480..482 'V2': V2([f32; 2]) -> V2
             480..494 'V2([0.0, 1.0])': V2
-            483..493 '[0.0, 1.0]': [f32; _]
+            483..493 '[0.0, 1.0]': [f32; 2]
             484..487 '0.0': f32
             489..492 '1.0': f32
             505..506 'r': V2
@@ -2593,8 +2537,8 @@ fn test() {
             658..661 'vec': Vec<i32, Global>
             664..679 '<[_]>::into_vec': fn into_vec<i32, Global>(Box<[i32], Global>) -> Vec<i32, Global>
             664..691 '<[_]>:...1i32])': Vec<i32, Global>
-            680..690 'box [1i32]': Box<[i32; _], Global>
-            684..690 '[1i32]': [i32; _]
+            680..690 'box [1i32]': Box<[i32; 1], Global>
+            684..690 '[1i32]': [i32; 1]
             685..689 '1i32': i32
         "#]],
     )
@@ -2650,4 +2594,98 @@ fn f() {
             155..157 '()': ()
         "#]],
     )
+}
+
+#[test]
+fn infer_boxed_self_receiver() {
+    check_infer(
+        r#"
+//- minicore: deref
+use core::ops::Deref;
+
+struct Box<T>(T);
+
+impl<T> Deref for Box<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target;
+}
+
+struct Foo<T>(T);
+
+impl<T> Foo<T> {
+    fn get_inner<'a>(self: &'a Box<Self>) -> &'a T {}
+
+    fn get_self<'a>(self: &'a Box<Self>) -> &'a Self {}
+
+    fn into_inner(self: Box<Self>) -> Self {}
+}
+
+fn main() {
+    let boxed = Box(Foo(0_i32));
+
+    let bad1 = boxed.get_inner();
+    let good1 = Foo::get_inner(&boxed);
+
+    let bad2 = boxed.get_self();
+    let good2 = Foo::get_self(&boxed);
+
+    let inner = boxed.into_inner();
+}
+        "#,
+        expect![[r#"
+            104..108 'self': &Box<T>
+            188..192 'self': &Box<Foo<T>>
+            218..220 '{}': ()
+            242..246 'self': &Box<Foo<T>>
+            275..277 '{}': ()
+            297..301 'self': Box<Foo<T>>
+            322..324 '{}': ()
+            338..559 '{     ...r(); }': ()
+            348..353 'boxed': Box<Foo<i32>>
+            356..359 'Box': Box<Foo<i32>>(Foo<i32>) -> Box<Foo<i32>>
+            356..371 'Box(Foo(0_i32))': Box<Foo<i32>>
+            360..363 'Foo': Foo<i32>(i32) -> Foo<i32>
+            360..370 'Foo(0_i32)': Foo<i32>
+            364..369 '0_i32': i32
+            382..386 'bad1': &i32
+            389..394 'boxed': Box<Foo<i32>>
+            389..406 'boxed....nner()': &i32
+            416..421 'good1': &i32
+            424..438 'Foo::get_inner': fn get_inner<i32>(&Box<Foo<i32>>) -> &i32
+            424..446 'Foo::g...boxed)': &i32
+            439..445 '&boxed': &Box<Foo<i32>>
+            440..445 'boxed': Box<Foo<i32>>
+            457..461 'bad2': &Foo<i32>
+            464..469 'boxed': Box<Foo<i32>>
+            464..480 'boxed....self()': &Foo<i32>
+            490..495 'good2': &Foo<i32>
+            498..511 'Foo::get_self': fn get_self<i32>(&Box<Foo<i32>>) -> &Foo<i32>
+            498..519 'Foo::g...boxed)': &Foo<i32>
+            512..518 '&boxed': &Box<Foo<i32>>
+            513..518 'boxed': Box<Foo<i32>>
+            530..535 'inner': Foo<i32>
+            538..543 'boxed': Box<Foo<i32>>
+            538..556 'boxed....nner()': Foo<i32>
+        "#]],
+    );
+}
+
+#[test]
+fn prelude_2015() {
+    check_types(
+        r#"
+//- /main.rs edition:2015 crate:main deps:core
+fn f() {
+    Rust;
+  //^^^^ Rust
+}
+
+//- /core.rs crate:core
+pub mod prelude {
+    pub mod rust_2015 {
+        pub struct Rust;
+    }
+}
+    "#,
+    );
 }

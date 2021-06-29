@@ -1,19 +1,19 @@
 //! Completes constants and paths in patterns.
 
-use crate::{CompletionContext, Completions};
+use crate::{context::PatternRefutability, CompletionContext, Completions};
 
 /// Completes constants and paths in patterns.
 pub(crate) fn complete_pattern(acc: &mut Completions, ctx: &CompletionContext) {
-    if !(ctx.is_pat_binding_or_const || ctx.is_irrefutable_pat_binding) {
-        return;
-    }
-    if ctx.record_pat_syntax.is_some() {
-        return;
-    }
+    let refutable = match ctx.is_pat_or_const {
+        Some(it) => it == PatternRefutability::Refutable,
+        None => return,
+    };
 
-    if !ctx.is_irrefutable_pat_binding {
-        if let Some(ty) = ctx.expected_type.as_ref() {
-            super::complete_enum_variants(acc, ctx, ty, |acc, ctx, variant, path| {
+    if refutable {
+        if let Some(hir::Adt::Enum(e)) =
+            ctx.expected_type.as_ref().and_then(|ty| ty.strip_references().as_adt())
+        {
+            super::enum_variants_with_paths(acc, ctx, e, |acc, ctx, variant, path| {
                 acc.add_qualified_variant_pat(ctx, variant, path.clone());
                 acc.add_qualified_enum_variant(ctx, variant, path);
             });
@@ -29,375 +29,29 @@ pub(crate) fn complete_pattern(acc: &mut Completions, ctx: &CompletionContext) {
                     acc.add_struct_pat(ctx, *strukt, Some(name.clone()));
                     true
                 }
-                hir::ModuleDef::Variant(variant) if !ctx.is_irrefutable_pat_binding => {
+                hir::ModuleDef::Variant(variant) if refutable => {
                     acc.add_variant_pat(ctx, *variant, Some(name.clone()));
                     true
                 }
                 hir::ModuleDef::Adt(hir::Adt::Enum(..))
                 | hir::ModuleDef::Variant(..)
                 | hir::ModuleDef::Const(..)
-                | hir::ModuleDef::Module(..) => !ctx.is_irrefutable_pat_binding,
+                | hir::ModuleDef::Module(..) => refutable,
                 _ => false,
             },
-            hir::ScopeDef::MacroDef(_) => true,
+            hir::ScopeDef::MacroDef(mac) => mac.is_fn_like(),
             hir::ScopeDef::ImplSelfType(impl_) => match impl_.self_ty(ctx.db).as_adt() {
                 Some(hir::Adt::Struct(strukt)) => {
                     acc.add_struct_pat(ctx, strukt, Some(name.clone()));
                     true
                 }
-                Some(hir::Adt::Enum(_)) => !ctx.is_irrefutable_pat_binding,
+                Some(hir::Adt::Enum(_)) => refutable,
                 _ => true,
             },
             _ => false,
         };
         if add_resolution {
-            acc.add_resolution(ctx, name.to_string(), &res);
+            acc.add_resolution(ctx, name, &res);
         }
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use expect_test::{expect, Expect};
-
-    use crate::{
-        test_utils::{check_edit, completion_list},
-        CompletionKind,
-    };
-
-    fn check(ra_fixture: &str, expect: Expect) {
-        let actual = completion_list(ra_fixture, CompletionKind::Reference);
-        expect.assert_eq(&actual)
-    }
-
-    fn check_snippet(ra_fixture: &str, expect: Expect) {
-        let actual = completion_list(ra_fixture, CompletionKind::Snippet);
-        expect.assert_eq(&actual)
-    }
-
-    #[test]
-    fn completes_enum_variants_and_modules() {
-        check(
-            r#"
-enum E { X }
-use self::E::X;
-const Z: E = E::X;
-mod m {}
-
-static FOO: E = E::X;
-struct Bar { f: u32 }
-
-fn foo() {
-   match E::X { a$0 }
-}
-"#,
-            expect![[r#"
-                en E
-                ct Z
-                st Bar
-                ev X
-                md m
-            "#]],
-        );
-    }
-
-    #[test]
-    fn completes_in_simple_macro_call() {
-        check(
-            r#"
-macro_rules! m { ($e:expr) => { $e } }
-enum E { X }
-
-fn foo() {
-   m!(match E::X { a$0 })
-}
-"#,
-            expect![[r#"
-                ev E::X  ()
-                en E
-                ma m!(…) macro_rules! m
-            "#]],
-        );
-    }
-
-    #[test]
-    fn completes_in_irrefutable_let() {
-        check(
-            r#"
-enum E { X }
-use self::E::X;
-const Z: E = E::X;
-mod m {}
-
-static FOO: E = E::X;
-struct Bar { f: u32 }
-
-fn foo() {
-   let a$0
-}
-"#,
-            expect![[r#"
-                st Bar
-            "#]],
-        );
-    }
-
-    #[test]
-    fn completes_in_param() {
-        check(
-            r#"
-enum E { X }
-
-static FOO: E = E::X;
-struct Bar { f: u32 }
-
-fn foo(a$0) {
-}
-"#,
-            expect![[r#"
-                st Bar
-            "#]],
-        );
-    }
-
-    #[test]
-    fn completes_pat_in_let() {
-        check_snippet(
-            r#"
-struct Bar { f: u32 }
-
-fn foo() {
-   let a$0
-}
-"#,
-            expect![[r#"
-                bn Bar Bar { f$1 }$0
-            "#]],
-        );
-    }
-
-    #[test]
-    fn completes_param_pattern() {
-        check_snippet(
-            r#"
-struct Foo { bar: String, baz: String }
-struct Bar(String, String);
-struct Baz;
-fn outer(a$0) {}
-"#,
-            expect![[r#"
-                bn Foo Foo { bar$1, baz$2 }: Foo$0
-                bn Bar Bar($1, $2): Bar$0
-            "#]],
-        )
-    }
-
-    #[test]
-    fn completes_let_pattern() {
-        check_snippet(
-            r#"
-struct Foo { bar: String, baz: String }
-struct Bar(String, String);
-struct Baz;
-fn outer() {
-    let a$0
-}
-"#,
-            expect![[r#"
-                bn Foo Foo { bar$1, baz$2 }$0
-                bn Bar Bar($1, $2)$0
-            "#]],
-        )
-    }
-
-    #[test]
-    fn completes_refutable_pattern() {
-        check_snippet(
-            r#"
-struct Foo { bar: i32, baz: i32 }
-struct Bar(String, String);
-struct Baz;
-fn outer() {
-    match () {
-        a$0
-    }
-}
-"#,
-            expect![[r#"
-                bn Foo Foo { bar$1, baz$2 }$0
-                bn Bar Bar($1, $2)$0
-            "#]],
-        )
-    }
-
-    #[test]
-    fn omits_private_fields_pat() {
-        check_snippet(
-            r#"
-mod foo {
-    pub struct Foo { pub bar: i32, baz: i32 }
-    pub struct Bar(pub String, String);
-    pub struct Invisible(String, String);
-}
-use foo::*;
-
-fn outer() {
-    match () {
-        a$0
-    }
-}
-"#,
-            expect![[r#"
-                bn Foo Foo { bar$1, .. }$0
-                bn Bar Bar($1, ..)$0
-            "#]],
-        )
-    }
-
-    #[test]
-    fn only_shows_ident_completion() {
-        check_edit(
-            "Foo",
-            r#"
-struct Foo(i32);
-fn main() {
-    match Foo(92) {
-        a$0(92) => (),
-    }
-}
-"#,
-            r#"
-struct Foo(i32);
-fn main() {
-    match Foo(92) {
-        Foo(92) => (),
-    }
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn completes_self_pats() {
-        check_snippet(
-            r#"
-struct Foo(i32);
-impl Foo {
-    fn foo() {
-        match () {
-            a$0
-        }
-    }
-}
-    "#,
-            expect![[r#"
-                bn Self Self($1)$0
-                bn Foo  Foo($1)$0
-            "#]],
-        )
-    }
-
-    #[test]
-    fn completes_qualified_variant() {
-        check_snippet(
-            r#"
-enum Foo {
-    Bar { baz: i32 }
-}
-impl Foo {
-    fn foo() {
-        match {Foo::Bar { baz: 0 }} {
-            B$0
-        }
-    }
-}
-    "#,
-            expect![[r#"
-                bn Self::Bar Self::Bar { baz$1 }$0
-                bn Foo::Bar  Foo::Bar { baz$1 }$0
-            "#]],
-        )
-    }
-
-    #[test]
-    fn completes_enum_variant_matcharm() {
-        check(
-            r#"
-enum Foo { Bar, Baz, Quux }
-
-fn main() {
-    let foo = Foo::Quux;
-    match foo { Qu$0 }
-}
-"#,
-            expect![[r#"
-                ev Foo::Bar  ()
-                ev Foo::Baz  ()
-                ev Foo::Quux ()
-                en Foo
-            "#]],
-        )
-    }
-
-    #[test]
-    fn completes_enum_variant_matcharm_ref() {
-        check(
-            r#"
-enum Foo { Bar, Baz, Quux }
-
-fn main() {
-    let foo = Foo::Quux;
-    match &foo { Qu$0 }
-}
-"#,
-            expect![[r#"
-                ev Foo::Bar  ()
-                ev Foo::Baz  ()
-                ev Foo::Quux ()
-                en Foo
-            "#]],
-        )
-    }
-
-    #[test]
-    fn completes_enum_variant_iflet() {
-        check(
-            r#"
-enum Foo { Bar, Baz, Quux }
-
-fn main() {
-    let foo = Foo::Quux;
-    if let Qu$0 = foo { }
-}
-"#,
-            expect![[r#"
-                ev Foo::Bar  ()
-                ev Foo::Baz  ()
-                ev Foo::Quux ()
-                en Foo
-            "#]],
-        )
-    }
-
-    #[test]
-    fn completes_enum_variant_impl() {
-        check(
-            r#"
-enum Foo { Bar, Baz, Quux }
-impl Foo {
-    fn foo() { match Foo::Bar { Q$0 } }
-}
-"#,
-            expect![[r#"
-                ev Self::Bar  ()
-                ev Self::Baz  ()
-                ev Self::Quux ()
-                ev Foo::Bar   ()
-                ev Foo::Baz   ()
-                ev Foo::Quux  ()
-                sp Self
-                en Foo
-            "#]],
-        )
-    }
 }

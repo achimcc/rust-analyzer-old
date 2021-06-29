@@ -5,10 +5,10 @@ use std::iter;
 use hir_expand::name::{known, AsName, Name};
 use rustc_hash::FxHashSet;
 
-use crate::nameres::DefMap;
 use crate::{
     db::DefDatabase,
     item_scope::ItemInNs,
+    nameres::DefMap,
     path::{ModPath, PathKind},
     visibility::Visibility,
     ModuleDefId, ModuleId,
@@ -134,7 +134,16 @@ fn find_path_inner(
     for (name, def_id) in root_def_map.extern_prelude() {
         if item == ItemInNs::Types(*def_id) {
             let name = scope_name.unwrap_or_else(|| name.clone());
-            return Some(ModPath::from_segments(PathKind::Plain, vec![name]));
+
+            let name_already_occupied_in_type_ns = def_map
+                .with_ancestor_maps(db, from.local_id, &mut |def_map, local_id| {
+                    def_map[local_id].scope.get(&name).take_types().filter(|&id| id != *def_id)
+                })
+                .is_some();
+            return Some(ModPath::from_segments(
+                if name_already_occupied_in_type_ns { PathKind::Abs } else { PathKind::Plain },
+                vec![name],
+            ));
         }
     }
 
@@ -386,7 +395,7 @@ mod tests {
         let parsed_path_file = syntax::SourceFile::parse(&format!("use {};", path));
         let ast_path =
             parsed_path_file.syntax_node().descendants().find_map(syntax::ast::Path::cast).unwrap();
-        let mod_path = ModPath::from_src(ast_path, &Hygiene::new_unhygienic()).unwrap();
+        let mod_path = ModPath::from_src(&db, ast_path, &Hygiene::new_unhygienic()).unwrap();
 
         let def_map = module.def_map(&db);
         let resolved = def_map
@@ -673,9 +682,11 @@ pub struct S;
 //- /main.rs crate:main deps:std
 $0
 //- /std.rs crate:std
-pub mod prelude { pub struct S; }
-#[prelude_import]
-pub use prelude::*;
+pub mod prelude {
+    pub mod rust_2018 {
+        pub struct S;
+    }
+}
         "#,
             "S",
             "S",
@@ -691,11 +702,11 @@ pub use prelude::*;
 $0
 //- /std.rs crate:std
 pub mod prelude {
-    pub enum Option<T> { Some(T), None }
-    pub use Option::*;
+    pub mod rust_2018 {
+        pub enum Option<T> { Some(T), None }
+        pub use Option::*;
+    }
 }
-#[prelude_import]
-pub use prelude::*;
         "#;
         check_found_path(code, "None", "None", "None", "None");
         check_found_path(code, "Some", "Some", "Some", "Some");
@@ -1071,11 +1082,11 @@ fn f() {
 }
 //- /std.rs crate:std
 pub mod prelude {
-    pub enum Option { None }
-    pub use Option::*;
+    pub mod rust_2018 {
+        pub enum Option { None }
+        pub use Option::*;
+    }
 }
-#[prelude_import]
-pub use prelude::*;
         "#,
             "None",
             "None",

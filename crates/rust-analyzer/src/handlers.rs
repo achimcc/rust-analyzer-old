@@ -3,13 +3,14 @@
 //! `ide` crate.
 
 use std::{
-    io::Write as _,
-    process::{self, Stdio},
+    io::{Read, Write as _},
+    process::{self, Command, Stdio},
 };
 
 use ide::{
-    AnnotationConfig, FileId, FilePosition, FileRange, HoverAction, HoverGotoTypeData, Query,
-    RangeInfo, Runnable, RunnableKind, SearchScope, SourceChange, TextEdit,
+    AnnotationConfig, AssistKind, AssistResolveStrategy, FileId, FilePosition, FileRange,
+    HoverAction, HoverGotoTypeData, Query, RangeInfo, Runnable, RunnableKind, SingleResolve,
+    SourceChange, TextEdit,
 };
 use ide_db::SymbolKind;
 use itertools::Itertools;
@@ -17,17 +18,17 @@ use lsp_server::ErrorCode;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
-    CodeLens, CompletionItem, Diagnostic, DiagnosticTag, DocumentFormattingParams,
-    DocumentHighlight, FoldingRange, FoldingRangeParams, HoverContents, Location, NumberOrString,
-    Position, PrepareRenameResponse, Range, RenameParams, SemanticTokensDeltaParams,
-    SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensRangeParams,
-    SemanticTokensRangeResult, SemanticTokensResult, SymbolInformation, SymbolTag,
-    TextDocumentIdentifier, TextDocumentPositionParams, Url, WorkspaceEdit,
+    CodeLens, CompletionItem, Diagnostic, DiagnosticTag, DocumentFormattingParams, FoldingRange,
+    FoldingRangeParams, HoverContents, Location, NumberOrString, Position, PrepareRenameResponse,
+    Range, RenameParams, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
+    SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
+    SemanticTokensResult, SymbolInformation, SymbolTag, TextDocumentIdentifier,
+    TextDocumentPositionParams, Url, WorkspaceEdit,
 };
 use project_model::TargetKind;
 use serde::{Deserialize, Serialize};
-use serde_json::to_value;
-use stdx::{format_to, split_once};
+use serde_json::{json, to_value};
+use stdx::format_to;
 use syntax::{algo, ast, AstNode, TextRange, TextSize};
 
 use crate::{
@@ -37,7 +38,7 @@ use crate::{
     from_proto,
     global_state::{GlobalState, GlobalStateSnapshot},
     line_index::LineEndings,
-    lsp_ext::{self, InlayHint, InlayHintsParams},
+    lsp_ext::{self, InlayHint, InlayHintsParams, WorkspaceSymbolParams},
     lsp_utils::all_edits_are_disjoint,
     to_proto, LspError, Result,
 };
@@ -114,6 +115,34 @@ pub(crate) fn handle_view_hir(
     let position = from_proto::file_position(&snap, params)?;
     let res = snap.analysis.view_hir(position)?;
     Ok(res)
+}
+
+pub(crate) fn handle_view_item_tree(
+    snap: GlobalStateSnapshot,
+    params: lsp_ext::ViewItemTreeParams,
+) -> Result<String> {
+    let _p = profile::span("handle_view_item_tree");
+    let file_id = from_proto::file_id(&snap, &params.text_document.uri)?;
+    let res = snap.analysis.view_item_tree(file_id)?;
+    Ok(res)
+}
+
+pub(crate) fn handle_view_crate_graph(snap: GlobalStateSnapshot, (): ()) -> Result<String> {
+    let _p = profile::span("handle_view_crate_graph");
+    let dot = snap.analysis.view_crate_graph()??;
+
+    // We shell out to `dot` to render to SVG, as there does not seem to be a pure-Rust renderer.
+    let child = Command::new("dot")
+        .arg("-Tsvg")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to spawn `dot`: {}", err))?;
+    child.stdin.unwrap().write_all(dot.as_bytes())?;
+
+    let mut svg = String::new();
+    child.stdout.unwrap().read_to_string(&mut svg)?;
+    Ok(svg)
 }
 
 pub(crate) fn handle_expand_macro(
@@ -361,11 +390,12 @@ pub(crate) fn handle_document_symbol(
 
 pub(crate) fn handle_workspace_symbol(
     snap: GlobalStateSnapshot,
-    params: lsp_types::WorkspaceSymbolParams,
+    params: WorkspaceSymbolParams,
 ) -> Result<Option<Vec<SymbolInformation>>> {
     let _p = profile::span("handle_workspace_symbol");
-    let all_symbols = params.query.contains('#');
-    let libs = params.query.contains('*');
+
+    let (all_symbols, libs) = decide_search_scope_and_kind(&params, &snap);
+
     let query = {
         let query: String = params.query.chars().filter(|&c| c != '#' && c != '*').collect();
         let mut q = Query::new(query);
@@ -386,6 +416,45 @@ pub(crate) fn handle_workspace_symbol(
     }
 
     return Ok(Some(res));
+
+    fn decide_search_scope_and_kind(
+        params: &WorkspaceSymbolParams,
+        snap: &GlobalStateSnapshot,
+    ) -> (bool, bool) {
+        // Support old-style parsing of markers in the query.
+        let mut all_symbols = params.query.contains('#');
+        let mut libs = params.query.contains('*');
+
+        let config = snap.config.workspace_symbol();
+
+        // If no explicit marker was set, check request params. If that's also empty
+        // use global config.
+        if !all_symbols {
+            let search_kind = if let Some(ref search_kind) = params.search_kind {
+                search_kind
+            } else {
+                &config.search_kind
+            };
+            all_symbols = match search_kind {
+                lsp_ext::WorkspaceSymbolSearchKind::OnlyTypes => false,
+                lsp_ext::WorkspaceSymbolSearchKind::AllSymbols => true,
+            }
+        }
+
+        if !libs {
+            let search_scope = if let Some(ref search_scope) = params.search_scope {
+                search_scope
+            } else {
+                &config.search_scope
+            };
+            libs = match search_scope {
+                lsp_ext::WorkspaceSymbolSearchScope::Workspace => false,
+                lsp_ext::WorkspaceSymbolSearchScope::WorkspaceAndDependencies => true,
+            }
+        }
+
+        (all_symbols, libs)
+    }
 
     fn exec_query(snap: &GlobalStateSnapshot, query: Query) -> Result<Vec<SymbolInformation>> {
         let mut res = Vec::new();
@@ -480,6 +549,21 @@ pub(crate) fn handle_goto_definition(
     let position = from_proto::file_position(&snap, params.text_document_position_params)?;
     let nav_info = match snap.analysis.goto_definition(position)? {
         None => return Ok(None),
+        Some(it) => it,
+    };
+    let src = FileRange { file_id: position.file_id, range: nav_info.range };
+    let res = to_proto::goto_definition_response(&snap, Some(src), nav_info.info)?;
+    Ok(Some(res))
+}
+
+pub(crate) fn handle_goto_declaration(
+    snap: GlobalStateSnapshot,
+    params: lsp_types::request::GotoDeclarationParams,
+) -> Result<Option<lsp_types::request::GotoDeclarationResponse>> {
+    let _p = profile::span("handle_goto_declaration");
+    let position = from_proto::file_position(&snap, params.text_document_position_params.clone())?;
+    let nav_info = match snap.analysis.goto_declaration(position)? {
+        None => return handle_goto_definition(snap, params),
         Some(it) => it,
     };
     let src = FileRange { file_id: position.file_id, range: nav_info.range };
@@ -592,19 +676,28 @@ pub(crate) fn handle_runnables(
             }
         }
         None => {
-            res.push(lsp_ext::Runnable {
-                label: "cargo check --workspace".to_string(),
-                location: None,
-                kind: lsp_ext::RunnableKind::Cargo,
-                args: lsp_ext::CargoRunnable {
-                    workspace_root: None,
-                    override_cargo: config.override_cargo,
-                    cargo_args: vec!["check".to_string(), "--workspace".to_string()],
-                    cargo_extra_args: config.cargo_extra_args,
-                    executable_args: Vec::new(),
-                    expect_test: None,
-                },
-            });
+            if !snap.config.linked_projects().is_empty()
+                || !snap
+                    .config
+                    .discovered_projects
+                    .as_ref()
+                    .map(|projects| projects.is_empty())
+                    .unwrap_or(true)
+            {
+                res.push(lsp_ext::Runnable {
+                    label: "cargo check --workspace".to_string(),
+                    location: None,
+                    kind: lsp_ext::RunnableKind::Cargo,
+                    args: lsp_ext::CargoRunnable {
+                        workspace_root: None,
+                        override_cargo: config.override_cargo,
+                        cargo_args: vec!["check".to_string(), "--workspace".to_string()],
+                        cargo_extra_args: config.cargo_extra_args,
+                        executable_args: Vec::new(),
+                        expect_test: None,
+                    },
+                });
+            }
         }
     }
     Ok(res)
@@ -703,7 +796,7 @@ pub(crate) fn handle_completion_resolve(
     let resolve_data = match original_completion
         .data
         .take()
-        .map(|data| serde_json::from_value::<CompletionResolveData>(data))
+        .map(serde_json::from_value::<CompletionResolveData>)
         .transpose()?
     {
         Some(data) => data,
@@ -783,12 +876,10 @@ pub(crate) fn handle_hover(
 ) -> Result<Option<lsp_ext::Hover>> {
     let _p = profile::span("handle_hover");
     let position = from_proto::file_position(&snap, params.text_document_position_params)?;
-    let hover_config = snap.config.hover();
-    let info =
-        match snap.analysis.hover(position, hover_config.links_in_hover, hover_config.markdown)? {
-            None => return Ok(None),
-            Some(info) => info,
-        };
+    let info = match snap.analysis.hover(position, &snap.config.hover())? {
+        None => return Ok(None),
+        Some(info) => info,
+    };
     let line_index = snap.file_line_index(position.file_id)?;
     let range = to_proto::range(&line_index, info.range);
     let hover = lsp_ext::Hover {
@@ -877,104 +968,17 @@ pub(crate) fn handle_formatting(
     params: DocumentFormattingParams,
 ) -> Result<Option<Vec<lsp_types::TextEdit>>> {
     let _p = profile::span("handle_formatting");
-    let file_id = from_proto::file_id(&snap, &params.text_document.uri)?;
-    let file = snap.analysis.file_text(file_id)?;
-    let crate_ids = snap.analysis.crate_for(file_id)?;
 
-    let line_index = snap.file_line_index(file_id)?;
+    run_rustfmt(&snap, params.text_document, None)
+}
 
-    let mut rustfmt = match snap.config.rustfmt() {
-        RustfmtConfig::Rustfmt { extra_args } => {
-            let mut cmd = process::Command::new(toolchain::rustfmt());
-            cmd.args(extra_args);
-            // try to chdir to the file so we can respect `rustfmt.toml`
-            // FIXME: use `rustfmt --config-path` once
-            // https://github.com/rust-lang/rustfmt/issues/4660 gets fixed
-            match params.text_document.uri.to_file_path() {
-                Ok(mut path) => {
-                    // pop off file name
-                    if path.pop() && path.is_dir() {
-                        cmd.current_dir(path);
-                    }
-                }
-                Err(_) => {
-                    log::error!(
-                        "Unable to get file path for {}, rustfmt.toml might be ignored",
-                        params.text_document.uri
-                    );
-                }
-            }
-            if let Some(&crate_id) = crate_ids.first() {
-                // Assume all crates are in the same edition
-                let edition = snap.analysis.crate_edition(crate_id)?;
-                cmd.arg("--edition");
-                cmd.arg(edition.to_string());
-            }
-            cmd
-        }
-        RustfmtConfig::CustomCommand { command, args } => {
-            let mut cmd = process::Command::new(command);
-            cmd.args(args);
-            cmd
-        }
-    };
+pub(crate) fn handle_range_formatting(
+    snap: GlobalStateSnapshot,
+    params: lsp_types::DocumentRangeFormattingParams,
+) -> Result<Option<Vec<lsp_types::TextEdit>>> {
+    let _p = profile::span("handle_range_formatting");
 
-    let mut rustfmt =
-        rustfmt.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-
-    rustfmt.stdin.as_mut().unwrap().write_all(file.as_bytes())?;
-
-    let output = rustfmt.wait_with_output()?;
-    let captured_stdout = String::from_utf8(output.stdout)?;
-    let captured_stderr = String::from_utf8(output.stderr).unwrap_or_default();
-
-    if !output.status.success() {
-        let rustfmt_not_installed =
-            captured_stderr.contains("not installed") || captured_stderr.contains("not available");
-
-        return match output.status.code() {
-            Some(1) if !rustfmt_not_installed => {
-                // While `rustfmt` doesn't have a specific exit code for parse errors this is the
-                // likely cause exiting with 1. Most Language Servers swallow parse errors on
-                // formatting because otherwise an error is surfaced to the user on top of the
-                // syntax error diagnostics they're already receiving. This is especially jarring
-                // if they have format on save enabled.
-                log::info!("rustfmt exited with status 1, assuming parse error and ignoring");
-                Ok(None)
-            }
-            _ => {
-                // Something else happened - e.g. `rustfmt` is missing or caught a signal
-                Err(LspError::new(
-                    -32900,
-                    format!(
-                        r#"rustfmt exited with:
-                           Status: {}
-                           stdout: {}
-                           stderr: {}"#,
-                        output.status, captured_stdout, captured_stderr,
-                    ),
-                )
-                .into())
-            }
-        };
-    }
-
-    let (new_text, new_line_endings) = LineEndings::normalize(captured_stdout);
-
-    if line_index.endings != new_line_endings {
-        // If line endings are different, send the entire file.
-        // Diffing would not work here, as the line endings might be the only
-        // difference.
-        Ok(Some(to_proto::text_edit_vec(
-            &line_index,
-            TextEdit::replace(TextRange::up_to(TextSize::of(&*file)), new_text),
-        )))
-    } else if *file == new_text {
-        // The document is already formatted correctly -- no edits needed.
-        Ok(None)
-    } else {
-        Ok(Some(to_proto::text_edit_vec(&line_index, diff(&file, &new_text))))
-    }
+    run_rustfmt(&snap, params.text_document, Some(params.range))
 }
 
 pub(crate) fn handle_code_action(
@@ -1004,10 +1008,15 @@ pub(crate) fn handle_code_action(
     let mut res: Vec<lsp_ext::CodeAction> = Vec::new();
 
     let code_action_resolve_cap = snap.config.code_action_resolve();
+    let resolve = if code_action_resolve_cap {
+        AssistResolveStrategy::None
+    } else {
+        AssistResolveStrategy::All
+    };
     let assists = snap.analysis.assists_with_fixes(
         &assists_config,
         &snap.config.diagnostics(),
-        !code_action_resolve_cap,
+        resolve,
         frange,
     )?;
     for (index, assist) in assists.into_iter().enumerate() {
@@ -1052,20 +1061,66 @@ pub(crate) fn handle_code_action_resolve(
         .only
         .map(|it| it.into_iter().filter_map(from_proto::assist_kind).collect());
 
+    let (assist_index, assist_resolve) = match parse_action_id(&params.id) {
+        Ok(parsed_data) => parsed_data,
+        Err(e) => {
+            return Err(LspError::new(
+                ErrorCode::InvalidParams as i32,
+                format!("Failed to parse action id string '{}': {}", params.id, e),
+            )
+            .into())
+        }
+    };
+
+    let expected_assist_id = assist_resolve.assist_id.clone();
+    let expected_kind = assist_resolve.assist_kind;
+
     let assists = snap.analysis.assists_with_fixes(
         &assists_config,
         &snap.config.diagnostics(),
-        true,
+        AssistResolveStrategy::Single(assist_resolve),
         frange,
     )?;
 
-    let (id, index) = split_once(&params.id, ':').unwrap();
-    let index = index.parse::<usize>().unwrap();
-    let assist = &assists[index];
-    assert!(assist.id.0 == id);
+    let assist = match assists.get(assist_index) {
+        Some(assist) => assist,
+        None => return Err(LspError::new(
+            ErrorCode::InvalidParams as i32,
+            format!(
+                "Failed to find the assist for index {} provided by the resolve request. Resolve request assist id: {}",
+                assist_index, params.id,
+            ),
+        )
+        .into())
+    };
+    if assist.id.0 != expected_assist_id || assist.id.1 != expected_kind {
+        return Err(LspError::new(
+            ErrorCode::InvalidParams as i32,
+            format!(
+                "Mismatching assist at index {} for the resolve parameters given. Resolve request assist id: {}, actual id: {:?}.",
+                assist_index, params.id, assist.id
+            ),
+        )
+        .into());
+    }
     let edit = to_proto::code_action(&snap, assist.clone(), None)?.edit;
     code_action.edit = edit;
     Ok(code_action)
+}
+
+fn parse_action_id(action_id: &str) -> Result<(usize, SingleResolve), String> {
+    let id_parts = action_id.split(':').collect_vec();
+    match id_parts.as_slice() {
+        &[assist_id_string, assist_kind_string, index_string] => {
+            let assist_kind: AssistKind = assist_kind_string.parse()?;
+            let index: usize = match index_string.parse() {
+                Ok(index) => index,
+                Err(e) => return Err(format!("Incorrect index string: {}", e)),
+            };
+            Ok((index, SingleResolve { assist_id: assist_id_string.to_string(), assist_kind }))
+        }
+        _ => Err("Action id contains incorrect number of segments".to_string()),
+    }
 }
 
 pub(crate) fn handle_code_lens(
@@ -1123,33 +1178,22 @@ pub(crate) fn handle_code_lens_resolve(
 pub(crate) fn handle_document_highlight(
     snap: GlobalStateSnapshot,
     params: lsp_types::DocumentHighlightParams,
-) -> Result<Option<Vec<DocumentHighlight>>> {
+) -> Result<Option<Vec<lsp_types::DocumentHighlight>>> {
     let _p = profile::span("handle_document_highlight");
     let position = from_proto::file_position(&snap, params.text_document_position_params)?;
     let line_index = snap.file_line_index(position.file_id)?;
 
-    let refs = match snap
-        .analysis
-        .find_all_refs(position, Some(SearchScope::single_file(position.file_id)))?
-    {
+    let refs = match snap.analysis.highlight_related(position)? {
         None => return Ok(None),
         Some(refs) => refs,
     };
-
-    let decl = refs.declaration.filter(|decl| decl.nav.file_id == position.file_id).map(|decl| {
-        DocumentHighlight {
-            range: to_proto::range(&line_index, decl.nav.focus_or_full_range()),
-            kind: decl.access.map(to_proto::document_highlight_kind),
-        }
-    });
-
-    let file_refs = refs.references.get(&position.file_id).map_or(&[][..], Vec::as_slice);
-    let mut res = Vec::with_capacity(file_refs.len() + 1);
-    res.extend(decl);
-    res.extend(file_refs.iter().map(|&(range, access)| DocumentHighlight {
-        range: to_proto::range(&line_index, range),
-        kind: access.map(to_proto::document_highlight_kind),
-    }));
+    let res = refs
+        .into_iter()
+        .map(|ide::HighlightedRange { range, access }| lsp_types::DocumentHighlight {
+            range: to_proto::range(&line_index, range),
+            kind: access.map(to_proto::document_highlight_kind),
+        })
+        .collect();
     Ok(Some(res))
 }
 
@@ -1182,19 +1226,18 @@ pub(crate) fn publish_diagnostics(
 
     let diagnostics: Vec<Diagnostic> = snap
         .analysis
-        .diagnostics(&snap.config.diagnostics(), false, file_id)?
+        .diagnostics(&snap.config.diagnostics(), AssistResolveStrategy::None, file_id)?
         .into_iter()
         .map(|d| Diagnostic {
             range: to_proto::range(&line_index, d.range),
             severity: Some(to_proto::diagnostic_severity(d.severity)),
-            code: d.code.map(|d| d.as_str().to_owned()).map(NumberOrString::String),
-            code_description: d.code.and_then(|code| {
-                lsp_types::Url::parse(&format!(
+            code: Some(NumberOrString::String(d.code.as_str().to_string())),
+            code_description: Some(lsp_types::CodeDescription {
+                href: lsp_types::Url::parse(&format!(
                     "https://rust-analyzer.github.io/manual.html#{}",
-                    code.as_str()
+                    d.code.as_str()
                 ))
-                .ok()
-                .map(|href| lsp_types::CodeDescription { href })
+                .unwrap(),
             }),
             source: Some("rust-analyzer".to_string()),
             message: d.message,
@@ -1324,7 +1367,9 @@ pub(crate) fn handle_semantic_tokens_full(
     let line_index = snap.file_line_index(file_id)?;
 
     let highlights = snap.analysis.highlight(file_id)?;
-    let semantic_tokens = to_proto::semantic_tokens(&text, &line_index, highlights);
+    let highlight_strings = snap.config.highlighting_strings();
+    let semantic_tokens =
+        to_proto::semantic_tokens(&text, &line_index, highlights, highlight_strings);
 
     // Unconditionally cache the tokens
     snap.semantic_tokens_cache.lock().insert(params.text_document.uri, semantic_tokens.clone());
@@ -1343,15 +1388,16 @@ pub(crate) fn handle_semantic_tokens_full_delta(
     let line_index = snap.file_line_index(file_id)?;
 
     let highlights = snap.analysis.highlight(file_id)?;
-
-    let semantic_tokens = to_proto::semantic_tokens(&text, &line_index, highlights);
+    let highlight_strings = snap.config.highlighting_strings();
+    let semantic_tokens =
+        to_proto::semantic_tokens(&text, &line_index, highlights, highlight_strings);
 
     let mut cache = snap.semantic_tokens_cache.lock();
     let cached_tokens = cache.entry(params.text_document.uri).or_default();
 
     if let Some(prev_id) = &cached_tokens.result_id {
         if *prev_id == params.previous_result_id {
-            let delta = to_proto::semantic_token_delta(&cached_tokens, &semantic_tokens);
+            let delta = to_proto::semantic_token_delta(cached_tokens, &semantic_tokens);
             *cached_tokens = semantic_tokens;
             return Ok(Some(delta.into()));
         }
@@ -1373,7 +1419,9 @@ pub(crate) fn handle_semantic_tokens_range(
     let line_index = snap.file_line_index(frange.file_id)?;
 
     let highlights = snap.analysis.highlight_range(frange)?;
-    let semantic_tokens = to_proto::semantic_tokens(&text, &line_index, highlights);
+    let highlight_strings = snap.config.highlighting_strings();
+    let semantic_tokens =
+        to_proto::semantic_tokens(&text, &line_index, highlights, highlight_strings);
     Ok(Some(semantic_tokens.into()))
 }
 
@@ -1437,7 +1485,7 @@ fn show_impl_command_link(
     snap: &GlobalStateSnapshot,
     position: &FilePosition,
 ) -> Option<lsp_ext::CommandLinkGroup> {
-    if snap.config.hover().implementations {
+    if snap.config.hover_actions().implementations {
         if let Some(nav_data) = snap.analysis.goto_implementation(*position).unwrap_or(None) {
             let uri = to_proto::url(snap, position.file_id);
             let line_index = snap.file_line_index(position.file_id).ok()?;
@@ -1459,13 +1507,43 @@ fn show_impl_command_link(
     None
 }
 
+fn show_ref_command_link(
+    snap: &GlobalStateSnapshot,
+    position: &FilePosition,
+) -> Option<lsp_ext::CommandLinkGroup> {
+    if snap.config.hover_actions().references {
+        if let Some(ref_search_res) = snap.analysis.find_all_refs(*position, None).unwrap_or(None) {
+            let uri = to_proto::url(snap, position.file_id);
+            let line_index = snap.file_line_index(position.file_id).ok()?;
+            let position = to_proto::position(&line_index, position.offset);
+            let locations: Vec<_> = ref_search_res
+                .references
+                .into_iter()
+                .flat_map(|(file_id, ranges)| {
+                    ranges.into_iter().filter_map(move |(range, _)| {
+                        to_proto::location(snap, FileRange { file_id, range }).ok()
+                    })
+                })
+                .collect();
+            let title = to_proto::reference_title(locations.len());
+            let command = to_proto::command::show_references(title, &uri, position, locations);
+
+            return Some(lsp_ext::CommandLinkGroup {
+                commands: vec![to_command_link(command, "Go to references".into())],
+                ..Default::default()
+            });
+        }
+    }
+    None
+}
+
 fn runnable_action_links(
     snap: &GlobalStateSnapshot,
     runnable: Runnable,
 ) -> Option<lsp_ext::CommandLinkGroup> {
-    let cargo_spec = CargoTargetSpec::for_file(&snap, runnable.nav.file_id).ok()?;
-    let hover_config = snap.config.hover();
-    if !hover_config.runnable() || should_skip_target(&runnable, cargo_spec.as_ref()) {
+    let cargo_spec = CargoTargetSpec::for_file(snap, runnable.nav.file_id).ok()?;
+    let hover_actions_config = snap.config.hover_actions();
+    if !hover_actions_config.runnable() || should_skip_target(&runnable, cargo_spec.as_ref()) {
         return None;
     }
 
@@ -1473,12 +1551,12 @@ fn runnable_action_links(
     to_proto::runnable(snap, runnable).ok().map(|r| {
         let mut group = lsp_ext::CommandLinkGroup::default();
 
-        if hover_config.run {
+        if hover_actions_config.run {
             let run_command = to_proto::command::run_single(&r, action.run_title);
             group.commands.push(to_command_link(run_command, r.label.clone()));
         }
 
-        if hover_config.debug {
+        if hover_actions_config.debug {
             let dbg_command = to_proto::command::debug_single(&r);
             group.commands.push(to_command_link(dbg_command, r.label));
         }
@@ -1491,7 +1569,7 @@ fn goto_type_action_links(
     snap: &GlobalStateSnapshot,
     nav_targets: &[HoverGotoTypeData],
 ) -> Option<lsp_ext::CommandLinkGroup> {
-    if !snap.config.hover().goto_type_def || nav_targets.is_empty() {
+    if !snap.config.hover_actions().goto_type_def || nav_targets.is_empty() {
         return None;
     }
 
@@ -1511,7 +1589,7 @@ fn prepare_hover_actions(
     snap: &GlobalStateSnapshot,
     actions: &[HoverAction],
 ) -> Vec<lsp_ext::CommandLinkGroup> {
-    if snap.config.hover().none() || !snap.config.hover_actions() {
+    if snap.config.hover_actions().none() || !snap.config.experimental_hover_actions() {
         return Vec::new();
     }
 
@@ -1519,6 +1597,7 @@ fn prepare_hover_actions(
         .iter()
         .filter_map(|it| match it {
             HoverAction::Implementation(position) => show_impl_command_link(snap, position),
+            HoverAction::Reference(position) => show_ref_command_link(snap, position),
             HoverAction::Runnable(r) => runnable_action_links(snap, r.clone()),
             HoverAction::GoToType(targets) => goto_type_action_links(snap, targets),
         })
@@ -1538,6 +1617,140 @@ fn should_skip_target(runnable: &Runnable, cargo_spec: Option<&CargoTargetSpec>)
             }
         }
         _ => false,
+    }
+}
+
+fn run_rustfmt(
+    snap: &GlobalStateSnapshot,
+    text_document: TextDocumentIdentifier,
+    range: Option<lsp_types::Range>,
+) -> Result<Option<Vec<lsp_types::TextEdit>>> {
+    let file_id = from_proto::file_id(snap, &text_document.uri)?;
+    let file = snap.analysis.file_text(file_id)?;
+    let crate_ids = snap.analysis.crate_for(file_id)?;
+
+    let line_index = snap.file_line_index(file_id)?;
+
+    let mut rustfmt = match snap.config.rustfmt() {
+        RustfmtConfig::Rustfmt { extra_args, enable_range_formatting } => {
+            let mut cmd = process::Command::new(toolchain::rustfmt());
+            cmd.args(extra_args);
+            // try to chdir to the file so we can respect `rustfmt.toml`
+            // FIXME: use `rustfmt --config-path` once
+            // https://github.com/rust-lang/rustfmt/issues/4660 gets fixed
+            match text_document.uri.to_file_path() {
+                Ok(mut path) => {
+                    // pop off file name
+                    if path.pop() && path.is_dir() {
+                        cmd.current_dir(path);
+                    }
+                }
+                Err(_) => {
+                    log::error!(
+                        "Unable to get file path for {}, rustfmt.toml might be ignored",
+                        text_document.uri
+                    );
+                }
+            }
+            if let Some(&crate_id) = crate_ids.first() {
+                // Assume all crates are in the same edition
+                let edition = snap.analysis.crate_edition(crate_id)?;
+                cmd.arg("--edition");
+                cmd.arg(edition.to_string());
+            }
+
+            if let Some(range) = range {
+                if !enable_range_formatting {
+                    return Err(LspError::new(
+                        ErrorCode::InvalidRequest as i32,
+                        String::from(
+                            "rustfmt range formatting is unstable. \
+                            Opt-in by using a nightly build of rustfmt and setting \
+                            `rustfmt.enableRangeFormatting` to true in your LSP configuration",
+                        ),
+                    )
+                    .into());
+                }
+
+                let frange = from_proto::file_range(snap, text_document, range)?;
+                let start_line = line_index.index.line_col(frange.range.start()).line;
+                let end_line = line_index.index.line_col(frange.range.end()).line;
+
+                cmd.arg("--unstable-features");
+                cmd.arg("--file-lines");
+                cmd.arg(
+                    json!([{
+                        "file": "stdin",
+                        "range": [start_line, end_line]
+                    }])
+                    .to_string(),
+                );
+            }
+
+            cmd
+        }
+        RustfmtConfig::CustomCommand { command, args } => {
+            let mut cmd = process::Command::new(command);
+            cmd.args(args);
+            cmd
+        }
+    };
+
+    let mut rustfmt =
+        rustfmt.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+
+    rustfmt.stdin.as_mut().unwrap().write_all(file.as_bytes())?;
+
+    let output = rustfmt.wait_with_output()?;
+    let captured_stdout = String::from_utf8(output.stdout)?;
+    let captured_stderr = String::from_utf8(output.stderr).unwrap_or_default();
+
+    if !output.status.success() {
+        let rustfmt_not_installed =
+            captured_stderr.contains("not installed") || captured_stderr.contains("not available");
+
+        return match output.status.code() {
+            Some(1) if !rustfmt_not_installed => {
+                // While `rustfmt` doesn't have a specific exit code for parse errors this is the
+                // likely cause exiting with 1. Most Language Servers swallow parse errors on
+                // formatting because otherwise an error is surfaced to the user on top of the
+                // syntax error diagnostics they're already receiving. This is especially jarring
+                // if they have format on save enabled.
+                log::info!("rustfmt exited with status 1, assuming parse error and ignoring");
+                Ok(None)
+            }
+            _ => {
+                // Something else happened - e.g. `rustfmt` is missing or caught a signal
+                Err(LspError::new(
+                    -32900,
+                    format!(
+                        r#"rustfmt exited with:
+                           Status: {}
+                           stdout: {}
+                           stderr: {}"#,
+                        output.status, captured_stdout, captured_stderr,
+                    ),
+                )
+                .into())
+            }
+        };
+    }
+
+    let (new_text, new_line_endings) = LineEndings::normalize(captured_stdout);
+
+    if line_index.endings != new_line_endings {
+        // If line endings are different, send the entire file.
+        // Diffing would not work here, as the line endings might be the only
+        // difference.
+        Ok(Some(to_proto::text_edit_vec(
+            &line_index,
+            TextEdit::replace(TextRange::up_to(TextSize::of(&*file)), new_text),
+        )))
+    } else if *file == new_text {
+        // The document is already formatted correctly -- no edits needed.
+        Ok(None)
+    } else {
+        Ok(Some(to_proto::text_edit_vec(&line_index, diff(&file, &new_text))))
     }
 }
 

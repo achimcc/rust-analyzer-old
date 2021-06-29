@@ -8,7 +8,7 @@ use hir_expand::{
     ast_id_map::{AstIdMap, FileAstId},
     hygiene::Hygiene,
     name::{name, AsName, Name},
-    ExpandError, HirFileId,
+    ExpandError, HirFileId, InFile,
 };
 use la_arena::Arena;
 use profile::Count;
@@ -23,9 +23,9 @@ use syntax::{
 use crate::{
     adt::StructKind,
     body::{Body, BodySourceMap, Expander, LabelSource, PatPtr, SyntheticSyntax},
+    body::{BodyDiagnostic, ExprSource, PatSource},
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinUint},
     db::DefDatabase,
-    diagnostics::{InactiveCode, MacroError, UnresolvedMacroCall, UnresolvedProcMacro},
     expr::{
         dummy_expr_id, ArithOp, Array, BinaryOp, BindingAnnotation, CmpOp, Expr, ExprId, Label,
         LabelId, Literal, LogicOp, MatchArm, Ordering, Pat, PatId, RecordFieldPat, RecordLitField,
@@ -38,25 +38,25 @@ use crate::{
     AdtId, BlockLoc, ModuleDefId, UnresolvedMacro,
 };
 
-use super::{diagnostics::BodyDiagnostic, ExprSource, PatSource};
-
-pub struct LowerCtx {
+pub struct LowerCtx<'a> {
+    pub db: &'a dyn DefDatabase,
     hygiene: Hygiene,
     file_id: Option<HirFileId>,
     source_ast_id_map: Option<Arc<AstIdMap>>,
 }
 
-impl LowerCtx {
-    pub fn new(db: &dyn DefDatabase, file_id: HirFileId) -> Self {
+impl<'a> LowerCtx<'a> {
+    pub fn new(db: &'a dyn DefDatabase, file_id: HirFileId) -> Self {
         LowerCtx {
+            db,
             hygiene: Hygiene::new(db.upcast(), file_id),
             file_id: Some(file_id),
             source_ast_id_map: Some(db.ast_id_map(file_id)),
         }
     }
 
-    pub fn with_hygiene(hygiene: &Hygiene) -> Self {
-        LowerCtx { hygiene: hygiene.clone(), file_id: None, source_ast_id_map: None }
+    pub fn with_hygiene(db: &'a dyn DefDatabase, hygiene: &Hygiene) -> Self {
+        LowerCtx { db, hygiene: hygiene.clone(), file_id: None, source_ast_id_map: None }
     }
 
     pub(crate) fn hygiene(&self) -> &Hygiene {
@@ -145,7 +145,7 @@ impl ExprCollector<'_> {
         (self.body, self.source_map)
     }
 
-    fn ctx(&self) -> LowerCtx {
+    fn ctx(&self) -> LowerCtx<'_> {
         LowerCtx::new(self.db, self.expander.current_file_id)
     }
 
@@ -203,7 +203,7 @@ impl ExprCollector<'_> {
         self.maybe_collect_expr(expr).unwrap_or_else(|| self.missing_expr())
     }
 
-    /// Returns `None` if the expression is `#[cfg]`d out.
+    /// Returns `None` if and only if the expression is `#[cfg]`d out.
     fn maybe_collect_expr(&mut self, expr: ast::Expr) -> Option<ExprId> {
         let syntax_ptr = AstPtr::new(&expr);
         self.check_cfg(&expr)?;
@@ -376,7 +376,7 @@ impl ExprCollector<'_> {
             ast::Expr::PathExpr(e) => {
                 let path = e
                     .path()
-                    .and_then(|path| self.expander.parse_path(path))
+                    .and_then(|path| self.expander.parse_path(self.db, path))
                     .map(Expr::Path)
                     .unwrap_or(Expr::Missing);
                 self.alloc_expr(path, syntax_ptr)
@@ -408,7 +408,8 @@ impl ExprCollector<'_> {
                 self.alloc_expr(Expr::Yield { expr }, syntax_ptr)
             }
             ast::Expr::RecordExpr(e) => {
-                let path = e.path().and_then(|path| self.expander.parse_path(path)).map(Box::new);
+                let path =
+                    e.path().and_then(|path| self.expander.parse_path(self.db, path)).map(Box::new);
                 let record_lit = if let Some(nfl) = e.record_expr_field_list() {
                     let fields = nfl
                         .fields()
@@ -589,13 +590,10 @@ impl ExprCollector<'_> {
         let res = match res {
             Ok(res) => res,
             Err(UnresolvedMacro { path }) => {
-                self.source_map.diagnostics.push(BodyDiagnostic::UnresolvedMacroCall(
-                    UnresolvedMacroCall {
-                        file: outer_file,
-                        node: syntax_ptr.cast().unwrap(),
-                        path,
-                    },
-                ));
+                self.source_map.diagnostics.push(BodyDiagnostic::UnresolvedMacroCall {
+                    node: InFile::new(outer_file, syntax_ptr),
+                    path,
+                });
                 collector(self, None);
                 return;
             }
@@ -603,21 +601,15 @@ impl ExprCollector<'_> {
 
         match &res.err {
             Some(ExpandError::UnresolvedProcMacro) => {
-                self.source_map.diagnostics.push(BodyDiagnostic::UnresolvedProcMacro(
-                    UnresolvedProcMacro {
-                        file: outer_file,
-                        node: syntax_ptr.into(),
-                        precise_location: None,
-                        macro_name: None,
-                    },
-                ));
+                self.source_map.diagnostics.push(BodyDiagnostic::UnresolvedProcMacro {
+                    node: InFile::new(outer_file, syntax_ptr),
+                });
             }
             Some(err) => {
-                self.source_map.diagnostics.push(BodyDiagnostic::MacroError(MacroError {
-                    file: outer_file,
-                    node: syntax_ptr.into(),
+                self.source_map.diagnostics.push(BodyDiagnostic::MacroError {
+                    node: InFile::new(outer_file, syntax_ptr),
                     message: err.to_string(),
-                }));
+                });
             }
             None => {}
         }
@@ -665,7 +657,7 @@ impl ExprCollector<'_> {
                 if self.check_cfg(&stmt).is_none() {
                     return;
                 }
-
+                let has_semi = stmt.semicolon_token().is_some();
                 // Note that macro could be expended to multiple statements
                 if let Some(ast::Expr::MacroCall(m)) = stmt.expr() {
                     let macro_ptr = AstPtr::new(&m);
@@ -682,24 +674,23 @@ impl ExprCollector<'_> {
                                 statements.statements().for_each(|stmt| this.collect_stmt(stmt));
                                 if let Some(expr) = statements.expr() {
                                     let expr = this.collect_expr(expr);
-                                    this.statements_in_scope.push(Statement::Expr(expr));
+                                    this.statements_in_scope
+                                        .push(Statement::Expr { expr, has_semi });
                                 }
                             }
                             None => {
                                 let expr = this.alloc_expr(Expr::Missing, syntax_ptr.clone());
-                                this.statements_in_scope.push(Statement::Expr(expr));
+                                this.statements_in_scope.push(Statement::Expr { expr, has_semi });
                             }
                         },
                     );
                 } else {
                     let expr = self.collect_expr_opt(stmt.expr());
-                    self.statements_in_scope.push(Statement::Expr(expr));
+                    self.statements_in_scope.push(Statement::Expr { expr, has_semi });
                 }
             }
             ast::Stmt::Item(item) => {
-                if self.check_cfg(&item).is_none() {
-                    return;
-                }
+                self.check_cfg(&item);
             }
         }
     }
@@ -722,8 +713,18 @@ impl ExprCollector<'_> {
         let prev_statements = std::mem::take(&mut self.statements_in_scope);
 
         block.statements().for_each(|s| self.collect_stmt(s));
+        block.tail_expr().and_then(|e| {
+            let expr = self.maybe_collect_expr(e)?;
+            self.statements_in_scope.push(Statement::Expr { expr, has_semi: false });
+            Some(())
+        });
 
-        let tail = block.tail_expr().map(|e| self.collect_expr(e));
+        let mut tail = None;
+        if let Some(Statement::Expr { expr, has_semi: false }) = self.statements_in_scope.last() {
+            tail = Some(*expr);
+            self.statements_in_scope.pop();
+        }
+        let tail = tail;
         let statements = std::mem::replace(&mut self.statements_in_scope, prev_statements);
         let syntax_node_ptr = AstPtr::new(&block.into());
         let expr_id = self.alloc_expr(
@@ -791,7 +792,8 @@ impl ExprCollector<'_> {
                 }
             }
             ast::Pat::TupleStructPat(p) => {
-                let path = p.path().and_then(|path| self.expander.parse_path(path)).map(Box::new);
+                let path =
+                    p.path().and_then(|path| self.expander.parse_path(self.db, path)).map(Box::new);
                 let (args, ellipsis) = self.collect_tuple_pat(p.fields());
                 Pat::TupleStruct { path, args, ellipsis }
             }
@@ -801,7 +803,8 @@ impl ExprCollector<'_> {
                 Pat::Ref { pat, mutability }
             }
             ast::Pat::PathPat(p) => {
-                let path = p.path().and_then(|path| self.expander.parse_path(path)).map(Box::new);
+                let path =
+                    p.path().and_then(|path| self.expander.parse_path(self.db, path)).map(Box::new);
                 path.map(Pat::Path).unwrap_or(Pat::Missing)
             }
             ast::Pat::OrPat(p) => {
@@ -815,7 +818,8 @@ impl ExprCollector<'_> {
             }
             ast::Pat::WildcardPat(_) => Pat::Wild,
             ast::Pat::RecordPat(p) => {
-                let path = p.path().and_then(|path| self.expander.parse_path(path)).map(Box::new);
+                let path =
+                    p.path().and_then(|path| self.expander.parse_path(self.db, path)).map(Box::new);
                 let args: Vec<_> = p
                     .record_pat_field_list()
                     .expect("every struct should have a field list")
@@ -929,12 +933,14 @@ impl ExprCollector<'_> {
                     return Some(());
                 }
 
-                self.source_map.diagnostics.push(BodyDiagnostic::InactiveCode(InactiveCode {
-                    file: self.expander.current_file_id,
-                    node: SyntaxNodePtr::new(owner.syntax()),
+                self.source_map.diagnostics.push(BodyDiagnostic::InactiveCode {
+                    node: InFile::new(
+                        self.expander.current_file_id,
+                        SyntaxNodePtr::new(owner.syntax()),
+                    ),
                     cfg,
                     opts: self.expander.cfg_options().clone(),
-                }));
+                });
 
                 None
             }
@@ -990,23 +996,27 @@ impl From<ast::BinOp> for BinaryOp {
 impl From<ast::LiteralKind> for Literal {
     fn from(ast_lit_kind: ast::LiteralKind) -> Self {
         match ast_lit_kind {
+            // FIXME: these should have actual values filled in, but unsure on perf impact
             LiteralKind::IntNumber(lit) => {
                 if let builtin @ Some(_) = lit.suffix().and_then(BuiltinFloat::from_suffix) {
-                    return Literal::Float(Default::default(), builtin);
+                    Literal::Float(Default::default(), builtin)
                 } else if let builtin @ Some(_) =
-                    lit.suffix().and_then(|it| BuiltinInt::from_suffix(&it))
+                    lit.suffix().and_then(|it| BuiltinInt::from_suffix(it))
                 {
-                    Literal::Int(Default::default(), builtin)
+                    Literal::Int(lit.value().unwrap_or(0) as i128, builtin)
                 } else {
-                    let builtin = lit.suffix().and_then(|it| BuiltinUint::from_suffix(&it));
-                    Literal::Uint(Default::default(), builtin)
+                    let builtin = lit.suffix().and_then(|it| BuiltinUint::from_suffix(it));
+                    Literal::Uint(lit.value().unwrap_or(0), builtin)
                 }
             }
             LiteralKind::FloatNumber(lit) => {
-                let ty = lit.suffix().and_then(|it| BuiltinFloat::from_suffix(&it));
+                let ty = lit.suffix().and_then(|it| BuiltinFloat::from_suffix(it));
                 Literal::Float(Default::default(), ty)
             }
-            LiteralKind::ByteString(_) => Literal::ByteString(Default::default()),
+            LiteralKind::ByteString(bs) => {
+                let text = bs.value().map(Vec::from).unwrap_or_else(Default::default);
+                Literal::ByteString(text)
+            }
             LiteralKind::String(_) => Literal::String(Default::default()),
             LiteralKind::Byte => Literal::Uint(Default::default(), Some(BuiltinUint::U8)),
             LiteralKind::Bool(val) => Literal::Bool(val),

@@ -1,6 +1,5 @@
 use base_db::{fixture::ChangeFixture, FilePosition};
 use expect_test::{expect, Expect};
-use test_utils::RangeOrOffset;
 
 use crate::RootDatabase;
 
@@ -10,10 +9,7 @@ pub(crate) fn position(ra_fixture: &str) -> (RootDatabase, FilePosition) {
     let mut database = RootDatabase::default();
     database.apply_change(change_fixture.change);
     let (file_id, range_or_offset) = change_fixture.file_position.expect("expected a marker ($0)");
-    let offset = match range_or_offset {
-        RangeOrOffset::Range(_) => panic!(),
-        RangeOrOffset::Offset(it) => it,
-    };
+    let offset = range_or_offset.expect_offset();
     (database, FilePosition { file_id, offset })
 }
 
@@ -184,6 +180,24 @@ fn main() { S.foo($0); }
         expect![[r#"
                 fn foo(&self, x: i32)
                 (<x: i32>)
+            "#]],
+    );
+}
+
+#[test]
+fn test_fn_signature_for_generic_method() {
+    check(
+        r#"
+struct S<T>(T);
+impl<T> S<T> {
+    fn foo(&self, x: T) {}
+}
+
+fn main() { S(1u32).foo($0); }
+"#,
+        expect![[r#"
+                fn foo(&self, x: u32)
+                (<x: u32>)
             "#]],
     );
 }

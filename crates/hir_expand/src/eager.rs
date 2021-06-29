@@ -17,12 +17,12 @@
 //! > and we need to live with it because it's available on stable and widely relied upon.
 //!
 //!
-//! See the full discussion : https://rust-lang.zulipchat.com/#narrow/stream/131828-t-compiler/topic/Eager.20expansion.20of.20built-in.20macros
+//! See the full discussion : <https://rust-lang.zulipchat.com/#narrow/stream/131828-t-compiler/topic/Eager.20expansion.20of.20built-in.20macros>
 
 use crate::{
     ast::{self, AstNode},
     db::AstDatabase,
-    EagerCallLoc, EagerMacroId, InFile, MacroCallId, MacroCallKind, MacroDefId, MacroDefKind,
+    EagerCallInfo, InFile, MacroCallId, MacroCallKind, MacroCallLoc, MacroDefId, MacroDefKind,
 };
 
 use base_db::CrateId;
@@ -105,7 +105,7 @@ pub fn expand_eager_macro(
     def: MacroDefId,
     resolver: &dyn Fn(ast::Path) -> Option<MacroDefId>,
     mut diagnostic_sink: &mut dyn FnMut(mbe::ExpandError),
-) -> Result<EagerMacroId, ErrorEmitted> {
+) -> Result<MacroCallId, ErrorEmitted> {
     let parsed_args = diagnostic_sink.option_with(
         || Some(mbe::ast_to_token_tree(&macro_call.value.token_tree()?).0),
         || err("malformed macro invocation"),
@@ -113,22 +113,22 @@ pub fn expand_eager_macro(
 
     let ast_map = db.ast_id_map(macro_call.file_id);
     let call_id = InFile::new(macro_call.file_id, ast_map.ast_id(&macro_call.value));
+    let fragment = crate::to_fragment_kind(&macro_call.value);
 
     // Note:
     // When `lazy_expand` is called, its *parent* file must be already exists.
     // Here we store an eager macro id for the argument expanded subtree here
     // for that purpose.
-    let arg_id = db.intern_eager_expansion({
-        EagerCallLoc {
-            def,
-            fragment: FragmentKind::Expr,
-            subtree: Arc::new(parsed_args.clone()),
-            krate,
-            call: call_id,
+    let arg_id = db.intern_macro(MacroCallLoc {
+        def,
+        krate,
+        eager: Some(EagerCallInfo {
+            arg_or_expansion: Arc::new(parsed_args.clone()),
             included_file: None,
-        }
+        }),
+        kind: MacroCallKind::FnLike { ast_id: call_id, fragment: FragmentKind::Expr },
     });
-    let arg_file_id: MacroCallId = arg_id.into();
+    let arg_file_id = arg_id;
 
     let parsed_args =
         diagnostic_sink.result(mbe::token_tree_to_syntax_node(&parsed_args, FragmentKind::Expr))?.0;
@@ -146,16 +146,17 @@ pub fn expand_eager_macro(
         let res = eager.expand(db, arg_id, &subtree);
 
         let expanded = diagnostic_sink.expand_result_option(res)?;
-        let eager = EagerCallLoc {
+        let loc = MacroCallLoc {
             def,
-            fragment: expanded.fragment,
-            subtree: Arc::new(expanded.subtree),
             krate,
-            call: call_id,
-            included_file: expanded.included_file,
+            eager: Some(EagerCallInfo {
+                arg_or_expansion: Arc::new(expanded.subtree),
+                included_file: expanded.included_file,
+            }),
+            kind: MacroCallKind::FnLike { ast_id: call_id, fragment },
         };
 
-        Ok(db.intern_eager_expansion(eager))
+        Ok(db.intern_macro(loc))
     } else {
         panic!("called `expand_eager_macro` on non-eager macro def {:?}", def);
     }
@@ -175,9 +176,12 @@ fn lazy_expand(
 ) -> ExpandResult<Option<InFile<SyntaxNode>>> {
     let ast_id = db.ast_id_map(macro_call.file_id).ast_id(&macro_call.value);
 
-    let id: MacroCallId = def
-        .as_lazy_macro(db, krate, MacroCallKind::FnLike { ast_id: macro_call.with_value(ast_id) })
-        .into();
+    let fragment = crate::to_fragment_kind(&macro_call.value);
+    let id = def.as_lazy_macro(
+        db,
+        krate,
+        MacroCallKind::FnLike { ast_id: macro_call.with_value(ast_id), fragment },
+    );
 
     let err = db.macro_expand_error(id);
     let value = db.parse_or_expand(id.as_file()).map(|node| InFile::new(id.as_file(), node));
@@ -192,7 +196,7 @@ fn eager_macro_recur(
     macro_resolver: &dyn Fn(ast::Path) -> Option<MacroDefId>,
     mut diagnostic_sink: &mut dyn FnMut(mbe::ExpandError),
 ) -> Result<SyntaxNode, ErrorEmitted> {
-    let original = curr.value.clone().clone_for_update();
+    let original = curr.value.clone_for_update();
 
     let children = original.descendants().filter_map(ast::MacroCall::cast);
     let mut replacements = Vec::new();
@@ -203,21 +207,21 @@ fn eager_macro_recur(
             .option_with(|| macro_resolver(child.path()?), || err("failed to resolve macro"))?;
         let insert = match def.kind {
             MacroDefKind::BuiltInEager(..) => {
-                let id: MacroCallId = expand_eager_macro(
+                let id = expand_eager_macro(
                     db,
                     krate,
                     curr.with_value(child.clone()),
                     def,
                     macro_resolver,
                     diagnostic_sink,
-                )?
-                .into();
+                )?;
                 db.parse_or_expand(id.as_file())
                     .expect("successful macro expansion should be parseable")
                     .clone_for_update()
             }
             MacroDefKind::Declarative(_)
             | MacroDefKind::BuiltIn(..)
+            | MacroDefKind::BuiltInAttr(..)
             | MacroDefKind::BuiltInDerive(..)
             | MacroDefKind::ProcMacro(..) => {
                 let res = lazy_expand(db, &def, curr.with_value(child.clone()), krate);

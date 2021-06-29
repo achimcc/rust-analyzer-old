@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use base_db::{impl_intern_key, salsa, CrateId, Upcast};
 use hir_def::{
-    db::DefDatabase, expr::ExprId, ConstParamId, DefWithBodyId, FunctionId, GenericDefId, ImplId,
-    LifetimeParamId, LocalFieldId, TypeParamId, VariantId,
+    db::DefDatabase, expr::ExprId, BlockId, ConstParamId, DefWithBodyId, FunctionId, GenericDefId,
+    ImplId, LifetimeParamId, LocalFieldId, TypeParamId, VariantId,
 };
 use la_arena::ArenaMap;
 
@@ -79,6 +79,9 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
     #[salsa::invoke(TraitImpls::trait_impls_in_crate_query)]
     fn trait_impls_in_crate(&self, krate: CrateId) -> Arc<TraitImpls>;
 
+    #[salsa::invoke(TraitImpls::trait_impls_in_block_query)]
+    fn trait_impls_in_block(&self, krate: BlockId) -> Option<Arc<TraitImpls>>;
+
     #[salsa::invoke(TraitImpls::trait_impls_in_deps_query)]
     fn trait_impls_in_deps(&self, krate: CrateId) -> Arc<TraitImpls>;
 
@@ -117,10 +120,10 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
     fn fn_def_datum(&self, krate: CrateId, fn_def_id: FnDefId) -> Arc<chalk_db::FnDefDatum>;
 
     #[salsa::invoke(chalk_db::fn_def_variance_query)]
-    fn fn_def_variance(&self, krate: CrateId, fn_def_id: FnDefId) -> chalk_db::Variances;
+    fn fn_def_variance(&self, fn_def_id: FnDefId) -> chalk_db::Variances;
 
     #[salsa::invoke(chalk_db::adt_variance_query)]
-    fn adt_variance(&self, krate: CrateId, adt_id: chalk_db::AdtId) -> chalk_db::Variances;
+    fn adt_variance(&self, adt_id: chalk_db::AdtId) -> chalk_db::Variances;
 
     #[salsa::invoke(chalk_db::associated_ty_value_query)]
     fn associated_ty_value(
@@ -134,14 +137,14 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
     fn trait_solve(
         &self,
         krate: CrateId,
-        goal: crate::Canonical<crate::InEnvironment<crate::DomainGoal>>,
+        goal: crate::Canonical<crate::InEnvironment<crate::Goal>>,
     ) -> Option<crate::Solution>;
 
     #[salsa::invoke(crate::traits::trait_solve_query)]
     fn trait_solve_query(
         &self,
         krate: CrateId,
-        goal: crate::Canonical<crate::InEnvironment<crate::DomainGoal>>,
+        goal: crate::Canonical<crate::InEnvironment<crate::Goal>>,
     ) -> Option<crate::Solution>;
 
     #[salsa::invoke(chalk_db::program_clauses_for_chalk_env_query)]
@@ -168,7 +171,7 @@ fn infer_wait(db: &dyn HirDatabase, def: DefWithBodyId) -> Arc<InferenceResult> 
 fn trait_solve_wait(
     db: &dyn HirDatabase,
     krate: CrateId,
-    goal: crate::Canonical<crate::InEnvironment<crate::DomainGoal>>,
+    goal: crate::Canonical<crate::InEnvironment<crate::Goal>>,
 ) -> Option<crate::Solution> {
     let _p = profile::span("trait_solve::wait");
     db.trait_solve_query(krate, goal)

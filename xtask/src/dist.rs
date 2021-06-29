@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::Result;
 use flate2::{write::GzEncoder, Compression};
-use xshell::{cmd, cp, mkdir_p, pushd, pushenv, read_file, rm_rf, write_file};
+use xshell::{cmd, mkdir_p, pushd, pushenv, read_file, rm_rf, write_file};
 
 use crate::{date_iso, flags, project_root};
 
@@ -45,8 +45,8 @@ fn dist_client(version: &str, release_tag: &str) -> Result<()> {
     patch
         .replace(r#""version": "0.4.0-dev""#, &format!(r#""version": "{}""#, version))
         .replace(r#""releaseTag": null"#, &format!(r#""releaseTag": "{}""#, release_tag))
-        .replace(r#""$generated-start": false,"#, "")
-        .replace(",\n                \"$generated-end\": false", "");
+        .replace(r#""$generated-start": {},"#, "")
+        .replace(",\n                \"$generated-end\": {}", "");
 
     if nightly {
         patch.replace(
@@ -66,6 +66,13 @@ fn dist_client(version: &str, release_tag: &str) -> Result<()> {
 
 fn dist_server(release_channel: &str) -> Result<()> {
     let _e = pushenv("RUST_ANALYZER_CHANNEL", release_channel);
+    let _e = pushenv("CARGO_PROFILE_RELEASE_LTO", "thin");
+
+    // Uncomment to enable debug info for releases. Note that:
+    //   * debug info is split on windows and macs, so it does nothing for those platforms,
+    //   * on Linux, this blows up the binary size from 8MB to 43MB, which is unreasonable.
+    // let _e = pushenv("CARGO_PROFILE_RELEASE_DEBUG", "1");
+
     let target = get_target();
     if target.contains("-linux-gnu") || target.contains("-linux-musl") {
         env::set_var("CC", "clang");
@@ -78,24 +85,6 @@ fn dist_server(release_channel: &str) -> Result<()> {
         Path::new("target").join(&target).join("release").join(format!("rust-analyzer{}", suffix));
     let dst = Path::new("dist").join(format!("rust-analyzer-{}{}", target, suffix));
     gzip(&src, &dst.with_extension("gz"))?;
-
-    // FIXME: the old names are temporarily kept for client compatibility, but they should be removed
-    // Remove this block after a couple of releases
-    match target.as_ref() {
-        "x86_64-unknown-linux-gnu" => {
-            cp(&src, "dist/rust-analyzer-linux")?;
-            gzip(&src, Path::new("dist/rust-analyzer-linux.gz"))?;
-        }
-        "x86_64-pc-windows-msvc" => {
-            cp(&src, "dist/rust-analyzer-windows.exe")?;
-            gzip(&src, Path::new("dist/rust-analyzer-windows.gz"))?;
-        }
-        "x86_64-apple-darwin" => {
-            cp(&src, "dist/rust-analyzer-mac")?;
-            gzip(&src, Path::new("dist/rust-analyzer-mac.gz"))?;
-        }
-        _ => {}
-    }
 
     Ok(())
 }

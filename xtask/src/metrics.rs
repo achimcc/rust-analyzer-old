@@ -71,7 +71,7 @@ impl Metrics {
         Ok(())
     }
     fn measure_analysis_stats_self(&mut self) -> Result<()> {
-        self.measure_analysis_stats_path("self", &".")
+        self.measure_analysis_stats_path("self", ".")
     }
     fn measure_analysis_stats(&mut self, bench: &str) -> Result<()> {
         self.measure_analysis_stats_path(
@@ -81,9 +81,8 @@ impl Metrics {
     }
     fn measure_analysis_stats_path(&mut self, name: &str, path: &str) -> Result<()> {
         eprintln!("\nMeasuring analysis-stats/{}", name);
-        let output =
-            cmd!("./target/release/rust-analyzer --quiet analysis-stats --memory-usage {path}")
-                .read()?;
+        let output = cmd!("./target/release/rust-analyzer -q analysis-stats --memory-usage {path}")
+            .read()?;
         for (metric, value, unit) in parse_metrics(&output) {
             self.report(&format!("analysis-stats/{}/{}", name, metric), value, unit.into());
         }

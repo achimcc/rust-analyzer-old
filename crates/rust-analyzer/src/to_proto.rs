@@ -6,7 +6,7 @@ use std::{
 };
 
 use ide::{
-    Annotation, AnnotationKind, Assist, AssistKind, CallInfo, Cancelable, CompletionItem,
+    Annotation, AnnotationKind, Assist, AssistKind, CallInfo, Cancellable, CompletionItem,
     CompletionItemKind, CompletionRelevance, Documentation, FileId, FileRange, FileSystemEdit,
     Fold, FoldKind, Highlight, HlMod, HlOperator, HlPunct, HlRange, HlTag, Indel, InlayHint,
     InlayKind, InsertTextFormat, Markup, NavigationTarget, ReferenceAccess, RenameError, Runnable,
@@ -270,9 +270,12 @@ pub(crate) fn completion_item(
             set_score(&mut lsp_item_with_ref, relevance);
             lsp_item_with_ref.label =
                 format!("&{}{}", mutability.as_keyword_for_ref(), lsp_item_with_ref.label);
-            if let Some(lsp_types::CompletionTextEdit::Edit(it)) = &mut lsp_item_with_ref.text_edit
-            {
-                it.new_text = format!("&{}{}", mutability.as_keyword_for_ref(), it.new_text);
+            if let Some(it) = &mut lsp_item_with_ref.text_edit {
+                let new_text = match it {
+                    lsp_types::CompletionTextEdit::Edit(it) => &mut it.new_text,
+                    lsp_types::CompletionTextEdit::InsertAndReplace(it) => &mut it.new_text,
+                };
+                *new_text = format!("&{}{}", mutability.as_keyword_for_ref(), new_text);
             }
             vec![lsp_item_with_ref, lsp_item]
         }
@@ -381,6 +384,7 @@ pub(crate) fn semantic_tokens(
     text: &str,
     line_index: &LineIndex,
     highlights: Vec<HlRange>,
+    highlight_strings: bool,
 ) -> lsp_types::SemanticTokens {
     let id = TOKEN_RESULT_COUNTER.fetch_add(1, Ordering::SeqCst).to_string();
     let mut builder = semantic_tokens::SemanticTokensBuilder::new(id);
@@ -389,8 +393,11 @@ pub(crate) fn semantic_tokens(
         if highlight_range.highlight.is_empty() {
             continue;
         }
-        let (type_, mods) = semantic_token_type_and_modifiers(highlight_range.highlight);
-        let token_index = semantic_tokens::type_index(type_);
+        let (ty, mods) = semantic_token_type_and_modifiers(highlight_range.highlight);
+        if !highlight_strings && ty == lsp_types::SemanticTokenType::STRING {
+            continue;
+        }
+        let token_index = semantic_tokens::type_index(ty);
         let modifier_bitset = mods.0;
 
         for mut text_range in line_index.index.lines(highlight_range.range) {
@@ -398,7 +405,7 @@ pub(crate) fn semantic_tokens(
                 text_range =
                     TextRange::new(text_range.start(), text_range.end() - TextSize::of('\n'));
             }
-            let range = range(&line_index, text_range);
+            let range = range(line_index, text_range);
             builder.push(range, token_index, modifier_bitset);
         }
     }
@@ -422,7 +429,7 @@ fn semantic_token_type_and_modifiers(
     let type_ = match highlight.tag {
         HlTag::Symbol(symbol) => match symbol {
             SymbolKind::Module => lsp_types::SemanticTokenType::NAMESPACE,
-            SymbolKind::Impl => lsp_types::SemanticTokenType::TYPE,
+            SymbolKind::Impl => semantic_tokens::TYPE_ALIAS,
             SymbolKind::Field => lsp_types::SemanticTokenType::PROPERTY,
             SymbolKind::TypeParam => lsp_types::SemanticTokenType::TYPE_PARAMETER,
             SymbolKind::ConstParam => semantic_tokens::CONST_PARAMETER,
@@ -459,7 +466,7 @@ fn semantic_token_type_and_modifiers(
         HlTag::BoolLiteral => semantic_tokens::BOOLEAN,
         HlTag::BuiltinType => semantic_tokens::BUILTIN_TYPE,
         HlTag::ByteLiteral | HlTag::NumericLiteral => lsp_types::SemanticTokenType::NUMBER,
-        HlTag::CharLiteral => semantic_tokens::CHAR_LITERAL,
+        HlTag::CharLiteral => semantic_tokens::CHAR,
         HlTag::Comment => lsp_types::SemanticTokenType::COMMENT,
         HlTag::EscapeSequence => semantic_tokens::ESCAPE_SEQUENCE,
         HlTag::FormatSpecifier => semantic_tokens::FORMAT_SPECIFIER,
@@ -496,6 +503,9 @@ fn semantic_token_type_and_modifiers(
             HlMod::ControlFlow => semantic_tokens::CONTROL_FLOW,
             HlMod::Mutable => semantic_tokens::MUTABLE,
             HlMod::Consuming => semantic_tokens::CONSUMING,
+            HlMod::Async => semantic_tokens::ASYNC,
+            HlMod::Library => semantic_tokens::LIBRARY,
+            HlMod::Public => semantic_tokens::PUBLIC,
             HlMod::Unsafe => semantic_tokens::UNSAFE,
             HlMod::Callable => semantic_tokens::CALLABLE,
             HlMod::Static => lsp_types::SemanticTokenModifier::STATIC,
@@ -524,6 +534,8 @@ pub(crate) fn folding_range(
         | FoldKind::ArgList
         | FoldKind::Consts
         | FoldKind::Statics
+        | FoldKind::WhereClause
+        | FoldKind::ReturnType
         | FoldKind::Array => None,
     };
 
@@ -595,7 +607,7 @@ pub(crate) fn url_from_abs_path(path: &Path) -> lsp_types::Url {
     // Note: lowercasing the `path` itself doesn't help, the `Url::parse`
     // machinery *also* canonicalizes the drive letter. So, just massage the
     // string in place.
-    let mut url = url.into_string();
+    let mut url: String = url.into();
     url[driver_letter_range].make_ascii_lowercase();
     lsp_types::Url::parse(&url).unwrap()
 }
@@ -716,7 +728,7 @@ pub(crate) fn snippet_text_document_edit(
 pub(crate) fn snippet_text_document_ops(
     snap: &GlobalStateSnapshot,
     file_system_edit: FileSystemEdit,
-) -> Cancelable<Vec<lsp_ext::SnippetDocumentChangeOperation>> {
+) -> Cancellable<Vec<lsp_ext::SnippetDocumentChangeOperation>> {
     let mut ops = Vec::new();
     match file_system_edit {
         FileSystemEdit::CreateFile { dst, initial_contents } => {
@@ -746,7 +758,7 @@ pub(crate) fn snippet_text_document_ops(
             let new_uri = snap.anchored_path(&dst);
             let mut rename_file =
                 lsp_types::RenameFile { old_uri, new_uri, options: None, annotation_id: None };
-            if snap.analysis.is_library_file(src) == Ok(true)
+            if snap.analysis.is_library_file(src).ok() == Some(true)
                 && snap.config.change_annotation_support()
             {
                 rename_file.annotation_id = Some(outside_workspace_annotation_id())
@@ -770,7 +782,7 @@ pub(crate) fn snippet_workspace_edit(
         document_changes.extend_from_slice(&ops);
     }
     for (file_id, edit) in source_change.source_file_edits {
-        let edit = snippet_text_document_edit(&snap, source_change.is_snippet, file_id, edit)?;
+        let edit = snippet_text_document_edit(snap, source_change.is_snippet, file_id, edit)?;
         document_changes.push(lsp_ext::SnippetDocumentChangeOperation::Edit(edit));
     }
     let mut workspace_edit = lsp_ext::SnippetWorkspaceEdit {
@@ -897,7 +909,7 @@ pub(crate) fn code_action(
         (Some(it), _) => res.edit = Some(snippet_workspace_edit(snap, it)?),
         (None, Some((index, code_action_params))) => {
             res.data = Some(lsp_ext::CodeActionData {
-                id: format!("{}:{}", assist.id.0, index.to_string()),
+                id: format!("{}:{}:{}", assist.id.0, assist.id.1.name(), index),
                 code_action_params,
             });
         }
@@ -946,7 +958,7 @@ pub(crate) fn code_lens(
             let annotation_range = range(&line_index, annotation.range);
 
             let action = run.action();
-            let r = runnable(&snap, run)?;
+            let r = runnable(snap, run)?;
 
             let command = if debug {
                 command::debug_single(&r)
@@ -1139,7 +1151,7 @@ mod tests {
 
     use ide::Analysis;
     use ide_db::helpers::{
-        insert_use::{InsertUseConfig, PrefixKind},
+        insert_use::{ImportGranularity, InsertUseConfig, PrefixKind},
         SnippetCap,
     };
 
@@ -1167,13 +1179,16 @@ mod tests {
                 &ide::CompletionConfig {
                     enable_postfix_completions: true,
                     enable_imports_on_the_fly: true,
+                    enable_self_on_the_fly: true,
                     add_call_parenthesis: true,
                     add_call_argument_snippets: true,
                     snippet_cap: SnippetCap::new(true),
                     insert_use: InsertUseConfig {
-                        merge: None,
+                        granularity: ImportGranularity::Item,
                         prefix_kind: PrefixKind::Plain,
+                        enforce_granularity: true,
                         group: true,
+                        skip_glob_imports: true,
                     },
                 },
                 ide_db::base_db::FilePosition { file_id, offset },
@@ -1223,12 +1238,12 @@ fn main() {
         assert_eq!(folds.len(), 4);
 
         let line_index = LineIndex {
-            index: Arc::new(ide::LineIndex::new(&text)),
+            index: Arc::new(ide::LineIndex::new(text)),
             endings: LineEndings::Unix,
             encoding: OffsetEncoding::Utf16,
         };
         let converted: Vec<lsp_types::FoldingRange> =
-            folds.into_iter().map(|it| folding_range(&text, &line_index, true, it)).collect();
+            folds.into_iter().map(|it| folding_range(text, &line_index, true, it)).collect();
 
         let expected_lines = [(0, 2), (4, 10), (5, 6), (7, 9)];
         assert_eq!(converted.len(), expected_lines.len());

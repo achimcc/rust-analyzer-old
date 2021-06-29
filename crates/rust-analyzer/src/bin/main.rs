@@ -60,7 +60,14 @@ fn try_main() -> Result<()> {
         }
     }
 
-    setup_logging(flags.log_file.as_deref(), flags.no_log_buffering)?;
+    let mut log_file = flags.log_file.as_deref();
+
+    let env_log_file = env::var("RA_LOG_FILE").ok();
+    if let Some(env_log_file) = env_log_file.as_deref() {
+        log_file = Some(Path::new(env_log_file));
+    }
+
+    setup_logging(log_file, flags.no_log_buffering)?;
     let verbosity = flags.verbosity();
 
     match flags.subcommand {
@@ -91,14 +98,14 @@ fn try_main() -> Result<()> {
             with_deps: cmd.with_deps,
             no_sysroot: cmd.no_sysroot,
             path: cmd.path,
-            load_output_dirs: cmd.load_output_dirs,
-            with_proc_macro: cmd.with_proc_macro,
+            enable_build_scripts: !cmd.disable_build_scripts,
+            enable_proc_macros: !cmd.disable_proc_macros,
             skip_inference: cmd.skip_inference,
         }
         .run(verbosity)?,
 
         flags::RustAnalyzerCmd::Diagnostics(cmd) => {
-            cli::diagnostics(&cmd.path, cmd.load_output_dirs, cmd.with_proc_macro)?
+            cli::diagnostics(&cmd.path, !cmd.disable_build_scripts, !cmd.disable_proc_macros)?
         }
         flags::RustAnalyzerCmd::Ssr(cmd) => cli::apply_ssr_rules(cmd.rule)?,
         flags::RustAnalyzerCmd::Search(cmd) => cli::search_for_patterns(cmd.pattern, cmd.debug)?,
@@ -159,7 +166,24 @@ fn run_server() -> Result<()> {
     let initialize_params =
         from_json::<lsp_types::InitializeParams>("InitializeParams", initialize_params)?;
 
-    let server_capabilities = rust_analyzer::server_capabilities(&initialize_params.capabilities);
+    let root_path = match initialize_params
+        .root_uri
+        .and_then(|it| it.to_file_path().ok())
+        .and_then(|it| AbsPathBuf::try_from(it).ok())
+    {
+        Some(it) => it,
+        None => {
+            let cwd = env::current_dir()?;
+            AbsPathBuf::assert(cwd)
+        }
+    };
+
+    let mut config = Config::new(root_path, initialize_params.capabilities);
+    if let Some(json) = initialize_params.initialization_options {
+        config.update(json);
+    }
+
+    let server_capabilities = rust_analyzer::server_capabilities(&config);
 
     let initialize_result = lsp_types::InitializeResult {
         capabilities: server_capabilities,
@@ -167,11 +191,7 @@ fn run_server() -> Result<()> {
             name: String::from("rust-analyzer"),
             version: Some(String::from(env!("REV"))),
         }),
-        offset_encoding: if supports_utf8(&initialize_params.capabilities) {
-            Some("utf-8".to_string())
-        } else {
-            None
-        },
+        offset_encoding: if supports_utf8(&config.caps) { Some("utf-8".to_string()) } else { None },
     };
 
     let initialize_result = serde_json::to_value(initialize_result).unwrap();
@@ -182,48 +202,26 @@ fn run_server() -> Result<()> {
         log::info!("Client '{}' {}", client_info.name, client_info.version.unwrap_or_default());
     }
 
-    let config = {
-        let root_path = match initialize_params
-            .root_uri
-            .and_then(|it| it.to_file_path().ok())
-            .and_then(|it| AbsPathBuf::try_from(it).ok())
-        {
-            Some(it) => it,
-            None => {
-                let cwd = env::current_dir()?;
-                AbsPathBuf::assert(cwd)
-            }
-        };
+    if config.linked_projects().is_empty() && config.detached_files().is_empty() {
+        let workspace_roots = initialize_params
+            .workspace_folders
+            .map(|workspaces| {
+                workspaces
+                    .into_iter()
+                    .filter_map(|it| it.uri.to_file_path().ok())
+                    .filter_map(|it| AbsPathBuf::try_from(it).ok())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|workspaces| !workspaces.is_empty())
+            .unwrap_or_else(|| vec![config.root_path.clone()]);
 
-        let mut config = Config::new(root_path, initialize_params.capabilities);
-        if let Some(json) = initialize_params.initialization_options {
-            config.update(json);
+        let discovered = ProjectManifest::discover_all(&workspace_roots);
+        log::info!("discovered projects: {:?}", discovered);
+        if discovered.is_empty() {
+            log::error!("failed to find any projects in {:?}", workspace_roots);
         }
-
-        if config.linked_projects().is_empty() {
-            let workspace_roots = initialize_params
-                .workspace_folders
-                .map(|workspaces| {
-                    workspaces
-                        .into_iter()
-                        .filter_map(|it| it.uri.to_file_path().ok())
-                        .filter_map(|it| AbsPathBuf::try_from(it).ok())
-                        .collect::<Vec<_>>()
-                })
-                .filter(|workspaces| !workspaces.is_empty())
-                .unwrap_or_else(|| vec![config.root_path.clone()]);
-
-            let discovered = ProjectManifest::discover_all(&workspace_roots);
-            log::info!("discovered projects: {:?}", discovered);
-            if discovered.is_empty() {
-                log::error!("failed to find any projects in {:?}", workspace_roots);
-            }
-
-            config.discovered_projects = Some(discovered);
-        }
-
-        config
-    };
+        config.discovered_projects = Some(discovered);
+    }
 
     rust_analyzer::main_loop(config, connection)?;
 

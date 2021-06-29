@@ -1,4 +1,5 @@
-//! FIXME: write short doc here
+//! A "Parser" structure for token trees. We use this when parsing a declarative
+//! macro definition into a list of patterns and templates.
 
 use crate::{subtree_source::SubtreeTokenSource, ExpandError, ExpandResult};
 
@@ -114,16 +115,17 @@ impl<'a> TtIter<'a> {
             }
         }
 
-        let buffer = TokenBuffer::from_tokens(&self.inner.as_slice());
+        let buffer = TokenBuffer::from_tokens(self.inner.as_slice());
         let mut src = SubtreeTokenSource::new(&buffer);
         let mut sink = OffsetTokenSink { cursor: buffer.begin(), error: false };
 
         parser::parse_fragment(&mut src, &mut sink, fragment_kind);
 
-        let mut err = None;
-        if !sink.cursor.is_root() || sink.error {
-            err = Some(err!("expected {:?}", fragment_kind));
-        }
+        let mut err = if !sink.cursor.is_root() || sink.error {
+            Some(err!("expected {:?}", fragment_kind))
+        } else {
+            None
+        };
 
         let mut curr = buffer.begin();
         let mut res = vec![];
@@ -137,7 +139,7 @@ impl<'a> TtIter<'a> {
             }
         }
         self.inner = self.inner.as_slice()[res.len()..].iter();
-        if res.len() == 0 && err.is_none() {
+        if res.is_empty() && err.is_none() {
             err = Some(err!("no tokens consumed"));
         }
         let res = match res.len() {

@@ -64,10 +64,10 @@ pub(crate) fn complete_fn_param(acc: &mut Completions, ctx: &CompletionContext) 
 mod tests {
     use expect_test::{expect, Expect};
 
-    use crate::{test_utils::completion_list, CompletionKind};
+    use crate::{tests::filtered_completion_list, CompletionKind};
 
     fn check(ra_fixture: &str, expect: Expect) {
-        let actual = completion_list(ra_fixture, CompletionKind::Magic);
+        let actual = filtered_completion_list(ra_fixture, CompletionKind::Magic);
         expect.assert_eq(&actual);
     }
 
@@ -125,6 +125,21 @@ fn outer(text: String) {
 "#,
             expect![[r#"
                 bn text: String
+            "#]],
+        )
+    }
+
+    #[test]
+    fn completes_non_ident_pat_param() {
+        check(
+            r#"
+struct Bar { bar: u32 }
+
+fn foo(Bar { bar }: Bar) {}
+fn foo2($0) {}
+"#,
+            expect![[r#"
+                bn Bar { bar }: Bar
             "#]],
         )
     }

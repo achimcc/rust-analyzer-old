@@ -22,6 +22,7 @@ pub struct FunctionData {
     pub name: Name,
     pub params: Vec<Interned<TypeRef>>,
     pub ret_type: Interned<TypeRef>,
+    pub async_ret_type: Option<Interned<TypeRef>>,
     pub attrs: Attrs,
     pub visibility: RawVisibility,
     pub abi: Option<Interned<str>>,
@@ -63,6 +64,7 @@ impl FunctionData {
                 })
                 .collect(),
             ret_type: func.ret_type.clone(),
+            async_ret_type: func.async_ret_type.clone(),
             attrs: item_tree.attrs(db, krate, ModItem::from(loc.id.value).into()),
             visibility: item_tree[func.visibility].clone(),
             abi: func.abi.clone(),
@@ -112,7 +114,7 @@ pub struct TypeAliasData {
     pub visibility: RawVisibility,
     pub is_extern: bool,
     /// Bounds restricting the type alias itself (eg. `type Ty: Bound;` in a trait or impl).
-    pub bounds: Vec<TypeBound>,
+    pub bounds: Vec<Interned<TypeBound>>,
 }
 
 impl TypeAliasData {
@@ -141,7 +143,10 @@ pub struct TraitData {
     pub is_auto: bool,
     pub is_unsafe: bool,
     pub visibility: RawVisibility,
-    pub bounds: Box<[TypeBound]>,
+    /// Whether the trait has `#[rust_skip_array_during_method_dispatch]`. `hir_ty` will ignore
+    /// method calls to this trait's methods when the receiver is an array and the crate edition is
+    /// 2015 or 2018.
+    pub skip_array_during_method_dispatch: bool,
 }
 
 impl TraitData {
@@ -155,8 +160,11 @@ impl TraitData {
         let module_id = tr_loc.container;
         let container = AssocContainerId::TraitId(tr);
         let visibility = item_tree[tr_def.visibility].clone();
-        let bounds = tr_def.bounds.clone();
         let mut expander = Expander::new(db, tr_loc.id.file_id(), module_id);
+        let skip_array_during_method_dispatch = item_tree
+            .attrs(db, tr_loc.container.krate(), ModItem::from(tr_loc.id.value).into())
+            .by_key("rustc_skip_array_during_method_dispatch")
+            .exists();
 
         let items = collect_items(
             db,
@@ -168,7 +176,14 @@ impl TraitData {
             100,
         );
 
-        Arc::new(TraitData { name, items, is_auto, is_unsafe, visibility, bounds })
+        Arc::new(TraitData {
+            name,
+            items,
+            is_auto,
+            is_unsafe,
+            visibility,
+            skip_array_during_method_dispatch,
+        })
     }
 
     pub fn associated_types(&self) -> impl Iterator<Item = TypeAliasId> + '_ {

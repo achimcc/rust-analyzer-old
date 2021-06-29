@@ -43,6 +43,7 @@ pub mod loader;
 mod path_interner;
 mod vfs_path;
 
+use serde;
 use std::{fmt, mem};
 
 use crate::path_interner::PathInterner;

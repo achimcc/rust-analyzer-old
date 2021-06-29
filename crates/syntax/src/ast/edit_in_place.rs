@@ -2,13 +2,18 @@
 
 use std::iter::empty;
 
-use parser::T;
+use parser::{SyntaxKind, T};
+use rowan::SyntaxElement;
 
 use crate::{
     algo::neighbor,
-    ast::{self, edit::AstNodeEdit, make, GenericParamsOwner, WhereClause},
+    ast::{
+        self,
+        edit::{AstNodeEdit, IndentLevel},
+        make, GenericParamsOwner,
+    },
     ted::{self, Position},
-    AstNode, AstToken, Direction,
+    AstNode, AstToken, Direction, SyntaxNode,
 };
 
 use super::NameOwner;
@@ -37,7 +42,7 @@ impl GenericParamsOwnerEdit for ast::Fn {
         }
     }
 
-    fn get_or_create_where_clause(&self) -> WhereClause {
+    fn get_or_create_where_clause(&self) -> ast::WhereClause {
         if self.where_clause().is_none() {
             let position = if let Some(ty) = self.ret_type() {
                 Position::after(ty.syntax())
@@ -67,7 +72,7 @@ impl GenericParamsOwnerEdit for ast::Impl {
         }
     }
 
-    fn get_or_create_where_clause(&self) -> WhereClause {
+    fn get_or_create_where_clause(&self) -> ast::WhereClause {
         if self.where_clause().is_none() {
             let position = if let Some(items) = self.assoc_item_list() {
                 Position::before(items.syntax())
@@ -97,7 +102,7 @@ impl GenericParamsOwnerEdit for ast::Trait {
         }
     }
 
-    fn get_or_create_where_clause(&self) -> WhereClause {
+    fn get_or_create_where_clause(&self) -> ast::WhereClause {
         if self.where_clause().is_none() {
             let position = if let Some(items) = self.assoc_item_list() {
                 Position::before(items.syntax())
@@ -127,7 +132,7 @@ impl GenericParamsOwnerEdit for ast::Struct {
         }
     }
 
-    fn get_or_create_where_clause(&self) -> WhereClause {
+    fn get_or_create_where_clause(&self) -> ast::WhereClause {
         if self.where_clause().is_none() {
             let tfl = self.field_list().and_then(|fl| match fl {
                 ast::FieldList::RecordFieldList(_) => None,
@@ -165,7 +170,7 @@ impl GenericParamsOwnerEdit for ast::Enum {
         }
     }
 
-    fn get_or_create_where_clause(&self) -> WhereClause {
+    fn get_or_create_where_clause(&self) -> ast::WhereClause {
         if self.where_clause().is_none() {
             let position = if let Some(gpl) = self.generic_param_list() {
                 Position::after(gpl.syntax())
@@ -195,18 +200,13 @@ impl ast::GenericParamList {
     pub fn add_generic_param(&self, generic_param: ast::GenericParam) {
         match self.generic_params().last() {
             Some(last_param) => {
-                let mut elems = Vec::new();
-                if !last_param
-                    .syntax()
-                    .siblings_with_tokens(Direction::Next)
-                    .any(|it| it.kind() == T![,])
-                {
-                    elems.push(make::token(T![,]).into());
-                    elems.push(make::tokens::single_space().into());
-                };
-                elems.push(generic_param.syntax().clone().into());
-                let after_last_param = Position::after(last_param.syntax());
-                ted::insert_all(after_last_param, elems);
+                let position = Position::after(last_param.syntax());
+                let elements = vec![
+                    make::token(T![,]).into(),
+                    make::tokens::single_space().into(),
+                    generic_param.syntax().clone().into(),
+                ];
+                ted::insert_all(position, elements);
             }
             None => {
                 let after_l_angle = Position::after(self.l_angle_token().unwrap());
@@ -236,6 +236,16 @@ impl ast::TypeBoundList {
         } else {
             ted::remove(self.syntax())
         }
+    }
+}
+
+impl ast::PathSegment {
+    pub fn get_or_create_generic_arg_list(&self) -> ast::GenericArgList {
+        if self.generic_arg_list().is_none() {
+            let arg_list = make::generic_arg_list().clone_for_update();
+            ted::append_child(self.syntax(), arg_list.syntax())
+        }
+        self.generic_arg_list().unwrap()
     }
 }
 
@@ -275,6 +285,176 @@ impl ast::Use {
         }
         ted::remove(self.syntax())
     }
+}
+
+impl ast::Impl {
+    pub fn get_or_create_assoc_item_list(&self) -> ast::AssocItemList {
+        if self.assoc_item_list().is_none() {
+            let assoc_item_list = make::assoc_item_list().clone_for_update();
+            ted::append_child(self.syntax(), assoc_item_list.syntax());
+        }
+        self.assoc_item_list().unwrap()
+    }
+}
+
+impl ast::AssocItemList {
+    pub fn add_item(&self, item: ast::AssocItem) {
+        let (indent, position, whitespace) = match self.assoc_items().last() {
+            Some(last_item) => (
+                IndentLevel::from_node(last_item.syntax()),
+                Position::after(last_item.syntax()),
+                "\n\n",
+            ),
+            None => match self.l_curly_token() {
+                Some(l_curly) => {
+                    normalize_ws_between_braces(self.syntax());
+                    (IndentLevel::from_token(&l_curly) + 1, Position::after(&l_curly), "\n")
+                }
+                None => (IndentLevel::single(), Position::last_child_of(self.syntax()), "\n"),
+            },
+        };
+        let elements: Vec<SyntaxElement<_>> = vec![
+            make::tokens::whitespace(&format!("{}{}", whitespace, indent)).into(),
+            item.syntax().clone().into(),
+        ];
+        ted::insert_all(position, elements);
+    }
+}
+
+impl ast::Fn {
+    pub fn get_or_create_body(&self) -> ast::BlockExpr {
+        if self.body().is_none() {
+            let body = make::ext::empty_block_expr().clone_for_update();
+            match self.semicolon_token() {
+                Some(semi) => {
+                    ted::replace(semi, body.syntax());
+                    ted::insert(Position::before(body.syntax), make::tokens::single_space());
+                }
+                None => ted::append_child(self.syntax(), body.syntax()),
+            }
+        }
+        self.body().unwrap()
+    }
+}
+
+impl ast::MatchArm {
+    pub fn remove(&self) {
+        if let Some(sibling) = self.syntax().prev_sibling_or_token() {
+            if sibling.kind() == SyntaxKind::WHITESPACE {
+                ted::remove(sibling);
+            }
+        }
+        if let Some(sibling) = self.syntax().next_sibling_or_token() {
+            if sibling.kind() == T![,] {
+                ted::remove(sibling);
+            }
+        }
+        ted::remove(self.syntax());
+    }
+}
+
+impl ast::MatchArmList {
+    pub fn add_arm(&self, arm: ast::MatchArm) {
+        normalize_ws_between_braces(self.syntax());
+        let mut elements = Vec::new();
+        let position = match self.arms().last() {
+            Some(last_arm) => {
+                let comma = last_arm
+                    .syntax()
+                    .siblings_with_tokens(Direction::Next)
+                    .find(|it| it.kind() == T![,]);
+                if needs_comma(&last_arm) && comma.is_none() {
+                    elements.push(make::token(SyntaxKind::COMMA).into());
+                }
+                Position::after(comma.unwrap_or_else(|| last_arm.syntax().clone().into()))
+            }
+            None => match self.l_curly_token() {
+                Some(it) => Position::after(it),
+                None => Position::last_child_of(self.syntax()),
+            },
+        };
+        let indent = IndentLevel::from_node(self.syntax()) + 1;
+        elements.push(make::tokens::whitespace(&format!("\n{}", indent)).into());
+        elements.push(arm.syntax().clone().into());
+        if needs_comma(&arm) {
+            elements.push(make::token(SyntaxKind::COMMA).into());
+        }
+        ted::insert_all(position, elements);
+
+        fn needs_comma(arm: &ast::MatchArm) -> bool {
+            arm.expr().map_or(false, |e| !e.is_block_like())
+        }
+    }
+}
+
+impl ast::RecordExprFieldList {
+    pub fn add_field(&self, field: ast::RecordExprField) {
+        let is_multiline = self.syntax().text().contains_char('\n');
+        let whitespace = if is_multiline {
+            let indent = IndentLevel::from_node(self.syntax()) + 1;
+            make::tokens::whitespace(&format!("\n{}", indent))
+        } else {
+            make::tokens::single_space()
+        };
+
+        if is_multiline {
+            normalize_ws_between_braces(self.syntax());
+        }
+
+        let position = match self.fields().last() {
+            Some(last_field) => {
+                let comma = match last_field
+                    .syntax()
+                    .siblings_with_tokens(Direction::Next)
+                    .filter_map(|it| it.into_token())
+                    .find(|it| it.kind() == T![,])
+                {
+                    Some(it) => it,
+                    None => {
+                        let comma = ast::make::token(T![,]);
+                        ted::insert(Position::after(last_field.syntax()), &comma);
+                        comma
+                    }
+                };
+                Position::after(comma)
+            }
+            None => match self.l_curly_token() {
+                Some(it) => Position::after(it),
+                None => Position::last_child_of(self.syntax()),
+            },
+        };
+
+        ted::insert_all(position, vec![whitespace.into(), field.syntax().clone().into()]);
+        if is_multiline {
+            ted::insert(Position::after(field.syntax()), ast::make::token(T![,]));
+        }
+    }
+}
+
+fn normalize_ws_between_braces(node: &SyntaxNode) -> Option<()> {
+    let l = node
+        .children_with_tokens()
+        .filter_map(|it| it.into_token())
+        .find(|it| it.kind() == T!['{'])?;
+    let r = node
+        .children_with_tokens()
+        .filter_map(|it| it.into_token())
+        .find(|it| it.kind() == T!['}'])?;
+
+    let indent = IndentLevel::from_node(node);
+
+    match l.next_sibling_or_token() {
+        Some(ws) if ws.kind() == SyntaxKind::WHITESPACE => {
+            if ws.next_sibling_or_token()?.into_token()? == r {
+                ted::replace(ws, make::tokens::whitespace(&format!("\n{}", indent)));
+            }
+        }
+        Some(ws) if ws.kind() == T!['}'] => {
+            ted::insert(Position::after(l), make::tokens::whitespace(&format!("\n{}", indent)));
+        }
+        _ => (),
+    }
+    Some(())
 }
 
 #[cfg(test)]

@@ -1,4 +1,13 @@
-//! FIXME: write short doc here
+//! In rust-analyzer, syntax trees are transient objects.
+//!
+//! That means that we create trees when we need them, and tear them down to
+//! save memory. In this architecture, hanging on to a particular syntax node
+//! for a long time is ill-advisable, as that keeps the whole tree resident.
+//!
+//! Instead, we provide a [`SyntaxNodePtr`] type, which stores information about
+//! *location* of a particular syntax node in a tree. Its a small type which can
+//! be cheaply stored, and which can be resolved to a real [`SyntaxNode`] when
+//! necessary.
 
 use std::{
     hash::{Hash, Hasher},
@@ -23,10 +32,19 @@ impl SyntaxNodePtr {
         SyntaxNodePtr { range: node.text_range(), kind: node.kind() }
     }
 
+    /// "Dereference" the pointer to get the node it points to.
+    ///
+    /// Panics if node is not found, so make sure that `root` syntax tree is
+    /// equivalent (is build from the same text) to the tree which was
+    /// originally used to get this [`SyntaxNodePtr`].
+    ///
+    /// The complexity is linear in the depth of the tree and logarithmic in
+    /// tree width. As most trees are shallow, thinking about this as
+    /// `O(log(N))` in the size of the tree is not too wrong!
     pub fn to_node(&self, root: &SyntaxNode) -> SyntaxNode {
         assert!(root.parent().is_none());
         successors(Some(root.clone()), |node| {
-            node.children().find(|it| it.text_range().contains_range(self.range))
+            node.child_or_token_at_range(self.range).and_then(|it| it.into_node())
         })
         .find(|it| it.text_range() == self.range && it.kind() == self.kind)
         .unwrap_or_else(|| panic!("can't resolve local ptr to SyntaxNode: {:?}", self))

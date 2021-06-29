@@ -4,10 +4,9 @@ mod lower;
 use std::{
     fmt::{self, Display},
     iter,
-    sync::Arc,
 };
 
-use crate::{body::LowerCtx, intern::Interned, type_ref::LifetimeRef};
+use crate::{body::LowerCtx, db::DefDatabase, intern::Interned, type_ref::LifetimeRef};
 use base_db::CrateId;
 use hir_expand::{
     hygiene::Hygiene,
@@ -15,10 +14,7 @@ use hir_expand::{
 };
 use syntax::ast;
 
-use crate::{
-    type_ref::{TypeBound, TypeRef},
-    InFile,
-};
+use crate::type_ref::{TypeBound, TypeRef};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ModPath {
@@ -46,10 +42,18 @@ pub enum ImportAlias {
     Alias(Name),
 }
 
+impl Display for ImportAlias {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ImportAlias::Underscore => f.write_str("_"),
+            ImportAlias::Alias(name) => f.write_str(&name.to_string()),
+        }
+    }
+}
+
 impl ModPath {
-    pub fn from_src(path: ast::Path, hygiene: &Hygiene) -> Option<ModPath> {
-        let ctx = LowerCtx::with_hygiene(hygiene);
-        lower::lower_path(path, &ctx).map(|it| (*it.mod_path).clone())
+    pub fn from_src(db: &dyn DefDatabase, path: ast::Path, hygiene: &Hygiene) -> Option<ModPath> {
+        lower::convert_path(db, None, path, hygiene)
     }
 
     pub fn from_segments(kind: PathKind, segments: impl IntoIterator<Item = Name>) -> ModPath {
@@ -60,17 +64,6 @@ impl ModPath {
     /// Creates a `ModPath` from a `PathKind`, with no extra path segments.
     pub const fn from_kind(kind: PathKind) -> ModPath {
         ModPath { kind, segments: Vec::new() }
-    }
-
-    /// Calls `cb` with all paths, represented by this use item.
-    pub(crate) fn expand_use_item(
-        item_src: InFile<ast::Use>,
-        hygiene: &Hygiene,
-        mut cb: impl FnMut(ModPath, &ast::UseTree, /* is_glob */ bool, Option<ImportAlias>),
-    ) {
-        if let Some(tree) = item_src.value.use_tree() {
-            lower::lower_use_tree(None, tree, hygiene, &mut cb);
-        }
     }
 
     pub fn segments(&self) -> &[Name] {
@@ -126,7 +119,7 @@ pub struct Path {
     type_anchor: Option<Interned<TypeRef>>,
     mod_path: Interned<ModPath>,
     /// Invariant: the same len as `self.mod_path.segments`
-    generic_args: Vec<Option<Arc<GenericArgs>>>,
+    generic_args: Vec<Option<Interned<GenericArgs>>>,
 }
 
 /// Generic arguments to a path segment (e.g. the `i32` in `Option<i32>`). This
@@ -155,7 +148,7 @@ pub struct AssociatedTypeBinding {
     /// Bounds for the associated type, like in `Iterator<Item:
     /// SomeOtherTrait>`. (This is the unstable `associated_type_bounds`
     /// feature.)
-    pub bounds: Vec<TypeBound>,
+    pub bounds: Vec<Interned<TypeBound>>,
 }
 
 /// A single generic argument.
@@ -173,9 +166,9 @@ impl Path {
     }
 
     /// Converts a known mod path to `Path`.
-    pub(crate) fn from_known_path(
+    pub fn from_known_path(
         path: ModPath,
-        generic_args: Vec<Option<Arc<GenericArgs>>>,
+        generic_args: Vec<Option<Interned<GenericArgs>>>,
     ) -> Path {
         Path { type_anchor: None, mod_path: Interned::new(path), generic_args }
     }
@@ -216,7 +209,7 @@ impl Path {
 
     pub fn is_self_type(&self) -> bool {
         self.type_anchor.is_none()
-            && self.generic_args == &[None]
+            && self.generic_args == [None]
             && self.mod_path.as_ident() == Some(&name!(Self))
     }
 }
@@ -229,7 +222,7 @@ pub struct PathSegment<'a> {
 
 pub struct PathSegments<'a> {
     segments: &'a [Name],
-    generic_args: &'a [Option<Arc<GenericArgs>>],
+    generic_args: &'a [Option<Interned<GenericArgs>>],
 }
 
 impl<'a> PathSegments<'a> {

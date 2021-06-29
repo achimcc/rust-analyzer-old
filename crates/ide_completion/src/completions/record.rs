@@ -2,41 +2,44 @@
 use ide_db::{helpers::FamousDefs, SymbolKind};
 use syntax::ast::Expr;
 
-use crate::{item::CompletionKind, CompletionContext, CompletionItem, Completions};
+use crate::{
+    item::CompletionKind, patterns::ImmediateLocation, CompletionContext, CompletionItem,
+    Completions,
+};
 
 pub(crate) fn complete_record(acc: &mut Completions, ctx: &CompletionContext) -> Option<()> {
-    let missing_fields = match (ctx.record_pat_syntax.as_ref(), ctx.record_lit_syntax.as_ref()) {
-        (None, None) => return None,
-        (Some(_), Some(_)) => unreachable!("A record cannot be both a literal and a pattern"),
-        (Some(record_pat), _) => ctx.sema.record_pattern_missing_fields(record_pat),
-        (_, Some(record_lit)) => {
-            let ty = ctx.sema.type_of_expr(&Expr::RecordExpr(record_lit.clone()));
+    let missing_fields = match &ctx.completion_location {
+        Some(ImmediateLocation::RecordExpr(record_expr)) => {
+            let ty = ctx.sema.type_of_expr(&Expr::RecordExpr(record_expr.clone()));
             let default_trait = FamousDefs(&ctx.sema, ctx.krate).core_default_Default();
             let impl_default_trait = default_trait
-                .and_then(|default_trait| ty.map(|ty| ty.impls_trait(ctx.db, default_trait, &[])))
-                .unwrap_or(false);
+                .zip(ty)
+                .map_or(false, |(default_trait, ty)| ty.impls_trait(ctx.db, default_trait, &[]));
 
-            let missing_fields = ctx.sema.record_literal_missing_fields(record_lit);
+            let missing_fields = ctx.sema.record_literal_missing_fields(record_expr);
             if impl_default_trait && !missing_fields.is_empty() {
                 let completion_text = "..Default::default()";
-                let completion_text = completion_text
-                    .strip_prefix(ctx.token.to_string().as_str())
-                    .unwrap_or(completion_text);
                 let mut item = CompletionItem::new(
                     CompletionKind::Snippet,
                     ctx.source_range(),
-                    "..Default::default()",
+                    completion_text,
                 );
+                let completion_text =
+                    completion_text.strip_prefix(ctx.token.text()).unwrap_or(completion_text);
                 item.insert_text(completion_text).kind(SymbolKind::Field);
                 item.add_to(acc);
             }
 
             missing_fields
         }
+        Some(ImmediateLocation::RecordPat(record_pat)) => {
+            ctx.sema.record_pattern_missing_fields(record_pat)
+        }
+        _ => return None,
     };
 
     for (field, ty) in missing_fields {
-        acc.add_field(ctx, field, &ty);
+        acc.add_field(ctx, None, field, &ty);
     }
 
     Some(())
@@ -45,44 +48,29 @@ pub(crate) fn complete_record(acc: &mut Completions, ctx: &CompletionContext) ->
 #[cfg(test)]
 mod tests {
     use expect_test::{expect, Expect};
-    use ide_db::helpers::FamousDefs;
 
     use crate::{
-        test_utils::{self, completion_list},
+        tests::{check_edit, filtered_completion_list},
         CompletionKind,
     };
 
     fn check(ra_fixture: &str, expect: Expect) {
-        let actual = completion_list(ra_fixture, CompletionKind::Reference);
+        let actual = filtered_completion_list(ra_fixture, CompletionKind::Reference);
         expect.assert_eq(&actual);
     }
 
     fn check_snippet(ra_fixture: &str, expect: Expect) {
-        let actual = completion_list(
-            &format!("//- /main.rs crate:main deps:core\n{}\n{}", ra_fixture, FamousDefs::FIXTURE),
-            CompletionKind::Snippet,
-        );
+        let actual = filtered_completion_list(ra_fixture, CompletionKind::Snippet);
         expect.assert_eq(&actual);
-    }
-
-    fn check_edit(what: &str, ra_fixture_before: &str, ra_fixture_after: &str) {
-        test_utils::check_edit(
-            what,
-            &format!(
-                "//- /main.rs crate:main deps:core{}\n{}",
-                ra_fixture_before,
-                FamousDefs::FIXTURE,
-            ),
-            &(ra_fixture_after.to_owned() + "\n"),
-        );
     }
 
     #[test]
     fn test_record_literal_field_default() {
         let test_code = r#"
+//- minicore: default
 struct S { foo: u32, bar: usize }
 
-impl core::default::Default for S {
+impl Default for S {
     fn default() -> Self {
         S {
             foo: 0,
@@ -108,8 +96,6 @@ fn process(f: S) {
         check_snippet(
             test_code,
             expect![[r#"
-                sn pd
-                sn ppd
                 fd ..Default::default()
             "#]],
         );
@@ -120,9 +106,10 @@ fn process(f: S) {
         check_edit(
             "..Default::default()",
             r#"
+//- minicore: default
 struct S { foo: u32, bar: usize }
 
-impl core::default::Default for S {
+impl Default for S {
     fn default() -> Self {
         S {
             foo: 0,
@@ -141,7 +128,7 @@ fn process(f: S) {
             r#"
 struct S { foo: u32, bar: usize }
 
-impl core::default::Default for S {
+impl Default for S {
     fn default() -> Self {
         S {
             foo: 0,
@@ -179,13 +166,7 @@ fn process(f: S) {
             "#]],
         );
 
-        check_snippet(
-            test_code,
-            expect![[r#"
-                sn pd
-                sn ppd
-            "#]],
-        );
+        check_snippet(test_code, expect![[r#""#]]);
     }
 
     #[test]

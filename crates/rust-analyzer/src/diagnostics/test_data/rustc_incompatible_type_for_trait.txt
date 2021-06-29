@@ -2,6 +2,7 @@
     MappedRustDiagnostic {
         url: Url {
             scheme: "file",
+            cannot_be_a_base: false,
             username: "",
             password: None,
             host: None,
@@ -33,6 +34,7 @@
                 CodeDescription {
                     href: Url {
                         scheme: "https",
+                        cannot_be_a_base: false,
                         username: "",
                         password: None,
                         host: Some(
@@ -52,7 +54,7 @@
             source: Some(
                 "rustc",
             ),
-            message: "method `next` has an incompatible type for trait\nexpected type `fn(&mut ty::list_iter::ListIterator<\'list, M>) -> std::option::Option<&ty::Ref<M>>`\n   found type `fn(&ty::list_iter::ListIterator<\'list, M>) -> std::option::Option<&\'list ty::Ref<M>>`",
+            message: "method `next` has an incompatible type for trait\nexpected type `fn(&mut ty::list_iter::ListIterator<'list, M>) -> std::option::Option<&ty::Ref<M>>`\n   found type `fn(&ty::list_iter::ListIterator<'list, M>) -> std::option::Option<&'list ty::Ref<M>>`",
             related_information: None,
             tags: None,
             data: None,

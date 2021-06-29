@@ -1,6 +1,6 @@
 //! Rustc proc-macro server implementation with tt
 //!
-//! Based on idea from https://github.com/fedochet/rust-proc-macro-expander
+//! Based on idea from <https://github.com/fedochet/rust-proc-macro-expander>
 //! The lib-proc-macro server backend is `TokenStream`-agnostic, such that
 //! we could provide any TokenStream implementation.
 //! The original idea from fedochet is using proc-macro2 as backend,
@@ -248,7 +248,7 @@ pub mod token_stream {
             token_trees: subtree
                 .token_trees
                 .into_iter()
-                .map(|t| token_tree_replace_token_ids_with_unspecified(t))
+                .map(token_tree_replace_token_ids_with_unspecified)
                 .collect(),
         }
     }
@@ -457,7 +457,7 @@ impl server::Group for Rustc {
     }
 
     fn span(&mut self, group: &Self::Group) -> Self::Span {
-        group.delimiter.map(|it| it.id).unwrap_or_else(|| tt::TokenId::unspecified())
+        group.delimiter.map(|it| it.id).unwrap_or_else(tt::TokenId::unspecified)
     }
 
     fn set_span(&mut self, _group: &mut Self::Group, _span: Self::Span) {
@@ -539,7 +539,7 @@ impl server::Literal for Rustc {
         } else {
             n.parse::<u128>().unwrap().to_string()
         };
-        return Literal { text: n.into(), id: tt::TokenId::unspecified() };
+        Literal { text: n.into(), id: tt::TokenId::unspecified() }
     }
 
     fn typed_integer(&mut self, n: &str, kind: &str) -> Self::Literal {

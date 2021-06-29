@@ -1,18 +1,21 @@
-//! FIXME: write short doc here
+//! Various diagnostics for expressions that are collected together in one pass
+//! through the body using inference results: mismatched arg counts, missing
+//! fields, etc.
 
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
 
-use hir_def::{expr::Statement, path::path, resolver::HasResolver, AssocItemId, DefWithBodyId};
-use hir_expand::{diagnostics::DiagnosticSink, name};
+use hir_def::{
+    expr::Statement, path::path, resolver::HasResolver, AssocItemId, DefWithBodyId, HasModule,
+};
+use hir_expand::name;
+use itertools::Either;
 use rustc_hash::FxHashSet;
-use syntax::{ast, AstPtr};
 
 use crate::{
     db::HirDatabase,
-    diagnostics::{
-        match_check::{is_useful, MatchCheckCtx, Matrix, PatStack, Usefulness},
-        MismatchedArgCount, MissingFields, MissingMatchArms, MissingOkOrSomeInTailExpr,
-        MissingPatFields, RemoveThisSemicolon,
+    diagnostics::match_check::{
+        self,
+        usefulness::{compute_match_usefulness, expand_pattern, MatchCheckCtx, PatternArena},
     },
     AdtId, InferenceResult, Interner, TyExt, TyKind,
 };
@@ -23,38 +26,67 @@ pub(crate) use hir_def::{
     LocalFieldId, VariantId,
 };
 
-use super::ReplaceFilterMapNextWithFindMap;
-
-pub(super) struct ExprValidator<'a, 'b: 'a> {
-    owner: DefWithBodyId,
-    infer: Arc<InferenceResult>,
-    sink: &'a mut DiagnosticSink<'b>,
+pub enum BodyValidationDiagnostic {
+    RecordMissingFields {
+        record: Either<ExprId, PatId>,
+        variant: VariantId,
+        missed_fields: Vec<LocalFieldId>,
+    },
+    ReplaceFilterMapNextWithFindMap {
+        method_call_expr: ExprId,
+    },
+    MismatchedArgCount {
+        call_expr: ExprId,
+        expected: usize,
+        found: usize,
+    },
+    RemoveThisSemicolon {
+        expr: ExprId,
+    },
+    MissingOkOrSomeInTailExpr {
+        expr: ExprId,
+        required: String,
+    },
+    MissingMatchArms {
+        match_expr: ExprId,
+    },
 }
 
-impl<'a, 'b> ExprValidator<'a, 'b> {
-    pub(super) fn new(
-        owner: DefWithBodyId,
-        infer: Arc<InferenceResult>,
-        sink: &'a mut DiagnosticSink<'b>,
-    ) -> ExprValidator<'a, 'b> {
-        ExprValidator { owner, infer, sink }
+impl BodyValidationDiagnostic {
+    pub fn collect(db: &dyn HirDatabase, owner: DefWithBodyId) -> Vec<BodyValidationDiagnostic> {
+        let _p = profile::span("BodyValidationDiagnostic::collect");
+        let infer = db.infer(owner);
+        let mut validator = ExprValidator::new(owner, infer);
+        validator.validate_body(db);
+        validator.diagnostics
+    }
+}
+
+struct ExprValidator {
+    owner: DefWithBodyId,
+    infer: Arc<InferenceResult>,
+    pub(super) diagnostics: Vec<BodyValidationDiagnostic>,
+}
+
+impl ExprValidator {
+    fn new(owner: DefWithBodyId, infer: Arc<InferenceResult>) -> ExprValidator {
+        ExprValidator { owner, infer, diagnostics: Vec::new() }
     }
 
-    pub(super) fn validate_body(&mut self, db: &dyn HirDatabase) {
+    fn validate_body(&mut self, db: &dyn HirDatabase) {
         self.check_for_filter_map_next(db);
 
         let body = db.body(self.owner);
 
         for (id, expr) in body.exprs.iter() {
-            if let Some((variant_def, missed_fields, true)) =
+            if let Some((variant, missed_fields, true)) =
                 record_literal_missing_fields(db, &self.infer, id, expr)
             {
-                self.create_record_literal_missing_fields_diagnostic(
-                    id,
-                    db,
-                    variant_def,
+                self.diagnostics.push(BodyValidationDiagnostic::RecordMissingFields {
+                    record: Either::Left(id),
+                    variant,
                     missed_fields,
-                );
+                });
             }
 
             match expr {
@@ -68,87 +100,22 @@ impl<'a, 'b> ExprValidator<'a, 'b> {
             }
         }
         for (id, pat) in body.pats.iter() {
-            if let Some((variant_def, missed_fields, true)) =
+            if let Some((variant, missed_fields, true)) =
                 record_pattern_missing_fields(db, &self.infer, id, pat)
             {
-                self.create_record_pattern_missing_fields_diagnostic(
-                    id,
-                    db,
-                    variant_def,
+                self.diagnostics.push(BodyValidationDiagnostic::RecordMissingFields {
+                    record: Either::Right(id),
+                    variant,
                     missed_fields,
-                );
+                });
             }
         }
         let body_expr = &body[body.body_expr];
         if let Expr::Block { statements, tail, .. } = body_expr {
             if let Some(t) = tail {
                 self.validate_results_in_tail_expr(body.body_expr, *t, db);
-            } else if let Some(Statement::Expr(id)) = statements.last() {
-                self.validate_missing_tail_expr(body.body_expr, *id, db);
-            }
-        }
-    }
-
-    fn create_record_literal_missing_fields_diagnostic(
-        &mut self,
-        id: ExprId,
-        db: &dyn HirDatabase,
-        variant_def: VariantId,
-        missed_fields: Vec<LocalFieldId>,
-    ) {
-        // XXX: only look at source_map if we do have missing fields
-        let (_, source_map) = db.body_with_source_map(self.owner);
-
-        if let Ok(source_ptr) = source_map.expr_syntax(id) {
-            let root = source_ptr.file_syntax(db.upcast());
-            if let ast::Expr::RecordExpr(record_expr) = &source_ptr.value.to_node(&root) {
-                if let Some(_) = record_expr.record_expr_field_list() {
-                    let variant_data = variant_def.variant_data(db.upcast());
-                    let missed_fields = missed_fields
-                        .into_iter()
-                        .map(|idx| variant_data.fields()[idx].name.clone())
-                        .collect();
-                    self.sink.push(MissingFields {
-                        file: source_ptr.file_id,
-                        field_list_parent: AstPtr::new(&record_expr),
-                        field_list_parent_path: record_expr.path().map(|path| AstPtr::new(&path)),
-                        missed_fields,
-                    })
-                }
-            }
-        }
-    }
-
-    fn create_record_pattern_missing_fields_diagnostic(
-        &mut self,
-        id: PatId,
-        db: &dyn HirDatabase,
-        variant_def: VariantId,
-        missed_fields: Vec<LocalFieldId>,
-    ) {
-        // XXX: only look at source_map if we do have missing fields
-        let (_, source_map) = db.body_with_source_map(self.owner);
-
-        if let Ok(source_ptr) = source_map.pat_syntax(id) {
-            if let Some(expr) = source_ptr.value.as_ref().left() {
-                let root = source_ptr.file_syntax(db.upcast());
-                if let ast::Pat::RecordPat(record_pat) = expr.to_node(&root) {
-                    if let Some(_) = record_pat.record_pat_field_list() {
-                        let variant_data = variant_def.variant_data(db.upcast());
-                        let missed_fields = missed_fields
-                            .into_iter()
-                            .map(|idx| variant_data.fields()[idx].name.clone())
-                            .collect();
-                        self.sink.push(MissingPatFields {
-                            file: source_ptr.file_id,
-                            field_list_parent: AstPtr::new(&record_pat),
-                            field_list_parent_path: record_pat
-                                .path()
-                                .map(|path| AstPtr::new(&path)),
-                            missed_fields,
-                        })
-                    }
-                }
+            } else if let Some(Statement::Expr { expr: id, .. }) = statements.last() {
+                self.validate_missing_tail_expr(body.body_expr, *id);
             }
         }
     }
@@ -179,7 +146,7 @@ impl<'a, 'b> ExprValidator<'a, 'b> {
         for (id, expr) in body.exprs.iter() {
             if let Expr::MethodCall { receiver, .. } = expr {
                 let function_id = match self.infer.method_resolution(id) {
-                    Some(id) => id,
+                    Some((id, _)) => id,
                     None => continue,
                 };
 
@@ -191,13 +158,11 @@ impl<'a, 'b> ExprValidator<'a, 'b> {
                 if function_id == *next_function_id {
                     if let Some(filter_map_id) = prev {
                         if *receiver == filter_map_id {
-                            let (_, source_map) = db.body_with_source_map(self.owner);
-                            if let Ok(next_source_ptr) = source_map.expr_syntax(id) {
-                                self.sink.push(ReplaceFilterMapNextWithFindMap {
-                                    file: next_source_ptr.file_id,
-                                    next_expr: next_source_ptr.value,
-                                });
-                            }
+                            self.diagnostics.push(
+                                BodyValidationDiagnostic::ReplaceFilterMapNextWithFindMap {
+                                    method_call_expr: id,
+                                },
+                            );
                         }
                     }
                 }
@@ -211,7 +176,7 @@ impl<'a, 'b> ExprValidator<'a, 'b> {
 
         // FIXME: Due to shortcomings in the current type system implementation, only emit this
         // diagnostic if there are no type mismatches in the containing function.
-        if self.infer.type_mismatches.iter().next().is_some() {
+        if self.infer.expr_type_mismatches().next().is_some() {
             return;
         }
 
@@ -237,15 +202,11 @@ impl<'a, 'b> ExprValidator<'a, 'b> {
                     return;
                 }
 
-                // FIXME: note that we erase information about substs here. This
-                // is not right, but, luckily, doesn't matter as we care only
-                // about the number of params
-                let callee = match self.infer.method_resolution(call_id) {
-                    Some(callee) => callee,
+                let (callee, subst) = match self.infer.method_resolution(call_id) {
+                    Some(it) => it,
                     None => return,
                 };
-                let sig =
-                    db.callable_item_signature(callee.into()).into_value_and_skipped_binders().0;
+                let sig = db.callable_item_signature(callee.into()).substitute(&Interner, &subst);
 
                 (sig, args)
             }
@@ -262,19 +223,15 @@ impl<'a, 'b> ExprValidator<'a, 'b> {
         let mut arg_count = args.len();
 
         if arg_count != param_count {
-            let (_, source_map) = db.body_with_source_map(self.owner);
-            if let Ok(source_ptr) = source_map.expr_syntax(call_id) {
-                if is_method_call {
-                    param_count -= 1;
-                    arg_count -= 1;
-                }
-                self.sink.push(MismatchedArgCount {
-                    file: source_ptr.file_id,
-                    call_expr: source_ptr.value,
-                    expected: param_count,
-                    found: arg_count,
-                });
+            if is_method_call {
+                param_count -= 1;
+                arg_count -= 1;
             }
+            self.diagnostics.push(BodyValidationDiagnostic::MismatchedArgCount {
+                call_expr: call_id,
+                expected: param_count,
+                found: arg_count,
+            });
         }
     }
 
@@ -295,12 +252,12 @@ impl<'a, 'b> ExprValidator<'a, 'b> {
             &infer.type_of_expr[match_expr]
         };
 
-        let cx = MatchCheckCtx { match_expr, body, infer: infer.clone(), db };
-        let pats = arms.iter().map(|arm| arm.pat);
+        let pattern_arena = RefCell::new(PatternArena::new());
 
-        let mut seen = Matrix::empty();
-        for pat in pats {
-            if let Some(pat_ty) = infer.type_of_pat.get(pat) {
+        let mut m_arms = Vec::new();
+        let mut has_lowering_errors = false;
+        for arm in arms {
+            if let Some(pat_ty) = infer.type_of_pat.get(arm.pat) {
                 // We only include patterns whose type matches the type
                 // of the match expression. If we had a InvalidMatchArmPattern
                 // diagnostic or similar we could raise that in an else
@@ -311,18 +268,30 @@ impl<'a, 'b> ExprValidator<'a, 'b> {
                 // necessary.
                 //
                 // FIXME we should use the type checker for this.
-                if pat_ty == match_expr_ty
+                if (pat_ty == match_expr_ty
                     || match_expr_ty
                         .as_reference()
                         .map(|(match_expr_ty, ..)| match_expr_ty == pat_ty)
-                        .unwrap_or(false)
+                        .unwrap_or(false))
+                    && types_of_subpatterns_do_match(arm.pat, &body, &infer)
                 {
                     // If we had a NotUsefulMatchArm diagnostic, we could
                     // check the usefulness of each pattern as we added it
                     // to the matrix here.
-                    let v = PatStack::from_pattern(pat);
-                    seen.push(&cx, v);
-                    continue;
+                    let m_arm = match_check::MatchArm {
+                        pat: self.lower_pattern(
+                            arm.pat,
+                            &mut pattern_arena.borrow_mut(),
+                            db,
+                            &body,
+                            &mut has_lowering_errors,
+                        ),
+                        has_guard: arm.guard.is_some(),
+                    };
+                    m_arms.push(m_arm);
+                    if !has_lowering_errors {
+                        continue;
+                    }
                 }
             }
 
@@ -330,32 +299,60 @@ impl<'a, 'b> ExprValidator<'a, 'b> {
             // fit the match expression, we skip this diagnostic. Skipping the entire
             // diagnostic rather than just not including this match arm is preferred
             // to avoid the chance of false positives.
+            cov_mark::hit!(validate_match_bailed_out);
             return;
         }
 
-        match is_useful(&cx, &seen, &PatStack::from_wild()) {
-            Ok(Usefulness::Useful) => (),
-            // if a wildcard pattern is not useful, then all patterns are covered
-            Ok(Usefulness::NotUseful) => return,
-            // this path is for unimplemented checks, so we err on the side of not
-            // reporting any errors
-            _ => return,
-        }
-
-        if let Ok(source_ptr) = source_map.expr_syntax(id) {
-            let root = source_ptr.file_syntax(db.upcast());
-            if let ast::Expr::MatchExpr(match_expr) = &source_ptr.value.to_node(&root) {
-                if let (Some(match_expr), Some(arms)) =
-                    (match_expr.expr(), match_expr.match_arm_list())
-                {
-                    self.sink.push(MissingMatchArms {
-                        file: source_ptr.file_id,
-                        match_expr: AstPtr::new(&match_expr),
-                        arms: AstPtr::new(&arms),
+        let cx = MatchCheckCtx {
+            module: self.owner.module(db.upcast()),
+            match_expr,
+            infer: &infer,
+            db,
+            pattern_arena: &pattern_arena,
+            panic_context: &|| {
+                use syntax::AstNode;
+                let match_expr_text = source_map
+                    .expr_syntax(match_expr)
+                    .ok()
+                    .and_then(|scrutinee_sptr| {
+                        let root = scrutinee_sptr.file_syntax(db.upcast());
+                        scrutinee_sptr.value.to_node(&root).syntax().parent()
                     })
-                }
-            }
+                    .map(|node| node.to_string());
+                format!(
+                    "expression:\n{}",
+                    match_expr_text.as_deref().unwrap_or("<synthesized expr>")
+                )
+            },
+        };
+        let report = compute_match_usefulness(&cx, &m_arms);
+
+        // FIXME Report unreacheble arms
+        // https://github.com/rust-lang/rust/blob/25c15cdbe/compiler/rustc_mir_build/src/thir/pattern/check_match.rs#L200-L201
+
+        let witnesses = report.non_exhaustiveness_witnesses;
+        // FIXME Report witnesses
+        // eprintln!("compute_match_usefulness(..) -> {:?}", &witnesses);
+        if !witnesses.is_empty() {
+            self.diagnostics.push(BodyValidationDiagnostic::MissingMatchArms { match_expr: id });
         }
+    }
+
+    fn lower_pattern(
+        &self,
+        pat: PatId,
+        pattern_arena: &mut PatternArena,
+        db: &dyn HirDatabase,
+        body: &Body,
+        have_errors: &mut bool,
+    ) -> match_check::PatId {
+        let mut patcx = match_check::PatCtxt::new(db, &self.infer, body);
+        let pattern = patcx.lower_pattern(pat);
+        let pattern = pattern_arena.alloc(expand_pattern(pattern));
+        if !patcx.errors.is_empty() {
+            *have_errors = true;
+        }
+        pattern
     }
 
     fn validate_results_in_tail_expr(&mut self, body_id: ExprId, id: ExprId, db: &dyn HirDatabase) {
@@ -395,24 +392,12 @@ impl<'a, 'b> ExprValidator<'a, 'b> {
         if params.len(&Interner) > 0
             && params.at(&Interner, 0).ty(&Interner) == Some(&mismatch.actual)
         {
-            let (_, source_map) = db.body_with_source_map(self.owner);
-
-            if let Ok(source_ptr) = source_map.expr_syntax(id) {
-                self.sink.push(MissingOkOrSomeInTailExpr {
-                    file: source_ptr.file_id,
-                    expr: source_ptr.value,
-                    required,
-                });
-            }
+            self.diagnostics
+                .push(BodyValidationDiagnostic::MissingOkOrSomeInTailExpr { expr: id, required });
         }
     }
 
-    fn validate_missing_tail_expr(
-        &mut self,
-        body_id: ExprId,
-        possible_tail_id: ExprId,
-        db: &dyn HirDatabase,
-    ) {
+    fn validate_missing_tail_expr(&mut self, body_id: ExprId, possible_tail_id: ExprId) {
         let mismatch = match self.infer.type_mismatch_for_expr(body_id) {
             Some(m) => m,
             None => return,
@@ -427,12 +412,8 @@ impl<'a, 'b> ExprValidator<'a, 'b> {
             return;
         }
 
-        let (_, source_map) = db.body_with_source_map(self.owner);
-
-        if let Ok(source_ptr) = source_map.expr_syntax(possible_tail_id) {
-            self.sink
-                .push(RemoveThisSemicolon { file: source_ptr.file_id, expr: source_ptr.value });
-        }
+        self.diagnostics
+            .push(BodyValidationDiagnostic::RemoveThisSemicolon { expr: possible_tail_id });
     }
 }
 
@@ -496,257 +477,17 @@ pub fn record_pattern_missing_fields(
     Some((variant_def, missed_fields, exhaustive))
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::diagnostics::tests::check_diagnostics;
-
-    #[test]
-    fn simple_free_fn_zero() {
-        check_diagnostics(
-            r#"
-fn zero() {}
-fn f() { zero(1); }
-       //^^^^^^^ Expected 0 arguments, found 1
-"#,
-        );
-
-        check_diagnostics(
-            r#"
-fn zero() {}
-fn f() { zero(); }
-"#,
-        );
+fn types_of_subpatterns_do_match(pat: PatId, body: &Body, infer: &InferenceResult) -> bool {
+    fn walk(pat: PatId, body: &Body, infer: &InferenceResult, has_type_mismatches: &mut bool) {
+        match infer.type_mismatch_for_pat(pat) {
+            Some(_) => *has_type_mismatches = true,
+            None => {
+                body[pat].walk_child_pats(|subpat| walk(subpat, body, infer, has_type_mismatches))
+            }
+        }
     }
 
-    #[test]
-    fn simple_free_fn_one() {
-        check_diagnostics(
-            r#"
-fn one(arg: u8) {}
-fn f() { one(); }
-       //^^^^^ Expected 1 argument, found 0
-"#,
-        );
-
-        check_diagnostics(
-            r#"
-fn one(arg: u8) {}
-fn f() { one(1); }
-"#,
-        );
-    }
-
-    #[test]
-    fn method_as_fn() {
-        check_diagnostics(
-            r#"
-struct S;
-impl S { fn method(&self) {} }
-
-fn f() {
-    S::method();
-} //^^^^^^^^^^^ Expected 1 argument, found 0
-"#,
-        );
-
-        check_diagnostics(
-            r#"
-struct S;
-impl S { fn method(&self) {} }
-
-fn f() {
-    S::method(&S);
-    S.method();
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn method_with_arg() {
-        check_diagnostics(
-            r#"
-struct S;
-impl S { fn method(&self, arg: u8) {} }
-
-            fn f() {
-                S.method();
-            } //^^^^^^^^^^ Expected 1 argument, found 0
-            "#,
-        );
-
-        check_diagnostics(
-            r#"
-struct S;
-impl S { fn method(&self, arg: u8) {} }
-
-fn f() {
-    S::method(&S, 0);
-    S.method(1);
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn method_unknown_receiver() {
-        // note: this is incorrect code, so there might be errors on this in the
-        // future, but we shouldn't emit an argument count diagnostic here
-        check_diagnostics(
-            r#"
-trait Foo { fn method(&self, arg: usize) {} }
-
-fn f() {
-    let x;
-    x.method();
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn tuple_struct() {
-        check_diagnostics(
-            r#"
-struct Tup(u8, u16);
-fn f() {
-    Tup(0);
-} //^^^^^^ Expected 2 arguments, found 1
-"#,
-        )
-    }
-
-    #[test]
-    fn enum_variant() {
-        check_diagnostics(
-            r#"
-enum En { Variant(u8, u16), }
-fn f() {
-    En::Variant(0);
-} //^^^^^^^^^^^^^^ Expected 2 arguments, found 1
-"#,
-        )
-    }
-
-    #[test]
-    fn enum_variant_type_macro() {
-        check_diagnostics(
-            r#"
-macro_rules! Type {
-    () => { u32 };
-}
-enum Foo {
-    Bar(Type![])
-}
-impl Foo {
-    fn new() {
-        Foo::Bar(0);
-        Foo::Bar(0, 1);
-      //^^^^^^^^^^^^^^ Expected 1 argument, found 2
-        Foo::Bar();
-      //^^^^^^^^^^ Expected 1 argument, found 0
-    }
-}
-        "#,
-        );
-    }
-
-    #[test]
-    fn varargs() {
-        check_diagnostics(
-            r#"
-extern "C" {
-    fn fixed(fixed: u8);
-    fn varargs(fixed: u8, ...);
-    fn varargs2(...);
-}
-
-fn f() {
-    unsafe {
-        fixed(0);
-        fixed(0, 1);
-      //^^^^^^^^^^^ Expected 1 argument, found 2
-        varargs(0);
-        varargs(0, 1);
-        varargs2();
-        varargs2(0);
-        varargs2(0, 1);
-    }
-}
-        "#,
-        )
-    }
-
-    #[test]
-    fn arg_count_lambda() {
-        check_diagnostics(
-            r#"
-fn main() {
-    let f = |()| ();
-    f();
-  //^^^ Expected 1 argument, found 0
-    f(());
-    f((), ());
-  //^^^^^^^^^ Expected 1 argument, found 2
-}
-"#,
-        )
-    }
-
-    #[test]
-    fn cfgd_out_call_arguments() {
-        check_diagnostics(
-            r#"
-struct C(#[cfg(FALSE)] ());
-impl C {
-    fn new() -> Self {
-        Self(
-            #[cfg(FALSE)]
-            (),
-        )
-    }
-
-    fn method(&self) {}
-}
-
-fn main() {
-    C::new().method(#[cfg(FALSE)] 0);
-}
-            "#,
-        );
-    }
-
-    #[test]
-    fn cfgd_out_fn_params() {
-        check_diagnostics(
-            r#"
-fn foo(#[cfg(NEVER)] x: ()) {}
-
-struct S;
-
-impl S {
-    fn method(#[cfg(NEVER)] self) {}
-    fn method2(#[cfg(NEVER)] self, arg: u8) {}
-    fn method3(self, #[cfg(NEVER)] arg: u8) {}
-}
-
-extern "C" {
-    fn fixed(fixed: u8, #[cfg(NEVER)] ...);
-    fn varargs(#[cfg(not(NEVER))] ...);
-}
-
-fn main() {
-    foo();
-    S::method();
-    S::method2(0);
-    S::method3(S);
-    S.method3();
-    unsafe {
-        fixed(0);
-        varargs(1, 2, 3);
-    }
-}
-            "#,
-        )
-    }
+    let mut has_type_mismatches = false;
+    walk(pat, body, infer, &mut has_type_mismatches);
+    !has_type_mismatches
 }

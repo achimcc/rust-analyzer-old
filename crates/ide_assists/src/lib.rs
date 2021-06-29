@@ -15,93 +15,32 @@ mod assist_context;
 #[cfg(test)]
 mod tests;
 pub mod utils;
-pub mod ast_transform;
 
 use hir::Semantics;
-use ide_db::base_db::FileRange;
-use ide_db::{label::Label, source_change::SourceChange, RootDatabase};
+use ide_db::{base_db::FileRange, RootDatabase};
 use syntax::TextRange;
 
 pub(crate) use crate::assist_context::{AssistContext, Assists};
 
 pub use assist_config::AssistConfig;
+pub use ide_db::assists::{
+    Assist, AssistId, AssistKind, AssistResolveStrategy, GroupLabel, SingleResolve,
+};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AssistKind {
-    // FIXME: does the None variant make sense? Probably not.
-    None,
-
-    QuickFix,
-    Generate,
-    Refactor,
-    RefactorExtract,
-    RefactorInline,
-    RefactorRewrite,
-}
-
-impl AssistKind {
-    pub fn contains(self, other: AssistKind) -> bool {
-        if self == other {
-            return true;
-        }
-
-        match self {
-            AssistKind::None | AssistKind::Generate => return true,
-            AssistKind::Refactor => match other {
-                AssistKind::RefactorExtract
-                | AssistKind::RefactorInline
-                | AssistKind::RefactorRewrite => return true,
-                _ => return false,
-            },
-            _ => return false,
-        }
-    }
-}
-
-/// Unique identifier of the assist, should not be shown to the user
-/// directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AssistId(pub &'static str, pub AssistKind);
-
-#[derive(Clone, Debug)]
-pub struct GroupLabel(pub String);
-
-#[derive(Debug, Clone)]
-pub struct Assist {
-    pub id: AssistId,
-    /// Short description of the assist, as shown in the UI.
-    pub label: Label,
-    pub group: Option<GroupLabel>,
-    /// Target ranges are used to sort assists: the smaller the target range,
-    /// the more specific assist is, and so it should be sorted first.
-    pub target: TextRange,
-    /// Computing source change sometimes is much more costly then computing the
-    /// other fields. Additionally, the actual change is not required to show
-    /// the lightbulb UI, it only is needed when the user tries to apply an
-    /// assist. So, we compute it lazily: the API allow requesting assists with
-    /// or without source change. We could (and in fact, used to) distinguish
-    /// between resolved and unresolved assists at the type level, but this is
-    /// cumbersome, especially if you want to embed an assist into another data
-    /// structure, such as a diagnostic.
-    pub source_change: Option<SourceChange>,
-}
-
-impl Assist {
-    /// Return all the assists applicable at the given position.
-    pub fn get(
-        db: &RootDatabase,
-        config: &AssistConfig,
-        resolve: bool,
-        range: FileRange,
-    ) -> Vec<Assist> {
-        let sema = Semantics::new(db);
-        let ctx = AssistContext::new(sema, config, range);
-        let mut acc = Assists::new(&ctx, resolve);
-        handlers::all().iter().for_each(|handler| {
-            handler(&mut acc, &ctx);
-        });
-        acc.finish()
-    }
+/// Return all the assists applicable at the given position.
+pub fn assists(
+    db: &RootDatabase,
+    config: &AssistConfig,
+    resolve: AssistResolveStrategy,
+    range: FileRange,
+) -> Vec<Assist> {
+    let sema = Semantics::new(db);
+    let ctx = AssistContext::new(sema, config, range);
+    let mut acc = Assists::new(&ctx, resolve);
+    handlers::all().iter().for_each(|handler| {
+        handler(&mut acc, &ctx);
+    });
+    acc.finish()
 }
 
 mod handlers {
@@ -141,7 +80,6 @@ mod handlers {
     mod generate_enum_projection_method;
     mod generate_from_impl_for_enum;
     mod generate_function;
-    mod generate_getter_mut;
     mod generate_getter;
     mod generate_impl;
     mod generate_new;
@@ -211,8 +149,8 @@ mod handlers {
             generate_enum_projection_method::generate_enum_try_into_method,
             generate_from_impl_for_enum::generate_from_impl_for_enum,
             generate_function::generate_function,
-            generate_getter_mut::generate_getter_mut,
             generate_getter::generate_getter,
+            generate_getter::generate_getter_mut,
             generate_impl::generate_impl,
             generate_new::generate_new,
             generate_setter::generate_setter,

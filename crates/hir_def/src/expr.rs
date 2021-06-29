@@ -43,8 +43,8 @@ pub enum Literal {
     ByteString(Vec<u8>),
     Char(char),
     Bool(bool),
-    Int(u64, Option<BuiltinInt>),
-    Uint(u64, Option<BuiltinUint>),
+    Int(i128, Option<BuiltinInt>),
+    Uint(u128, Option<BuiltinUint>),
     Float(u64, Option<BuiltinFloat>), // FIXME: f64 is not Eq
 }
 
@@ -242,7 +242,7 @@ pub struct RecordLitField {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Statement {
     Let { pat: PatId, type_ref: Option<Interned<TypeRef>>, initializer: Option<ExprId> },
-    Expr(ExprId),
+    Expr { expr: ExprId, has_semi: bool },
 }
 
 impl Expr {
@@ -265,7 +265,7 @@ impl Expr {
                                 f(*expr);
                             }
                         }
-                        Statement::Expr(e) => f(*e),
+                        Statement::Expr { expr: expression, .. } => f(*expression),
                     }
                 }
                 if let Some(expr) = tail {

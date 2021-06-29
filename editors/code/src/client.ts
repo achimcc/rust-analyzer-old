@@ -4,6 +4,7 @@ import * as ra from '../src/lsp_ext';
 import * as Is from 'vscode-languageclient/lib/common/utils/is';
 import { assert } from './util';
 import { WorkspaceEdit } from 'vscode';
+import { Workspace } from './ctx';
 
 export interface Env {
     [name: string]: string;
@@ -23,7 +24,7 @@ function renderHoverActions(actions: ra.CommandLinkGroup[]): vscode.MarkdownStri
     return result;
 }
 
-export function createClient(serverPath: string, cwd: string, extraEnv: Env): lc.LanguageClient {
+export function createClient(serverPath: string, workspace: Workspace, extraEnv: Env): lc.LanguageClient {
     // '.' Is the fallback if no folder is open
     // TODO?: Workspace folders support Uri's (eg: file://test.txt).
     // It might be a good idea to test if the uri points to a file.
@@ -33,7 +34,7 @@ export function createClient(serverPath: string, cwd: string, extraEnv: Env): lc
 
     const run: lc.Executable = {
         command: serverPath,
-        options: { cwd, env: newEnv },
+        options: { env: newEnv },
     };
     const serverOptions: lc.ServerOptions = {
         run,
@@ -43,9 +44,14 @@ export function createClient(serverPath: string, cwd: string, extraEnv: Env): lc
         'Rust Analyzer Language Server Trace',
     );
 
+    let initializationOptions = vscode.workspace.getConfiguration("rust-analyzer");
+    if (workspace.kind === "Detached Files") {
+        initializationOptions = { "detachedFiles": workspace.files.map(file => file.uri.fsPath), ...initializationOptions };
+    }
+
     const clientOptions: lc.LanguageClientOptions = {
         documentSelector: [{ scheme: 'file', language: 'rust' }],
-        initializationOptions: vscode.workspace.getConfiguration("rust-analyzer"),
+        initializationOptions,
         diagnosticCollectionName: "rustc",
         traceOutputChannel,
         middleware: {

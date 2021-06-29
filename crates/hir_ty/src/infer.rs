@@ -13,8 +13,6 @@
 //! to certain types. To record this, we use the union-find implementation from
 //! the `ena` crate, which is extracted from rustc.
 
-use std::borrow::Cow;
-use std::mem;
 use std::ops::Index;
 use std::sync::Arc;
 
@@ -27,22 +25,19 @@ use hir_def::{
     path::{path, Path},
     resolver::{HasResolver, Resolver, TypeNs},
     type_ref::TypeRef,
-    AdtId, AssocItemId, DefWithBodyId, EnumVariantId, FieldId, FunctionId, Lookup, TraitId,
-    TypeAliasId, VariantId,
+    AdtId, AssocItemId, DefWithBodyId, EnumVariantId, FieldId, FunctionId, HasModule, Lookup,
+    TraitId, TypeAliasId, VariantId,
 };
-use hir_expand::{diagnostics::DiagnosticSink, name::name};
+use hir_expand::name::name;
 use la_arena::ArenaMap;
 use rustc_hash::FxHashMap;
 use stdx::impl_from;
 use syntax::SmolStr;
 
-use super::{
-    DomainGoal, Guidance, InEnvironment, ProjectionTy, Solution, TraitEnvironment, TraitRef, Ty,
-};
+use super::{DomainGoal, InEnvironment, ProjectionTy, TraitEnvironment, TraitRef, Ty};
 use crate::{
-    db::HirDatabase, fold_tys, infer::diagnostics::InferenceDiagnostic,
-    lower::ImplTraitLoweringMode, to_assoc_type_id, AliasEq, AliasTy, Canonical, Interner,
-    TyBuilder, TyExt, TyKind,
+    db::HirDatabase, fold_tys, lower::ImplTraitLoweringMode, to_assoc_type_id, AliasEq, AliasTy,
+    Goal, Interner, Substitution, TyBuilder, TyExt, TyKind,
 };
 
 // This lint has a false positive here. See the link below for details.
@@ -83,7 +78,7 @@ enum ExprOrPatId {
 impl_from!(ExprId, PatId for ExprOrPatId);
 
 /// Binding modes inferred for patterns.
-/// https://doc.rust-lang.org/reference/patterns.html#binding-modes
+/// <https://doc.rust-lang.org/reference/patterns.html#binding-modes>
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum BindingMode {
     Move,
@@ -104,6 +99,20 @@ impl Default for BindingMode {
     fn default() -> Self {
         BindingMode::Move
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct InferOk {
+    goals: Vec<InEnvironment<Goal>>,
+}
+#[derive(Debug)]
+pub(crate) struct TypeError;
+pub(crate) type InferResult = Result<InferOk, TypeError>;
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum InferenceDiagnostic {
+    NoSuchField { expr: ExprId },
+    BreakOutsideOfLoop { expr: ExprId },
 }
 
 /// A mismatch between an expected and an inferred type.
@@ -128,24 +137,30 @@ impl Default for InternedStandardTypes {
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct InferenceResult {
     /// For each method call expr, records the function it resolves to.
-    method_resolutions: FxHashMap<ExprId, FunctionId>,
+    method_resolutions: FxHashMap<ExprId, (FunctionId, Substitution)>,
     /// For each field access expr, records the field it resolves to.
     field_resolutions: FxHashMap<ExprId, FieldId>,
     /// For each struct literal or pattern, records the variant it resolves to.
     variant_resolutions: FxHashMap<ExprOrPatId, VariantId>,
     /// For each associated item record what it resolves to
     assoc_resolutions: FxHashMap<ExprOrPatId, AssocItemId>,
-    diagnostics: Vec<InferenceDiagnostic>,
+    pub diagnostics: Vec<InferenceDiagnostic>,
     pub type_of_expr: ArenaMap<ExprId, Ty>,
+    /// For each pattern record the type it resolves to.
+    ///
+    /// **Note**: When a pattern type is resolved it may still contain
+    /// unresolved or missing subpatterns or subpatterns of mismatched types.
     pub type_of_pat: ArenaMap<PatId, Ty>,
-    pub(super) type_mismatches: ArenaMap<ExprId, TypeMismatch>,
+    type_mismatches: FxHashMap<ExprOrPatId, TypeMismatch>,
     /// Interned Unknown to return references to.
     standard_types: InternedStandardTypes,
+    /// Stores the types which were implicitly dereferenced in pattern binding modes.
+    pub pat_adjustments: FxHashMap<PatId, Vec<Ty>>,
 }
 
 impl InferenceResult {
-    pub fn method_resolution(&self, expr: ExprId) -> Option<FunctionId> {
-        self.method_resolutions.get(&expr).copied()
+    pub fn method_resolution(&self, expr: ExprId) -> Option<(FunctionId, Substitution)> {
+        self.method_resolutions.get(&expr).cloned()
     }
     pub fn field_resolution(&self, expr: ExprId) -> Option<FieldId> {
         self.field_resolutions.get(&expr).copied()
@@ -163,15 +178,22 @@ impl InferenceResult {
         self.assoc_resolutions.get(&id.into()).copied()
     }
     pub fn type_mismatch_for_expr(&self, expr: ExprId) -> Option<&TypeMismatch> {
-        self.type_mismatches.get(expr)
+        self.type_mismatches.get(&expr.into())
     }
-    pub fn add_diagnostics(
-        &self,
-        db: &dyn HirDatabase,
-        owner: DefWithBodyId,
-        sink: &mut DiagnosticSink,
-    ) {
-        self.diagnostics.iter().for_each(|it| it.add_to(db, owner, sink))
+    pub fn type_mismatch_for_pat(&self, pat: PatId) -> Option<&TypeMismatch> {
+        self.type_mismatches.get(&pat.into())
+    }
+    pub fn expr_type_mismatches(&self) -> impl Iterator<Item = (ExprId, &TypeMismatch)> {
+        self.type_mismatches.iter().filter_map(|(expr_or_pat, mismatch)| match *expr_or_pat {
+            ExprOrPatId::ExprId(expr) => Some((expr, mismatch)),
+            _ => None,
+        })
+    }
+    pub fn pat_type_mismatches(&self) -> impl Iterator<Item = (PatId, &TypeMismatch)> {
+        self.type_mismatches.iter().filter_map(|(expr_or_pat, mismatch)| match *expr_or_pat {
+            ExprOrPatId::PatId(pat) => Some((pat, mismatch)),
+            _ => None,
+        })
     }
 }
 
@@ -198,10 +220,8 @@ struct InferenceContext<'a> {
     owner: DefWithBodyId,
     body: Arc<Body>,
     resolver: Resolver,
-    table: unify::InferenceTable,
+    table: unify::InferenceTable<'a>,
     trait_env: Arc<TraitEnvironment>,
-    obligations: Vec<DomainGoal>,
-    last_obligations_check: Option<u32>,
     result: InferenceResult,
     /// The return type of the function being inferred, or the closure if we're
     /// currently within one.
@@ -233,15 +253,15 @@ fn find_breakable<'c>(
 
 impl<'a> InferenceContext<'a> {
     fn new(db: &'a dyn HirDatabase, owner: DefWithBodyId, resolver: Resolver) -> Self {
+        let krate = owner.module(db.upcast()).krate();
+        let trait_env = owner
+            .as_generic_def_id()
+            .map_or_else(|| Arc::new(TraitEnvironment::empty(krate)), |d| db.trait_environment(d));
         InferenceContext {
             result: InferenceResult::default(),
-            table: unify::InferenceTable::new(),
-            obligations: Vec::default(),
-            last_obligations_check: None,
+            table: unify::InferenceTable::new(db, trait_env.clone()),
+            trait_env,
             return_ty: TyKind::Error.intern(&Interner), // set in collect_fn_signature
-            trait_env: owner
-                .as_generic_def_id()
-                .map_or_else(Default::default, |d| db.trait_environment(d)),
             db,
             owner,
             body: db.body(owner),
@@ -252,19 +272,28 @@ impl<'a> InferenceContext<'a> {
     }
 
     fn err_ty(&self) -> Ty {
-        TyKind::Error.intern(&Interner)
+        self.result.standard_types.unknown.clone()
     }
 
     fn resolve_all(mut self) -> InferenceResult {
         // FIXME resolve obligations as well (use Guidance if necessary)
+        self.table.resolve_obligations_as_possible();
+
+        // make sure diverging type variables are marked as such
+        self.table.propagate_diverging_flag();
         let mut result = std::mem::take(&mut self.result);
         for ty in result.type_of_expr.values_mut() {
-            let resolved = self.table.resolve_ty_completely(ty.clone());
-            *ty = resolved;
+            *ty = self.table.resolve_completely(ty.clone());
         }
         for ty in result.type_of_pat.values_mut() {
-            let resolved = self.table.resolve_ty_completely(ty.clone());
-            *ty = resolved;
+            *ty = self.table.resolve_completely(ty.clone());
+        }
+        for mismatch in result.type_mismatches.values_mut() {
+            mismatch.expected = self.table.resolve_completely(mismatch.expected.clone());
+            mismatch.actual = self.table.resolve_completely(mismatch.actual.clone());
+        }
+        for (_, subst) in result.method_resolutions.values_mut() {
+            *subst = self.table.resolve_completely(subst.clone());
         }
         result
     }
@@ -273,8 +302,8 @@ impl<'a> InferenceContext<'a> {
         self.result.type_of_expr.insert(expr, ty);
     }
 
-    fn write_method_resolution(&mut self, expr: ExprId, func: FunctionId) {
-        self.result.method_resolutions.insert(expr, func);
+    fn write_method_resolution(&mut self, expr: ExprId, func: FunctionId, subst: Substitution) {
+        self.result.method_resolutions.insert(expr, (func, subst));
     }
 
     fn write_field_resolution(&mut self, expr: ExprId, field: FieldId) {
@@ -318,6 +347,14 @@ impl<'a> InferenceContext<'a> {
     fn insert_type_vars_shallow(&mut self, ty: Ty) -> Ty {
         match ty.kind(&Interner) {
             TyKind::Error => self.table.new_type_var(),
+            TyKind::InferenceVar(..) => {
+                let ty_resolved = self.resolve_ty_shallow(&ty);
+                if ty_resolved.is_unknown() {
+                    self.table.new_type_var()
+                } else {
+                    ty
+                }
+            }
             _ => ty,
         }
     }
@@ -327,66 +364,19 @@ impl<'a> InferenceContext<'a> {
     }
 
     fn resolve_obligations_as_possible(&mut self) {
-        if self.last_obligations_check == Some(self.table.revision) {
-            // no change
-            return;
-        }
-        let _span = profile::span("resolve_obligations_as_possible");
-
-        self.last_obligations_check = Some(self.table.revision);
-        let obligations = mem::replace(&mut self.obligations, Vec::new());
-        for obligation in obligations {
-            let in_env = InEnvironment::new(&self.trait_env.env, obligation.clone());
-            let canonicalized = self.canonicalizer().canonicalize_obligation(in_env);
-            let solution =
-                self.db.trait_solve(self.resolver.krate().unwrap(), canonicalized.value.clone());
-
-            match solution {
-                Some(Solution::Unique(canonical_subst)) => {
-                    canonicalized.apply_solution(
-                        self,
-                        Canonical {
-                            binders: canonical_subst.binders,
-                            // FIXME: handle constraints
-                            value: canonical_subst.value.subst,
-                        },
-                    );
-                }
-                Some(Solution::Ambig(Guidance::Definite(substs))) => {
-                    canonicalized.apply_solution(self, substs);
-                    self.obligations.push(obligation);
-                }
-                Some(_) => {
-                    // FIXME use this when trying to resolve everything at the end
-                    self.obligations.push(obligation);
-                }
-                None => {
-                    // FIXME obligation cannot be fulfilled => diagnostic
-                }
-            };
-        }
+        self.table.resolve_obligations_as_possible();
     }
 
     fn push_obligation(&mut self, o: DomainGoal) {
-        self.obligations.push(o);
-        self.last_obligations_check = None;
+        self.table.register_obligation(o.cast(&Interner));
     }
 
     fn unify(&mut self, ty1: &Ty, ty2: &Ty) -> bool {
         self.table.unify(ty1, ty2)
     }
 
-    /// Resolves the type as far as currently possible, replacing type variables
-    /// by their known types. All types returned by the infer_* functions should
-    /// be resolved as far as possible, i.e. contain no type variables with
-    /// known type.
-    fn resolve_ty_as_possible(&mut self, ty: Ty) -> Ty {
+    fn resolve_ty_shallow(&mut self, ty: &Ty) -> Ty {
         self.resolve_obligations_as_possible();
-
-        self.table.resolve_ty_as_possible(ty)
-    }
-
-    fn resolve_ty_shallow<'b>(&mut self, ty: &'b Ty) -> Cow<'b, Ty> {
         self.table.resolve_ty_shallow(ty)
     }
 
@@ -420,7 +410,7 @@ impl<'a> InferenceContext<'a> {
                 };
                 self.push_obligation(trait_ref.cast(&Interner));
                 self.push_obligation(alias_eq.cast(&Interner));
-                self.resolve_ty_as_possible(ty)
+                ty
             }
             None => self.err_ty(),
         }
@@ -433,25 +423,7 @@ impl<'a> InferenceContext<'a> {
     /// call). `make_ty` handles this already, but e.g. for field types we need
     /// to do it as well.
     fn normalize_associated_types_in(&mut self, ty: Ty) -> Ty {
-        let ty = self.resolve_ty_as_possible(ty);
-        fold_tys(
-            ty,
-            |ty, _| match ty.kind(&Interner) {
-                TyKind::Alias(AliasTy::Projection(proj_ty)) => {
-                    self.normalize_projection_ty(proj_ty.clone())
-                }
-                _ => ty,
-            },
-            DebruijnIndex::INNERMOST,
-        )
-    }
-
-    fn normalize_projection_ty(&mut self, proj_ty: ProjectionTy) -> Ty {
-        let var = self.table.new_type_var();
-        let alias_eq = AliasEq { alias: AliasTy::Projection(proj_ty), ty: var.clone() };
-        let obligation = alias_eq.cast(&Interner);
-        self.push_obligation(obligation);
-        var
+        self.table.normalize_associated_types_in(ty)
     }
 
     fn resolve_variant(&mut self, path: Option<&Path>) -> (Ty, Option<VariantId>) {
@@ -584,7 +556,13 @@ impl<'a> InferenceContext<'a> {
 
             self.infer_pat(*pat, &ty, BindingMode::default());
         }
-        let return_ty = self.make_ty_with_mode(&data.ret_type, ImplTraitLoweringMode::Disallowed); // FIXME implement RPIT
+        let error_ty = &TypeRef::Error;
+        let return_ty = if data.is_async() {
+            data.async_ret_type.as_deref().unwrap_or(error_ty)
+        } else {
+            &*data.ret_type
+        };
+        let return_ty = self.make_ty_with_mode(return_ty, ImplTraitLoweringMode::Disallowed); // FIXME implement RPIT
         self.return_ty = return_ty;
     }
 
@@ -605,9 +583,14 @@ impl<'a> InferenceContext<'a> {
     }
 
     fn resolve_ops_try_ok(&self) -> Option<TypeAliasId> {
+        // FIXME resolve via lang_item once try v2 is stable
         let path = path![core::ops::Try];
         let trait_ = self.resolver.resolve_known_trait(self.db.upcast(), &path)?;
-        self.db.trait_data(trait_).associated_type_by_name(&name![Ok])
+        let trait_data = self.db.trait_data(trait_);
+        trait_data
+            // FIXME remove once try v2 is stable
+            .associated_type_by_name(&name![Ok])
+            .or_else(|| trait_data.associated_type_by_name(&name![Output]))
     }
 
     fn resolve_ops_neg_output(&self) -> Option<TypeAliasId> {
@@ -701,17 +684,23 @@ impl<'a> InferenceContext<'a> {
 /// When inferring an expression, we propagate downward whatever type hint we
 /// are able in the form of an `Expectation`.
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct Expectation {
-    ty: Ty,
-    /// See the `rvalue_hint` method.
-    rvalue_hint: bool,
+enum Expectation {
+    None,
+    HasType(Ty),
+    // Castable(Ty), // rustc has this, we currently just don't propagate an expectation for casts
+    RValueLikeUnsized(Ty),
 }
 
 impl Expectation {
     /// The expectation that the type of the expression needs to equal the given
     /// type.
     fn has_type(ty: Ty) -> Self {
-        Expectation { ty, rvalue_hint: false }
+        if ty.is_unknown() {
+            // FIXME: get rid of this?
+            Expectation::None
+        } else {
+            Expectation::HasType(ty)
+        }
     }
 
     /// The following explanation is copied straight from rustc:
@@ -735,24 +724,73 @@ impl Expectation {
     /// See the test case `test/ui/coerce-expect-unsized.rs` and #20169
     /// for examples of where this comes up,.
     fn rvalue_hint(ty: Ty) -> Self {
-        Expectation { ty, rvalue_hint: true }
+        match ty.strip_references().kind(&Interner) {
+            TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(_) => Expectation::RValueLikeUnsized(ty),
+            _ => Expectation::has_type(ty),
+        }
     }
 
     /// This expresses no expectation on the type.
     fn none() -> Self {
-        Expectation {
-            // FIXME
-            ty: TyKind::Error.intern(&Interner),
-            rvalue_hint: false,
+        Expectation::None
+    }
+
+    fn resolve(&self, table: &mut unify::InferenceTable) -> Expectation {
+        match self {
+            Expectation::None => Expectation::None,
+            Expectation::HasType(t) => Expectation::HasType(table.resolve_ty_shallow(t)),
+            Expectation::RValueLikeUnsized(t) => {
+                Expectation::RValueLikeUnsized(table.resolve_ty_shallow(t))
+            }
         }
     }
 
-    fn coercion_target(&self) -> Ty {
-        if self.rvalue_hint {
-            // FIXME
-            TyKind::Error.intern(&Interner)
-        } else {
-            self.ty.clone()
+    fn to_option(&self, table: &mut unify::InferenceTable) -> Option<Ty> {
+        match self.resolve(table) {
+            Expectation::None => None,
+            Expectation::HasType(t) |
+            // Expectation::Castable(t) |
+            Expectation::RValueLikeUnsized(t) => Some(t),
+        }
+    }
+
+    fn only_has_type(&self, table: &mut unify::InferenceTable) -> Option<Ty> {
+        match self {
+            Expectation::HasType(t) => Some(table.resolve_ty_shallow(t)),
+            // Expectation::Castable(_) |
+            Expectation::RValueLikeUnsized(_) | Expectation::None => None,
+        }
+    }
+
+    /// Comment copied from rustc:
+    /// Disregard "castable to" expectations because they
+    /// can lead us astray. Consider for example `if cond
+    /// {22} else {c} as u8` -- if we propagate the
+    /// "castable to u8" constraint to 22, it will pick the
+    /// type 22u8, which is overly constrained (c might not
+    /// be a u8). In effect, the problem is that the
+    /// "castable to" expectation is not the tightest thing
+    /// we can say, so we want to drop it in this case.
+    /// The tightest thing we can say is "must unify with
+    /// else branch". Note that in the case of a "has type"
+    /// constraint, this limitation does not hold.
+    ///
+    /// If the expected type is just a type variable, then don't use
+    /// an expected type. Otherwise, we might write parts of the type
+    /// when checking the 'then' block which are incompatible with the
+    /// 'else' branch.
+    fn adjust_for_branches(&self, table: &mut unify::InferenceTable) -> Expectation {
+        match self {
+            Expectation::HasType(ety) => {
+                let ety = table.resolve_ty_shallow(ety);
+                if !ety.is_ty_var() {
+                    Expectation::HasType(ety)
+                } else {
+                    Expectation::None
+                }
+            }
+            Expectation::RValueLikeUnsized(ety) => Expectation::RValueLikeUnsized(ety.clone()),
+            _ => Expectation::None,
         }
     }
 }
@@ -792,45 +830,5 @@ impl std::ops::BitAndAssign for Diverges {
 impl std::ops::BitOrAssign for Diverges {
     fn bitor_assign(&mut self, other: Self) {
         *self = *self | other;
-    }
-}
-
-mod diagnostics {
-    use hir_def::{expr::ExprId, DefWithBodyId};
-    use hir_expand::diagnostics::DiagnosticSink;
-
-    use crate::{
-        db::HirDatabase,
-        diagnostics::{BreakOutsideOfLoop, NoSuchField},
-    };
-
-    #[derive(Debug, PartialEq, Eq, Clone)]
-    pub(super) enum InferenceDiagnostic {
-        NoSuchField { expr: ExprId },
-        BreakOutsideOfLoop { expr: ExprId },
-    }
-
-    impl InferenceDiagnostic {
-        pub(super) fn add_to(
-            &self,
-            db: &dyn HirDatabase,
-            owner: DefWithBodyId,
-            sink: &mut DiagnosticSink,
-        ) {
-            match self {
-                InferenceDiagnostic::NoSuchField { expr } => {
-                    let (_, source_map) = db.body_with_source_map(owner);
-                    let field = source_map.field_syntax(*expr);
-                    sink.push(NoSuchField { file: field.file_id, field: field.value })
-                }
-                InferenceDiagnostic::BreakOutsideOfLoop { expr } => {
-                    let (_, source_map) = db.body_with_source_map(owner);
-                    let ptr = source_map
-                        .expr_syntax(*expr)
-                        .expect("break outside of loop in synthetic syntax");
-                    sink.push(BreakOutsideOfLoop { file: ptr.file_id, expr: ptr.value })
-                }
-            }
-        }
     }
 }

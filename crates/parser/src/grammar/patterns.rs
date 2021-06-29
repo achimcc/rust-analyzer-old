@@ -1,5 +1,3 @@
-//! FIXME: write short doc here
-
 use super::*;
 
 pub(super) const PATTERN_FIRST: TokenSet =
@@ -83,7 +81,7 @@ fn pattern_single_r(p: &mut Parser, recovery_set: TokenSet) {
 }
 
 const PAT_RECOVERY_SET: TokenSet =
-    TokenSet::new(&[T![let], T![if], T![while], T![loop], T![match], T![')'], T![,]]);
+    TokenSet::new(&[T![let], T![if], T![while], T![loop], T![match], T![')'], T![,], T![=]]);
 
 fn atom_pat(p: &mut Parser, recovery_set: TokenSet) -> Option<CompletedMarker> {
     let m = match p.nth(0) {

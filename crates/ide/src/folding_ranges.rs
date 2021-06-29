@@ -1,5 +1,3 @@
-//! FIXME: write short doc here
-
 use rustc_hash::FxHashSet;
 
 use syntax::{
@@ -20,6 +18,8 @@ pub enum FoldKind {
     Consts,
     Statics,
     Array,
+    WhereClause,
+    ReturnType,
 }
 
 #[derive(Debug)]
@@ -28,6 +28,10 @@ pub struct Fold {
     pub kind: FoldKind,
 }
 
+// Feature: Folding
+//
+// Defines folding regions for curly braced blocks, runs of consecutive import
+// statements, and `region` / `endregion` comment markers.
 pub(crate) fn folding_ranges(file: &SourceFile) -> Vec<Fold> {
     let mut res = vec![];
     let mut visited_comments = FxHashSet::default();
@@ -109,6 +113,13 @@ pub(crate) fn folding_ranges(file: &SourceFile) -> Vec<Fold> {
                         res.push(Fold { range, kind: FoldKind::Statics })
                     }
                 }
+
+                // Fold where clause
+                if node.kind() == WHERE_CLAUSE {
+                    if let Some(range) = fold_range_for_where_clause(&node) {
+                        res.push(Fold { range, kind: FoldKind::WhereClause })
+                    }
+                }
             }
         }
     }
@@ -121,6 +132,7 @@ fn fold_kind(kind: SyntaxKind) -> Option<FoldKind> {
         COMMENT => Some(FoldKind::Comment),
         ARG_LIST | PARAM_LIST => Some(FoldKind::ArgList),
         ARRAY_EXPR => Some(FoldKind::Array),
+        RET_TYPE => Some(FoldKind::ReturnType),
         ASSOC_ITEM_LIST
         | RECORD_FIELD_LIST
         | RECORD_PAT_FIELD_LIST
@@ -241,6 +253,23 @@ fn contiguous_range_for_comment(
     }
 }
 
+fn fold_range_for_where_clause(node: &SyntaxNode) -> Option<TextRange> {
+    let first_where_pred = node.first_child();
+    let last_where_pred = node.last_child();
+
+    if first_where_pred != last_where_pred {
+        let mut it = node.descendants_with_tokens();
+        if let (Some(_where_clause), Some(where_kw), Some(last_comma)) =
+            (it.next(), it.next(), it.last())
+        {
+            let start = where_kw.text_range().end();
+            let end = last_comma.text_range().end();
+            return Some(TextRange::new(start, end));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use test_utils::extract_tags;
@@ -272,6 +301,8 @@ mod tests {
                 FoldKind::Consts => "consts",
                 FoldKind::Statics => "statics",
                 FoldKind::Array => "array",
+                FoldKind::WhereClause => "whereclause",
+                FoldKind::ReturnType => "returntype",
             };
             assert_eq!(kind, &attr.unwrap());
         }
@@ -510,6 +541,39 @@ const SECOND_CONST: &str = "second";</fold>
             r#"
 <fold statics>static FIRST_STATIC: &str = "first";
 static SECOND_STATIC: &str = "second";</fold>
+            "#,
+        )
+    }
+
+    #[test]
+    fn fold_where_clause() {
+        // fold multi-line and don't fold single line.
+        check(
+            r#"
+fn foo()
+where<fold whereclause>
+    A: Foo,
+    B: Foo,
+    C: Foo,
+    D: Foo,</fold> {}
+
+fn bar()
+where
+    A: Bar, {}
+"#,
+        )
+    }
+
+    #[test]
+    fn fold_return_type() {
+        check(
+            r#"
+fn foo()<fold returntype>-> (
+    bool,
+    bool,
+)</fold> { (true, true) }
+
+fn bar() -> (bool, bool) { (true, true) }
             "#,
         )
     }

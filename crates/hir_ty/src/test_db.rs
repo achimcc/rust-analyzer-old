@@ -22,11 +22,19 @@ use test_utils::extract_annotations;
     hir_def::db::DefDatabaseStorage,
     crate::db::HirDatabaseStorage
 )]
-#[derive(Default)]
 pub(crate) struct TestDB {
     storage: salsa::Storage<TestDB>,
     events: Mutex<Option<Vec<salsa::Event>>>,
 }
+
+impl Default for TestDB {
+    fn default() -> Self {
+        let mut this = Self { storage: Default::default(), events: Default::default() };
+        this.set_enable_proc_attr_macros(true);
+        this
+    }
+}
+
 impl fmt::Debug for TestDB {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TestDB").finish()
@@ -78,16 +86,20 @@ impl FileLoader for TestDB {
 }
 
 impl TestDB {
-    pub(crate) fn module_for_file(&self, file_id: FileId) -> ModuleId {
+    pub(crate) fn module_for_file_opt(&self, file_id: FileId) -> Option<ModuleId> {
         for &krate in self.relevant_crates(file_id).iter() {
             let crate_def_map = self.crate_def_map(krate);
             for (local_id, data) in crate_def_map.modules() {
                 if data.origin.file_id() == Some(file_id) {
-                    return crate_def_map.module_id(local_id);
+                    return Some(crate_def_map.module_id(local_id));
                 }
             }
         }
-        panic!("Can't find module for file")
+        None
+    }
+
+    pub(crate) fn module_for_file(&self, file_id: FileId) -> ModuleId {
+        self.module_for_file_opt(file_id).unwrap()
     }
 
     pub(crate) fn extract_annotations(&self) -> FxHashMap<FileId, Vec<(TextRange, String)>> {

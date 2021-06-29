@@ -1,5 +1,7 @@
+use ide_db::base_db::Upcast;
+use ide_db::helpers::pick_best_token;
 use ide_db::RootDatabase;
-use syntax::{ast, match_ast, AstNode, SyntaxKind::*, SyntaxToken, TokenAtOffset, T};
+use syntax::{ast, match_ast, AstNode, SyntaxKind::*, SyntaxToken, T};
 
 use crate::{display::TryToNav, FilePosition, NavigationTarget, RangeInfo};
 
@@ -21,7 +23,12 @@ pub(crate) fn goto_type_definition(
     let sema = hir::Semantics::new(db);
 
     let file: ast::SourceFile = sema.parse(position.file_id);
-    let token: SyntaxToken = pick_best(file.syntax().token_at_offset(position.offset))?;
+    let token: SyntaxToken =
+        pick_best_token(file.syntax().token_at_offset(position.offset), |kind| match kind {
+            IDENT | INT_NUMBER | T![self] => 2,
+            kind if kind.is_trivia() => 0,
+            _ => 1,
+        })?;
     let token: SyntaxToken = sema.descend_into_macros(token);
 
     let (ty, node) = sema.token_ancestors_with_macros(token).find_map(|node| {
@@ -30,28 +37,29 @@ pub(crate) fn goto_type_definition(
                 ast::Expr(it) => sema.type_of_expr(&it)?,
                 ast::Pat(it) => sema.type_of_pat(&it)?,
                 ast::SelfParam(it) => sema.type_of_self(&it)?,
+                ast::Type(it) => sema.resolve_type(&it)?,
+                ast::RecordField(it) => sema.to_def(&it).map(|d| d.ty(db.upcast()))?,
+                ast::RecordField(it) => sema.to_def(&it).map(|d| d.ty(db.upcast()))?,
+                // can't match on RecordExprField directly as `ast::Expr` will match an iteration too early otherwise
+                ast::NameRef(it) => {
+                    if let Some(record_field) = ast::RecordExprField::for_name_ref(&it) {
+                        let (_, _, ty) = sema.resolve_record_field(&record_field)?;
+                        ty
+                    } else {
+                        let record_field = ast::RecordPatField::for_field_name_ref(&it)?;
+                        sema.resolve_record_pat_field(&record_field)?.ty(db)
+                    }
+                },
                 _ => return None,
             }
         };
 
         Some((ty, node))
     })?;
-
     let adt_def = ty.autoderef(db).filter_map(|ty| ty.as_adt()).last()?;
 
     let nav = adt_def.try_to_nav(db)?;
     Some(RangeInfo::new(node.text_range(), vec![nav]))
-}
-
-fn pick_best(tokens: TokenAtOffset<SyntaxToken>) -> Option<SyntaxToken> {
-    return tokens.max_by_key(priority);
-    fn priority(n: &SyntaxToken) -> usize {
-        match n.kind() {
-            IDENT | INT_NUMBER | T![self] => 2,
-            kind if kind.is_trivia() => 0,
-            _ => 1,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -79,6 +87,54 @@ struct Foo;
      //^^^
 fn foo() {
     let f: Foo; f$0
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn goto_type_definition_record_expr_field() {
+        check(
+            r#"
+struct Bar;
+    // ^^^
+struct Foo { foo: Bar }
+fn foo() {
+    Foo { foo$0 }
+}
+"#,
+        );
+        check(
+            r#"
+struct Bar;
+    // ^^^
+struct Foo { foo: Bar }
+fn foo() {
+    Foo { foo$0: Bar }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn goto_type_definition_record_pat_field() {
+        check(
+            r#"
+struct Bar;
+    // ^^^
+struct Foo { foo: Bar }
+fn foo() {
+    let Foo { foo$0 };
+}
+"#,
+        );
+        check(
+            r#"
+struct Bar;
+    // ^^^
+struct Foo { foo: Bar }
+fn foo() {
+    let Foo { foo$0: bar };
 }
 "#,
         );
@@ -148,5 +204,46 @@ impl Foo {
 }
 "#,
         )
+    }
+
+    #[test]
+    fn goto_def_for_type_fallback() {
+        check(
+            r#"
+struct Foo;
+     //^^^
+impl Foo$0 {}
+"#,
+        )
+    }
+
+    #[test]
+    fn goto_def_for_struct_field() {
+        check(
+            r#"
+struct Bar;
+     //^^^
+
+struct Foo {
+    bar$0: Bar,
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn goto_def_for_enum_struct_field() {
+        check(
+            r#"
+struct Bar;
+     //^^^
+
+enum Foo {
+    Bar {
+        bar$0: Bar
+    },
+}
+"#,
+        );
     }
 }

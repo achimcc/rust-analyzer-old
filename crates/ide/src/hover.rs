@@ -1,17 +1,17 @@
 use either::Either;
-use hir::{
-    AsAssocItem, AssocItemContainer, GenericParam, HasAttrs, HasSource, HirDisplay, InFile, Module,
-    ModuleDef, Semantics,
-};
+use hir::{AsAssocItem, HasAttrs, HasSource, HirDisplay, Semantics};
 use ide_db::{
     base_db::SourceDatabase,
     defs::{Definition, NameClass, NameRefClass},
-    helpers::FamousDefs,
+    helpers::{
+        generated_lints::{CLIPPY_LINTS, DEFAULT_LINTS, FEATURES},
+        pick_best_token, FamousDefs,
+    },
     RootDatabase,
 };
 use itertools::Itertools;
 use stdx::format_to;
-use syntax::{ast, match_ast, AstNode, AstToken, SyntaxKind::*, SyntaxToken, TokenAtOffset, T};
+use syntax::{algo, ast, match_ast, AstNode, AstToken, Direction, SyntaxKind::*, SyntaxToken, T};
 
 use crate::{
     display::{macro_label, TryToNav},
@@ -27,41 +27,27 @@ use crate::{
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HoverConfig {
-    pub implementations: bool,
-    pub run: bool,
-    pub debug: bool,
-    pub goto_type_def: bool,
     pub links_in_hover: bool,
-    pub markdown: bool,
+    pub documentation: Option<HoverDocFormat>,
 }
 
 impl HoverConfig {
-    pub const NO_ACTIONS: Self = Self {
-        implementations: false,
-        run: false,
-        debug: false,
-        goto_type_def: false,
-        links_in_hover: true,
-        markdown: true,
-    };
-
-    pub fn any(&self) -> bool {
-        self.implementations || self.runnable() || self.goto_type_def
+    fn markdown(&self) -> bool {
+        matches!(self.documentation, Some(HoverDocFormat::Markdown))
     }
+}
 
-    pub fn none(&self) -> bool {
-        !self.any()
-    }
-
-    pub fn runnable(&self) -> bool {
-        self.run || self.debug
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HoverDocFormat {
+    Markdown,
+    PlainText,
 }
 
 #[derive(Debug, Clone)]
 pub enum HoverAction {
     Runnable(Runnable),
     Implementation(FilePosition),
+    Reference(FilePosition),
     GoToType(Vec<HoverGotoTypeData>),
 }
 
@@ -87,12 +73,16 @@ pub struct HoverResult {
 pub(crate) fn hover(
     db: &RootDatabase,
     position: FilePosition,
-    links_in_hover: bool,
-    markdown: bool,
+    config: &HoverConfig,
 ) -> Option<RangeInfo<HoverResult>> {
-    let sema = Semantics::new(db);
+    let sema = hir::Semantics::new(db);
     let file = sema.parse(position.file_id).syntax().clone();
-    let token = pick_best(file.token_at_offset(position.offset))?;
+    let token = pick_best_token(file.token_at_offset(position.offset), |kind| match kind {
+        IDENT | INT_NUMBER | LIFETIME_IDENT | T![self] | T![super] | T![crate] => 3,
+        T!['('] | T![')'] => 2,
+        kind if kind.is_trivia() => 0,
+        _ => 1,
+    })?;
     let token = sema.descend_into_macros(token);
 
     let mut res = HoverResult::default();
@@ -115,13 +105,14 @@ pub(crate) fn hover(
                 |d| d.defined(db),
             ),
 
-            _ => ast::Comment::cast(token.clone())
-                .and_then(|_| {
+            _ => {
+                if ast::Comment::cast(token.clone()).is_some() {
+                    cov_mark::hit!(no_highlight_on_comment_hover);
                     let (attributes, def) = doc_attributes(&sema, &node)?;
                     let (docs, doc_mapping) = attributes.docs_with_rangemap(db)?;
                     let (idl_range, link, ns) =
                         extract_definitions_from_markdown(docs.as_str()).into_iter().find_map(|(range, link, ns)| {
-                            let InFile { file_id, value: range } = doc_mapping.map(range.clone())?;
+                            let hir::InFile { file_id, value: range } = doc_mapping.map(range)?;
                             if file_id == position.file_id.into() && range.contains(position.offset) {
                                 Some((range, link, ns))
                             } else {
@@ -129,22 +120,30 @@ pub(crate) fn hover(
                             }
                         })?;
                     range = Some(idl_range);
-                    resolve_doc_path_for_def(db, def, &link, ns)
-                })
-                .map(Definition::ModuleDef),
+                    resolve_doc_path_for_def(db, def, &link, ns).map(Definition::ModuleDef)
+                } else if let res@Some(_) = try_hover_for_attribute(&token) {
+                    return res;
+                } else {
+                    None
+                }
+            },
         }
     };
 
     if let Some(definition) = definition {
         let famous_defs = match &definition {
-            Definition::ModuleDef(ModuleDef::BuiltinType(_)) => {
+            Definition::ModuleDef(hir::ModuleDef::BuiltinType(_)) => {
                 Some(FamousDefs(&sema, sema.scope(&node).krate()))
             }
             _ => None,
         };
-        if let Some(markup) = hover_for_definition(db, definition, famous_defs.as_ref()) {
-            res.markup = process_markup(sema.db, definition, &markup, links_in_hover, markdown);
+        if let Some(markup) = hover_for_definition(db, definition, famous_defs.as_ref(), config) {
+            res.markup = process_markup(sema.db, definition, &markup, config);
             if let Some(action) = show_implementations_action(db, definition) {
+                res.actions.push(action);
+            }
+
+            if let Some(action) = show_fn_references_action(db, definition) {
                 res.actions.push(action);
             }
 
@@ -161,12 +160,7 @@ pub(crate) fn hover(
         }
     }
 
-    if token.kind() == syntax::SyntaxKind::COMMENT {
-        cov_mark::hit!(no_highlight_on_comment_hover);
-        return None;
-    }
-
-    if let res @ Some(_) = hover_for_keyword(&sema, links_in_hover, markdown, &token) {
+    if let res @ Some(_) = hover_for_keyword(&sema, config, &token) {
         return res;
     }
 
@@ -185,13 +179,58 @@ pub(crate) fn hover(
         }
     };
 
-    res.markup = if markdown {
+    res.markup = if config.markdown() {
         Markup::fenced_block(&ty.display(db))
     } else {
         ty.display(db).to_string().into()
     };
     let range = sema.original_range(&node).range;
     Some(RangeInfo::new(range, res))
+}
+
+fn try_hover_for_attribute(token: &SyntaxToken) -> Option<RangeInfo<HoverResult>> {
+    let attr = token.ancestors().find_map(ast::Attr::cast)?;
+    let (path, tt) = attr.as_simple_call()?;
+    if !tt.syntax().text_range().contains(token.text_range().start()) {
+        return None;
+    }
+    let (is_clippy, lints) = match &*path {
+        "feature" => (false, FEATURES),
+        "allow" | "deny" | "forbid" | "warn" => {
+            let is_clippy = algo::non_trivia_sibling(token.clone().into(), Direction::Prev)
+                .filter(|t| t.kind() == T![:])
+                .and_then(|t| algo::non_trivia_sibling(t, Direction::Prev))
+                .filter(|t| t.kind() == T![:])
+                .and_then(|t| algo::non_trivia_sibling(t, Direction::Prev))
+                .map_or(false, |t| {
+                    t.kind() == T![ident] && t.into_token().map_or(false, |t| t.text() == "clippy")
+                });
+            if is_clippy {
+                (true, CLIPPY_LINTS)
+            } else {
+                (false, DEFAULT_LINTS)
+            }
+        }
+        _ => return None,
+    };
+
+    let tmp;
+    let needle = if is_clippy {
+        tmp = format!("clippy::{}", token.text());
+        &tmp
+    } else {
+        &*token.text()
+    };
+
+    let lint =
+        lints.binary_search_by_key(&needle, |lint| lint.label).ok().map(|idx| &lints[idx])?;
+    Some(RangeInfo::new(
+        token.text_range(),
+        HoverResult {
+            markup: Markup::from(format!("```\n{}\n```\n___\n\n{}", lint.label, lint.description)),
+            ..Default::default()
+        },
+    ))
 }
 
 fn show_implementations_action(db: &RootDatabase, def: Definition) -> Option<HoverAction> {
@@ -203,23 +242,39 @@ fn show_implementations_action(db: &RootDatabase, def: Definition) -> Option<Hov
     }
 
     let adt = match def {
-        Definition::ModuleDef(ModuleDef::Trait(it)) => return it.try_to_nav(db).map(to_action),
-        Definition::ModuleDef(ModuleDef::Adt(it)) => Some(it),
+        Definition::ModuleDef(hir::ModuleDef::Trait(it)) => {
+            return it.try_to_nav(db).map(to_action)
+        }
+        Definition::ModuleDef(hir::ModuleDef::Adt(it)) => Some(it),
         Definition::SelfType(it) => it.self_ty(db).as_adt(),
         _ => None,
     }?;
     adt.try_to_nav(db).map(to_action)
 }
 
+fn show_fn_references_action(db: &RootDatabase, def: Definition) -> Option<HoverAction> {
+    match def {
+        Definition::ModuleDef(hir::ModuleDef::Function(it)) => {
+            it.try_to_nav(db).map(|nav_target| {
+                HoverAction::Reference(FilePosition {
+                    file_id: nav_target.file_id,
+                    offset: nav_target.focus_or_full_range().start(),
+                })
+            })
+        }
+        _ => None,
+    }
+}
+
 fn runnable_action(
-    sema: &Semantics<RootDatabase>,
+    sema: &hir::Semantics<RootDatabase>,
     def: Definition,
     file_id: FileId,
 ) -> Option<HoverAction> {
     match def {
         Definition::ModuleDef(it) => match it {
-            ModuleDef::Module(it) => runnable_mod(&sema, it).map(|it| HoverAction::Runnable(it)),
-            ModuleDef::Function(func) => {
+            hir::ModuleDef::Module(it) => runnable_mod(sema, it).map(HoverAction::Runnable),
+            hir::ModuleDef::Function(func) => {
                 let src = func.source(sema.db)?;
                 if src.file_id != file_id.into() {
                     cov_mark::hit!(hover_macro_generated_struct_fn_doc_comment);
@@ -227,7 +282,7 @@ fn runnable_action(
                     return None;
                 }
 
-                runnable_fn(&sema, func).map(HoverAction::Runnable)
+                runnable_fn(sema, func).map(HoverAction::Runnable)
             }
             _ => None,
         },
@@ -236,19 +291,19 @@ fn runnable_action(
 }
 
 fn goto_type_action(db: &RootDatabase, def: Definition) -> Option<HoverAction> {
-    let mut targets: Vec<ModuleDef> = Vec::new();
-    let mut push_new_def = |item: ModuleDef| {
+    let mut targets: Vec<hir::ModuleDef> = Vec::new();
+    let mut push_new_def = |item: hir::ModuleDef| {
         if !targets.contains(&item) {
             targets.push(item);
         }
     };
 
-    if let Definition::GenericParam(GenericParam::TypeParam(it)) = def {
+    if let Definition::GenericParam(hir::GenericParam::TypeParam(it)) = def {
         it.trait_bounds(db).into_iter().for_each(|it| push_new_def(it.into()));
     } else {
         let ty = match def {
             Definition::Local(it) => it.ty(db),
-            Definition::GenericParam(GenericParam::ConstParam(it)) => it.ty(db),
+            Definition::GenericParam(hir::GenericParam::ConstParam(it)) => it.ty(db),
             _ => return None,
         };
 
@@ -278,42 +333,32 @@ fn goto_type_action(db: &RootDatabase, def: Definition) -> Option<HoverAction> {
     Some(HoverAction::GoToType(targets))
 }
 
-fn hover_markup(
-    docs: Option<String>,
-    desc: Option<String>,
-    mod_path: Option<String>,
-) -> Option<Markup> {
-    match desc {
-        Some(desc) => {
-            let mut buf = String::new();
+fn hover_markup(docs: Option<String>, desc: String, mod_path: Option<String>) -> Option<Markup> {
+    let mut buf = String::new();
 
-            if let Some(mod_path) = mod_path {
-                if !mod_path.is_empty() {
-                    format_to!(buf, "```rust\n{}\n```\n\n", mod_path);
-                }
-            }
-            format_to!(buf, "```rust\n{}\n```", desc);
-
-            if let Some(doc) = docs {
-                format_to!(buf, "\n___\n\n{}", doc);
-            }
-            Some(buf.into())
+    if let Some(mod_path) = mod_path {
+        if !mod_path.is_empty() {
+            format_to!(buf, "```rust\n{}\n```\n\n", mod_path);
         }
-        None => docs.map(Markup::from),
     }
+    format_to!(buf, "```rust\n{}\n```", desc);
+
+    if let Some(doc) = docs {
+        format_to!(buf, "\n___\n\n{}", doc);
+    }
+    Some(buf.into())
 }
 
 fn process_markup(
     db: &RootDatabase,
     def: Definition,
     markup: &Markup,
-    links_in_hover: bool,
-    markdown: bool,
+    config: &HoverConfig,
 ) -> Markup {
     let markup = markup.as_str();
-    let markup = if !markdown {
+    let markup = if !config.markdown() {
         remove_markdown(markup)
-    } else if links_in_hover {
+    } else if config.links_in_hover {
         rewrite_links(db, markup, &def)
     } else {
         remove_links(markup)
@@ -326,11 +371,11 @@ fn definition_owner_name(db: &RootDatabase, def: &Definition) -> Option<String> 
         Definition::Field(f) => Some(f.parent_def(db).name(db)),
         Definition::Local(l) => l.parent(db).name(db),
         Definition::ModuleDef(md) => match md {
-            ModuleDef::Function(f) => match f.as_assoc_item(db)?.container(db) {
-                AssocItemContainer::Trait(t) => Some(t.name(db)),
-                AssocItemContainer::Impl(i) => i.self_ty(db).as_adt().map(|adt| adt.name(db)),
+            hir::ModuleDef::Function(f) => match f.as_assoc_item(db)?.container(db) {
+                hir::AssocItemContainer::Trait(t) => Some(t.name(db)),
+                hir::AssocItemContainer::Impl(i) => i.self_ty(db).as_adt().map(|adt| adt.name(db)),
             },
-            ModuleDef::Variant(e) => Some(e.parent_enum(db).name(db)),
+            hir::ModuleDef::Variant(e) => Some(e.parent_enum(db).name(db)),
             _ => None,
         },
         _ => None,
@@ -338,7 +383,7 @@ fn definition_owner_name(db: &RootDatabase, def: &Definition) -> Option<String> 
     .map(|name| name.to_string())
 }
 
-fn render_path(db: &RootDatabase, module: Module, item_name: Option<String>) -> String {
+fn render_path(db: &RootDatabase, module: hir::Module, item_name: Option<String>) -> String {
     let crate_name =
         db.crate_graph()[module.krate().into()].display_name.as_ref().map(|it| it.to_string());
     let module_path = module
@@ -350,6 +395,9 @@ fn render_path(db: &RootDatabase, module: Module, item_name: Option<String>) -> 
 }
 
 fn definition_mod_path(db: &RootDatabase, def: &Definition) -> Option<String> {
+    if let Definition::GenericParam(_) = def {
+        return None;
+    }
     def.module(db).map(|module| render_path(db, module, definition_owner_name(db, def)))
 }
 
@@ -357,60 +405,57 @@ fn hover_for_definition(
     db: &RootDatabase,
     def: Definition,
     famous_defs: Option<&FamousDefs>,
+    config: &HoverConfig,
 ) -> Option<Markup> {
     let mod_path = definition_mod_path(db, &def);
-    return match def {
+    let (label, docs) = match def {
         Definition::Macro(it) => match &it.source(db)?.value {
             Either::Left(mac) => {
-                let label = macro_label(&mac);
-                from_def_source_labeled(db, it, Some(label), mod_path)
+                let label = macro_label(mac);
+                (label, it.attrs(db).docs())
             }
             Either::Right(_) => {
                 // FIXME
-                None
+                return None;
             }
         },
-        Definition::Field(def) => from_hir_fmt(db, def, mod_path),
+        Definition::Field(def) => label_and_docs(db, def),
         Definition::ModuleDef(it) => match it {
-            ModuleDef::Module(it) => from_hir_fmt(db, it, mod_path),
-            ModuleDef::Function(it) => from_hir_fmt(db, it, mod_path),
-            ModuleDef::Adt(it) => from_hir_fmt(db, it, mod_path),
-            ModuleDef::Variant(it) => from_hir_fmt(db, it, mod_path),
-            ModuleDef::Const(it) => from_hir_fmt(db, it, mod_path),
-            ModuleDef::Static(it) => from_hir_fmt(db, it, mod_path),
-            ModuleDef::Trait(it) => from_hir_fmt(db, it, mod_path),
-            ModuleDef::TypeAlias(it) => from_hir_fmt(db, it, mod_path),
-            ModuleDef::BuiltinType(it) => famous_defs
-                .and_then(|fd| hover_for_builtin(fd, it))
-                .or_else(|| Some(Markup::fenced_block(&it.name()))),
+            hir::ModuleDef::Module(it) => label_and_docs(db, it),
+            hir::ModuleDef::Function(it) => label_and_docs(db, it),
+            hir::ModuleDef::Adt(it) => label_and_docs(db, it),
+            hir::ModuleDef::Variant(it) => label_and_docs(db, it),
+            hir::ModuleDef::Const(it) => label_and_docs(db, it),
+            hir::ModuleDef::Static(it) => label_and_docs(db, it),
+            hir::ModuleDef::Trait(it) => label_and_docs(db, it),
+            hir::ModuleDef::TypeAlias(it) => label_and_docs(db, it),
+            hir::ModuleDef::BuiltinType(it) => {
+                return famous_defs
+                    .and_then(|fd| hover_for_builtin(fd, it))
+                    .or_else(|| Some(Markup::fenced_block(&it.name())))
+            }
         },
-        Definition::Local(it) => hover_for_local(it, db),
+        Definition::Local(it) => return hover_for_local(it, db),
         Definition::SelfType(impl_def) => {
-            impl_def.self_ty(db).as_adt().and_then(|adt| from_hir_fmt(db, adt, mod_path))
+            impl_def.self_ty(db).as_adt().map(|adt| label_and_docs(db, adt))?
         }
-        Definition::GenericParam(it) => from_hir_fmt(db, it, None),
-        Definition::Label(it) => Some(Markup::fenced_block(&it.name(db))),
+        Definition::GenericParam(it) => label_and_docs(db, it),
+        Definition::Label(it) => return Some(Markup::fenced_block(&it.name(db))),
     };
 
-    fn from_hir_fmt<D>(db: &RootDatabase, def: D, mod_path: Option<String>) -> Option<Markup>
+    return hover_markup(
+        docs.filter(|_| config.documentation.is_some()).map(Into::into),
+        label,
+        mod_path,
+    );
+
+    fn label_and_docs<D>(db: &RootDatabase, def: D) -> (String, Option<hir::Documentation>)
     where
         D: HasAttrs + HirDisplay,
     {
         let label = def.display(db).to_string();
-        from_def_source_labeled(db, def, Some(label), mod_path)
-    }
-
-    fn from_def_source_labeled<D>(
-        db: &RootDatabase,
-        def: D,
-        short_label: Option<String>,
-        mod_path: Option<String>,
-    ) -> Option<Markup>
-    where
-        D: HasAttrs,
-    {
-        let docs = def.attrs(db).docs().map(Into::into);
-        hover_markup(docs, short_label, mod_path)
+        let docs = def.attrs(db).docs();
+        (label, docs)
     }
 }
 
@@ -434,19 +479,18 @@ fn hover_for_local(it: hir::Local, db: &RootDatabase) -> Option<Markup> {
         }
         Either::Right(_) => format!("{}self: {}", is_mut, ty),
     };
-    hover_markup(None, Some(desc), None)
+    hover_markup(None, desc, None)
 }
 
 fn hover_for_keyword(
     sema: &Semantics<RootDatabase>,
-    links_in_hover: bool,
-    markdown: bool,
+    config: &HoverConfig,
     token: &SyntaxToken,
 ) -> Option<RangeInfo<HoverResult>> {
-    if !token.kind().is_keyword() {
+    if !token.kind().is_keyword() || !config.documentation.is_some() {
         return None;
     }
-    let famous_defs = FamousDefs(&sema, sema.scope(&token.parent()?).krate());
+    let famous_defs = FamousDefs(sema, sema.scope(&token.parent()?).krate());
     // std exposes {}_keyword modules with docstrings on the root to document keywords
     let keyword_mod = format!("{}_keyword", token.text());
     let doc_owner = find_std_module(&famous_defs, &keyword_mod)?;
@@ -454,9 +498,8 @@ fn hover_for_keyword(
     let markup = process_markup(
         sema.db,
         Definition::ModuleDef(doc_owner.into()),
-        &hover_markup(Some(docs.into()), Some(token.text().into()), None)?,
-        links_in_hover,
-        markdown,
+        &hover_markup(Some(docs.into()), token.text().into(), None)?,
+        config,
     );
     Some(RangeInfo::new(token.text_range(), HoverResult { markup, actions: Default::default() }))
 }
@@ -466,7 +509,7 @@ fn hover_for_builtin(famous_defs: &FamousDefs, builtin: hir::BuiltinType) -> Opt
     let primitive_mod = format!("prim_{}", builtin.name());
     let doc_owner = find_std_module(famous_defs, &primitive_mod)?;
     let docs = doc_owner.attrs(famous_defs.0.db).docs()?;
-    hover_markup(Some(docs.into()), Some(builtin.name().to_string()), None)
+    hover_markup(Some(docs.into()), builtin.name().to_string(), None)
 }
 
 fn find_std_module(famous_defs: &FamousDefs, name: &str) -> Option<hir::Module> {
@@ -478,36 +521,39 @@ fn find_std_module(famous_defs: &FamousDefs, name: &str) -> Option<hir::Module> 
         .find(|module| module.name(db).map_or(false, |module| module.to_string() == name))
 }
 
-fn pick_best(tokens: TokenAtOffset<SyntaxToken>) -> Option<SyntaxToken> {
-    return tokens.max_by_key(priority);
-
-    fn priority(n: &SyntaxToken) -> usize {
-        match n.kind() {
-            IDENT | INT_NUMBER | LIFETIME_IDENT | T![self] | T![super] | T![crate] => 3,
-            T!['('] | T![')'] => 2,
-            kind if kind.is_trivia() => 0,
-            _ => 1,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use expect_test::{expect, Expect};
     use ide_db::base_db::FileLoader;
 
-    use crate::fixture;
-
-    use super::*;
+    use crate::{fixture, hover::HoverDocFormat, HoverConfig};
 
     fn check_hover_no_result(ra_fixture: &str) {
         let (analysis, position) = fixture::position(ra_fixture);
-        assert!(analysis.hover(position, true, true).unwrap().is_none());
+        assert!(analysis
+            .hover(
+                position,
+                &HoverConfig {
+                    links_in_hover: true,
+                    documentation: Some(HoverDocFormat::Markdown)
+                }
+            )
+            .unwrap()
+            .is_none());
     }
 
     fn check(ra_fixture: &str, expect: Expect) {
         let (analysis, position) = fixture::position(ra_fixture);
-        let hover = analysis.hover(position, true, true).unwrap().unwrap();
+        let hover = analysis
+            .hover(
+                position,
+                &HoverConfig {
+                    links_in_hover: true,
+                    documentation: Some(HoverDocFormat::Markdown),
+                },
+            )
+            .unwrap()
+            .unwrap();
 
         let content = analysis.db.file_text(position.file_id);
         let hovered_element = &content[hover.range];
@@ -518,7 +564,16 @@ mod tests {
 
     fn check_hover_no_links(ra_fixture: &str, expect: Expect) {
         let (analysis, position) = fixture::position(ra_fixture);
-        let hover = analysis.hover(position, false, true).unwrap().unwrap();
+        let hover = analysis
+            .hover(
+                position,
+                &HoverConfig {
+                    links_in_hover: false,
+                    documentation: Some(HoverDocFormat::Markdown),
+                },
+            )
+            .unwrap()
+            .unwrap();
 
         let content = analysis.db.file_text(position.file_id);
         let hovered_element = &content[hover.range];
@@ -529,7 +584,16 @@ mod tests {
 
     fn check_hover_no_markdown(ra_fixture: &str, expect: Expect) {
         let (analysis, position) = fixture::position(ra_fixture);
-        let hover = analysis.hover(position, true, false).unwrap().unwrap();
+        let hover = analysis
+            .hover(
+                position,
+                &HoverConfig {
+                    links_in_hover: true,
+                    documentation: Some(HoverDocFormat::PlainText),
+                },
+            )
+            .unwrap()
+            .unwrap();
 
         let content = analysis.db.file_text(position.file_id);
         let hovered_element = &content[hover.range];
@@ -540,7 +604,16 @@ mod tests {
 
     fn check_actions(ra_fixture: &str, expect: Expect) {
         let (analysis, position) = fixture::position(ra_fixture);
-        let hover = analysis.hover(position, true, true).unwrap().unwrap();
+        let hover = analysis
+            .hover(
+                position,
+                &HoverConfig {
+                    links_in_hover: true,
+                    documentation: Some(HoverDocFormat::Markdown),
+                },
+            )
+            .unwrap()
+            .unwrap();
         expect.assert_debug_eq(&hover.info.actions)
     }
 
@@ -1751,9 +1824,10 @@ pub struct B$0ar
         );
     }
 
-    #[ignore = "path based links currently only support documentation on ModuleDef items"]
     #[test]
     fn test_hover_path_link_field() {
+        // FIXME: Should be
+        //  [Foo](https://docs.rs/test/*/test/struct.Foo.html)
         check(
             r#"
 pub struct Foo;
@@ -1775,7 +1849,7 @@ pub struct Bar {
 
                 ---
 
-                [Foo](https://docs.rs/test/*/test/struct.Foo.html)
+                [Foo](struct.Foo.html)
             "#]],
         );
     }
@@ -2189,7 +2263,7 @@ pub fn fo$0o() {}
                 case 13. collapsed link: foo
                 case 14. shortcut link: foo
                 case 15. inline without URL: foo
-                case 16. just escaped text: \[foo]
+                case 16. just escaped text: \[foo\]
                 case 17. inline link: Foo
 
                 [^example]: https://www.example.com/
@@ -2377,6 +2451,14 @@ fn foo_$0test() {}
 "#,
             expect![[r#"
                 [
+                    Reference(
+                        FilePosition {
+                            file_id: FileId(
+                                0,
+                            ),
+                            offset: 11,
+                        },
+                    ),
                     Runnable(
                         Runnable {
                             nav: NavigationTarget {
@@ -2921,15 +3003,10 @@ fn foo(ar$0g: &impl Foo + Bar<S>) {}
     fn test_hover_async_block_impl_trait_has_goto_type_action() {
         check_actions(
             r#"
+//- minicore: future
 struct S;
 fn foo() {
     let fo$0o = async { S };
-}
-
-#[prelude_import] use future::*;
-mod future {
-    #[lang = "future_trait"]
-    pub trait Future { type Output; }
 }
 "#,
             expect![[r#"
@@ -2937,13 +3014,13 @@ mod future {
                     GoToType(
                         [
                             HoverGotoTypeData {
-                                mod_path: "test::future::Future",
+                                mod_path: "core::future::Future",
                                 nav: NavigationTarget {
                                     file_id: FileId(
-                                        0,
+                                        1,
                                     ),
-                                    full_range: 101..163,
-                                    focus_range: 140..146,
+                                    full_range: 251..433,
+                                    focus_range: 290..296,
                                     name: "Future",
                                     kind: Trait,
                                     description: "pub trait Future",
@@ -3739,11 +3816,14 @@ use foo::bar::{self$0};
 
     #[test]
     fn hover_keyword() {
-        let ra_fixture = r#"//- /main.rs crate:main deps:std
-fn f() { retur$0n; }"#;
-        let fixture = format!("{}\n{}", ra_fixture, FamousDefs::FIXTURE);
         check(
-            &fixture,
+            r#"
+//- /main.rs crate:main deps:std
+fn f() { retur$0n; }
+//- /libstd.rs crate:std
+/// Docs for return_keyword
+mod return_keyword {}
+"#,
             expect![[r#"
                 *return*
 
@@ -3760,11 +3840,15 @@ fn f() { retur$0n; }"#;
 
     #[test]
     fn hover_builtin() {
-        let ra_fixture = r#"//- /main.rs crate:main deps:std
-cosnt _: &str$0 = ""; }"#;
-        let fixture = format!("{}\n{}", ra_fixture, FamousDefs::FIXTURE);
         check(
-            &fixture,
+            r#"
+//- /main.rs crate:main deps:std
+cosnt _: &str$0 = ""; }
+
+//- /libstd.rs crate:std
+/// Docs for prim_str
+mod prim_str {}
+"#,
             expect![[r#"
                 *str*
 
@@ -3954,6 +4038,96 @@ mod string {
                 ---
 
                 Custom `String` type.
+            "#]],
+        )
+    }
+
+    #[test]
+    fn function_doesnt_shadow_crate_in_use_tree() {
+        check(
+            r#"
+//- /main.rs crate:main deps:foo
+use foo$0::{foo};
+
+//- /foo.rs crate:foo
+pub fn foo() {}
+"#,
+            expect![[r#"
+                *foo*
+
+                ```rust
+                extern crate foo
+                ```
+            "#]],
+        )
+    }
+
+    #[test]
+    fn hover_feature() {
+        check(
+            r#"#![feature(box_syntax$0)]"#,
+            expect![[r##"
+                *box_syntax*
+                ```
+                box_syntax
+                ```
+                ___
+
+                # `box_syntax`
+
+                The tracking issue for this feature is: [#49733]
+
+                [#49733]: https://github.com/rust-lang/rust/issues/49733
+
+                See also [`box_patterns`](box-patterns.md)
+
+                ------------------------
+
+                Currently the only stable way to create a `Box` is via the `Box::new` method.
+                Also it is not possible in stable Rust to destructure a `Box` in a match
+                pattern. The unstable `box` keyword can be used to create a `Box`. An example
+                usage would be:
+
+                ```rust
+                #![feature(box_syntax)]
+
+                fn main() {
+                    let b = box 5;
+                }
+                ```
+
+            "##]],
+        )
+    }
+
+    #[test]
+    fn hover_lint() {
+        check(
+            r#"#![allow(arithmetic_overflow$0)]"#,
+            expect![[r#"
+                *arithmetic_overflow*
+                ```
+                arithmetic_overflow
+                ```
+                ___
+
+                arithmetic operation overflows
+            "#]],
+        )
+    }
+
+    #[test]
+    fn hover_clippy_lint() {
+        check(
+            r#"#![allow(clippy::almost_swapped$0)]"#,
+            expect![[r#"
+                *almost_swapped*
+                ```
+                clippy::almost_swapped
+                ```
+                ___
+
+                Checks for `foo = bar; bar = foo` sequences.
             "#]],
         )
     }

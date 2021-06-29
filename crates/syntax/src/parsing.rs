@@ -6,17 +6,16 @@ mod text_token_source;
 mod text_tree_sink;
 mod reparsing;
 
-use crate::{syntax_node::GreenNode, AstNode, SyntaxError, SyntaxNode};
+use parser::SyntaxKind;
 use text_token_source::TextTokenSource;
 use text_tree_sink::TextTreeSink;
 
-pub(crate) use lexer::*;
+use crate::{syntax_node::GreenNode, AstNode, SyntaxError, SyntaxNode};
 
-pub(crate) use self::reparsing::incremental_reparse;
-use parser::SyntaxKind;
+pub(crate) use crate::parsing::{lexer::*, reparsing::incremental_reparse};
 
 pub(crate) fn parse_text(text: &str) -> (GreenNode, Vec<SyntaxError>) {
-    let (tokens, lexer_errors) = tokenize(&text);
+    let (tokens, lexer_errors) = tokenize(text);
 
     let mut token_source = TextTokenSource::new(text, &tokens);
     let mut tree_sink = TextTreeSink::new(text, &tokens);
@@ -34,7 +33,7 @@ pub(crate) fn parse_text_fragment<T: AstNode>(
     text: &str,
     fragment_kind: parser::FragmentKind,
 ) -> Result<T, ()> {
-    let (tokens, lexer_errors) = tokenize(&text);
+    let (tokens, lexer_errors) = tokenize(text);
     if !lexer_errors.is_empty() {
         return Err(());
     }

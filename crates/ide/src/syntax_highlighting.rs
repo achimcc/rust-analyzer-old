@@ -42,12 +42,107 @@ pub struct HlRange {
 // Feature: Semantic Syntax Highlighting
 //
 // rust-analyzer highlights the code semantically.
-// For example, `bar` in `foo::Bar` might be colored differently depending on whether `Bar` is an enum or a trait.
-// rust-analyzer does not specify colors directly, instead it assigns tag (like `struct`) and a set of modifiers (like `declaration`) to each token.
+// For example, `Bar` in `foo::Bar` might be colored differently depending on whether `Bar` is an enum or a trait.
+// rust-analyzer does not specify colors directly, instead it assigns a tag (like `struct`) and a set of modifiers (like `declaration`) to each token.
 // It's up to the client to map those to specific colors.
 //
 // The general rule is that a reference to an entity gets colored the same way as the entity itself.
 // We also give special modifier for `mut` and `&mut` local variables.
+//
+//
+// .Token Tags
+//
+// Rust-analyzer currently emits the following token tags:
+//
+// - For items:
+// +
+// [horizontal]
+// enum:: Emitted for enums.
+// function:: Emitted for free-standing functions.
+// macro:: Emitted for macros.
+// method:: Emitted for associated functions, also knowns as methods.
+// namespace:: Emitted for modules.
+// struct:: Emitted for structs.
+// trait:: Emitted for traits.
+// typeAlias:: Emitted for type aliases and `Self` in `impl`s.
+// union:: Emitted for unions.
+//
+// - For literals:
+// +
+// [horizontal]
+// boolean:: Emitted for the boolean literals `true` and `false`.
+// character:: Emitted for character literals.
+// number:: Emitted for numeric literals.
+// string:: Emitted for string literals.
+// escapeSequence:: Emitted for escaped sequences inside strings like `\n`.
+// formatSpecifier:: Emitted for format specifiers `{:?}` in `format!`-like macros.
+//
+// - For operators:
+// +
+// [horizontal]
+// operator:: Emitted for general operators.
+// arithmetic:: Emitted for the arithmetic operators `+`, `-`, `*`, `/`, `+=`, `-=`, `*=`, `/=`.
+// bitwise:: Emitted for the bitwise operators `|`, `&`, `!`, `^`, `|=`, `&=`, `^=`.
+// comparison:: Emitted for the comparison operators `>`, `<`, `==`, `>=`, `<=`, `!=`.
+// logical:: Emitted for the logical operators `||`, `&&`, `!`.
+//
+// - For punctuation:
+// +
+// [horizontal]
+// punctuation:: Emitted for general punctuation.
+// angle:: Emitted for `<>` angle brackets.
+// brace:: Emitted for `{}` braces.
+// bracket:: Emitted for `[]` brackets.
+// parenthesis:: Emitted for `()` parentheses.
+// colon:: Emitted for the `:` token.
+// comma:: Emitted for the `,` token.
+// dot:: Emitted for the `.` token.
+// Semi:: Emitted for the `;` token.
+//
+// //-
+//
+// [horizontal]
+// attribute:: Emitted for attributes.
+// builtinType:: Emitted for builtin types like `u32`, `str` and `f32`.
+// comment:: Emitted for comments.
+// constParameter:: Emitted for const parameters.
+// enumMember:: Emitted for enum variants.
+// generic:: Emitted for generic tokens that have no mapping.
+// keyword:: Emitted for keywords.
+// label:: Emitted for labels.
+// lifetime:: Emitted for lifetimes.
+// parameter:: Emitted for non-self function parameters.
+// property:: Emitted for struct and union fields.
+// selfKeyword:: Emitted for the self function parameter and self path-specifier.
+// typeParameter:: Emitted for type parameters.
+// unresolvedReference:: Emitted for unresolved references, names that rust-analyzer can't find the definition of.
+// variable:: Emitted for locals, constants and statics.
+//
+//
+// .Token Modifiers
+//
+// Token modifiers allow to style some elements in the source code more precisely.
+//
+// Rust-analyzer currently emits the following token modifiers:
+//
+// [horizontal]
+// async:: Emitted for async functions and the `async` and `await` keywords.
+// attribute:: Emitted for tokens inside attributes.
+// callable:: Emitted for locals whose types implements one of the `Fn*` traits.
+// constant:: Emitted for consts.
+// consuming:: Emitted for locals that are being consumed when use in a function call.
+// controlFlow:: Emitted for control-flow related tokens, this includes the `?` operator.
+// declaration:: Emitted for names of definitions, like `foo` in `fn foo() {}`.
+// documentation:: Emitted for documentation comments.
+// injected:: Emitted for doc-string injected highlighting like rust source blocks in documentation.
+// intraDocLink:: Emitted for intra doc links in doc-strings.
+// library:: Emitted for items that are defined outside of the current crate.
+// public:: Emitted for items that are from the current crate and are `pub`.
+// mutable:: Emitted for mutable locals and statics.
+// static:: Emitted for "static" functions, also known as functions that do not take a `self` param, as well as statics and consts.
+// trait:: Emitted for associated trait items.
+// unsafe:: Emitted for unsafe operations, like unsafe function calls, as well as the `unsafe` token.
+//
 //
 // image::https://user-images.githubusercontent.com/48062697/113164457-06cfb980-9239-11eb-819b-0f93e646acf8.png[]
 // image::https://user-images.githubusercontent.com/48062697/113187625-f7f50100-9250-11eb-825e-91c58f236071.png[]
@@ -80,6 +175,7 @@ pub(crate) fn highlight(
         &mut hl,
         &sema,
         InFile::new(file_id.into(), &root),
+        sema.scope(&root).krate(),
         range_to_highlight,
         syntactic_name_ref_highlighting,
     );
@@ -90,12 +186,14 @@ fn traverse(
     hl: &mut Highlights,
     sema: &Semantics<RootDatabase>,
     root: InFile<&SyntaxNode>,
+    krate: Option<hir::Crate>,
     range_to_highlight: TextRange,
     syntactic_name_ref_highlighting: bool,
 ) {
     let mut bindings_shadow_count: FxHashMap<Name, u32> = FxHashMap::default();
 
     let mut current_macro_call: Option<ast::MacroCall> = None;
+    let mut current_attr_macro_call = None;
     let mut current_macro: Option<ast::Macro> = None;
     let mut macro_highlighter = MacroHighlighter::default();
     let mut inside_attribute = false;
@@ -128,6 +226,19 @@ fn traverse(
             WalkEvent::Leave(Some(mc)) => {
                 assert_eq!(current_macro_call, Some(mc));
                 current_macro_call = None;
+            }
+            _ => (),
+        }
+        match event.clone().map(|it| it.into_node().and_then(ast::Item::cast)) {
+            WalkEvent::Enter(Some(item)) => {
+                if sema.is_attr_macro_call(&item) {
+                    current_attr_macro_call = Some(item);
+                }
+            }
+            WalkEvent::Leave(Some(item)) => {
+                if current_attr_macro_call == Some(item) {
+                    current_attr_macro_call = None;
+                }
             }
             _ => (),
         }
@@ -184,7 +295,23 @@ fn traverse(
                 Some(parent) => {
                     // We only care Name and Name_ref
                     match (token.kind(), parent.kind()) {
-                        (IDENT, NAME) | (IDENT, NAME_REF) => parent.into(),
+                        (IDENT, NAME | NAME_REF) => parent.into(),
+                        _ => token.into(),
+                    }
+                }
+                None => token.into(),
+            }
+        } else if current_attr_macro_call.is_some() {
+            let token = match element.clone().into_token() {
+                Some(it) => it,
+                _ => continue,
+            };
+            let token = sema.descend_into_macros(token.clone());
+            match token.parent() {
+                Some(parent) => {
+                    // We only care Name and Name_ref
+                    match (token.kind(), parent.kind()) {
+                        (IDENT, NAME | NAME_REF) => parent.into(),
                         _ => token.into(),
                     }
                 }
@@ -197,7 +324,7 @@ fn traverse(
         if let Some(token) = element.as_token().cloned().and_then(ast::String::cast) {
             if token.is_raw() {
                 let expanded = element_to_highlight.as_token().unwrap().clone();
-                if inject::ra_fixture(hl, &sema, token, expanded).is_some() {
+                if inject::ra_fixture(hl, sema, token, expanded).is_some() {
                     continue;
                 }
             }
@@ -208,7 +335,8 @@ fn traverse(
         }
 
         if let Some((mut highlight, binding_hash)) = highlight::element(
-            &sema,
+            sema,
+            krate,
             &mut bindings_shadow_count,
             syntactic_name_ref_highlighting,
             element_to_highlight.clone(),

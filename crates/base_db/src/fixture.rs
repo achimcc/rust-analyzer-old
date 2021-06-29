@@ -9,8 +9,8 @@ use test_utils::{
 use vfs::{file_set::FileSet, VfsPath};
 
 use crate::{
-    input::CrateName, Change, CrateGraph, CrateId, Edition, Env, FileId, FilePosition, FileRange,
-    SourceDatabaseExt, SourceRoot, SourceRootId,
+    input::CrateName, Change, CrateDisplayName, CrateGraph, CrateId, Edition, Env, FileId,
+    FilePosition, FileRange, SourceDatabaseExt, SourceRoot, SourceRootId,
 };
 
 pub const WORKSPACE: SourceRootId = SourceRootId(0);
@@ -24,6 +24,14 @@ pub trait WithFixture: Default + SourceDatabaseExt + 'static {
         (db, fixture.files[0])
     }
 
+    fn with_many_files(ra_fixture: &str) -> (Self, Vec<FileId>) {
+        let fixture = ChangeFixture::parse(ra_fixture);
+        let mut db = Self::default();
+        fixture.change.apply(&mut db);
+        assert!(fixture.file_position.is_none());
+        (db, fixture.files)
+    }
+
     fn with_files(ra_fixture: &str) -> Self {
         let fixture = ChangeFixture::parse(ra_fixture);
         let mut db = Self::default();
@@ -34,19 +42,13 @@ pub trait WithFixture: Default + SourceDatabaseExt + 'static {
 
     fn with_position(ra_fixture: &str) -> (Self, FilePosition) {
         let (db, file_id, range_or_offset) = Self::with_range_or_offset(ra_fixture);
-        let offset = match range_or_offset {
-            RangeOrOffset::Range(_) => panic!("Expected a cursor position, got a range instead"),
-            RangeOrOffset::Offset(it) => it,
-        };
+        let offset = range_or_offset.expect_offset();
         (db, FilePosition { file_id, offset })
     }
 
     fn with_range(ra_fixture: &str) -> (Self, FileRange) {
         let (db, file_id, range_or_offset) = Self::with_range_or_offset(ra_fixture);
-        let range = match range_or_offset {
-            RangeOrOffset::Range(it) => it,
-            RangeOrOffset::Offset(_) => panic!("Expected a cursor range, got a position instead"),
-        };
+        let range = range_or_offset.expect_range();
         (db, FileRange { file_id, range })
     }
 
@@ -79,7 +81,7 @@ pub struct ChangeFixture {
 
 impl ChangeFixture {
     pub fn parse(ra_fixture: &str) -> ChangeFixture {
-        let fixture = Fixture::parse(ra_fixture);
+        let (mini_core, fixture) = Fixture::parse(ra_fixture);
         let mut change = Change::new();
 
         let mut files = Vec::new();
@@ -104,7 +106,7 @@ impl ChangeFixture {
                     let (range_or_offset, text) = extract_range_or_offset(&entry.text);
                     assert!(file_position.is_none());
                     file_position = Some((file_id, range_or_offset));
-                    text.to_string()
+                    text
                 }
             } else {
                 entry.text.clone()
@@ -112,6 +114,9 @@ impl ChangeFixture {
 
             let meta = FileMeta::from(entry);
             assert!(meta.path.starts_with(&source_root_prefix));
+            if !meta.deps.is_empty() {
+                assert!(meta.krate.is_some(), "can't specify deps without naming the crate")
+            }
 
             if meta.introduce_new_source_root {
                 roots.push(SourceRoot::new_local(mem::take(&mut file_set)));
@@ -123,6 +128,7 @@ impl ChangeFixture {
                     file_id,
                     meta.edition,
                     Some(crate_name.clone().into()),
+                    meta.cfg.clone(),
                     meta.cfg,
                     meta.env,
                     Default::default(),
@@ -152,6 +158,7 @@ impl ChangeFixture {
                 crate_root,
                 Edition::Edition2018,
                 Some(CrateName::new("test").unwrap().into()),
+                default_cfg.clone(),
                 default_cfg,
                 Env::default(),
                 Default::default(),
@@ -164,6 +171,32 @@ impl ChangeFixture {
             }
         }
 
+        if let Some(mini_core) = mini_core {
+            let core_file = file_id;
+            file_id.0 += 1;
+
+            let mut fs = FileSet::default();
+            fs.insert(core_file, VfsPath::new_virtual_path("/sysroot/core/lib.rs".to_string()));
+            roots.push(SourceRoot::new_library(fs));
+
+            change.change_file(core_file, Some(Arc::new(mini_core.source_code())));
+
+            let all_crates = crate_graph.crates_in_topological_order();
+
+            let core_crate = crate_graph.add_crate_root(
+                core_file,
+                Edition::Edition2021,
+                Some(CrateDisplayName::from_canonical_name("core".to_string())),
+                CfgOptions::default(),
+                CfgOptions::default(),
+                Env::default(),
+                Vec::new(),
+            );
+
+            for krate in all_crates {
+                crate_graph.add_dep(krate, CrateName::new("core").unwrap(), core_crate).unwrap();
+            }
+        }
         roots.push(SourceRoot::new_local(mem::take(&mut file_set)));
         change.set_roots(roots);
         change.set_crate_graph(crate_graph);
@@ -172,6 +205,7 @@ impl ChangeFixture {
     }
 }
 
+#[derive(Debug)]
 struct FileMeta {
     path: String,
     krate: Option<String>,
@@ -196,7 +230,7 @@ impl From<Fixture> for FileMeta {
             edition: f
                 .edition
                 .as_ref()
-                .map_or(Edition::Edition2018, |v| Edition::from_str(&v).unwrap()),
+                .map_or(Edition::Edition2018, |v| Edition::from_str(v).unwrap()),
             env: f.env.into_iter().collect(),
             introduce_new_source_root: f.introduce_new_source_root,
         }

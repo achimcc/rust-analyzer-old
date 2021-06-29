@@ -1,5 +1,6 @@
-//! FIXME: write short doc here
-
+//! Stateful iteration over token trees.
+//!
+//! We use this as the source of tokens for parser.
 use crate::{Leaf, Subtree, TokenTree};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -104,7 +105,7 @@ impl<'t> TokenBuffer<'t> {
 
     /// Creates a cursor referencing the first token in the buffer and able to
     /// traverse until the end of the buffer.
-    pub fn begin(&self) -> Cursor {
+    pub fn begin(&self) -> Cursor<'_> {
         Cursor::create(self, EntryPtr(EntryId(0), 0))
     }
 
@@ -132,7 +133,7 @@ impl<'a> TokenTreeRef<'a> {
     }
 }
 
-/// A safe version of `Cursor` from `syn` crate https://github.com/dtolnay/syn/blob/6533607f91686545cb034d2838beea338d9d0742/src/buffer.rs#L125
+/// A safe version of `Cursor` from `syn` crate <https://github.com/dtolnay/syn/blob/6533607f91686545cb034d2838beea338d9d0742/src/buffer.rs#L125>
 #[derive(Copy, Clone, Debug)]
 pub struct Cursor<'a> {
     buffer: &'a TokenBuffer<'a>,

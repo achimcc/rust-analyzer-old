@@ -1,4 +1,4 @@
-//! See https://github.com/matklad/cargo-xtask/.
+//! See <https://github.com/matklad/cargo-xtask/>.
 //!
 //! This binary defines various auxiliary build commands, which are not
 //! expressible with just `cargo`. Notably, it provides tests via `cargo test -p xtask`
@@ -18,7 +18,6 @@ mod install;
 mod release;
 mod dist;
 mod metrics;
-mod pre_cache;
 
 use anyhow::{bail, Result};
 use std::{
@@ -39,7 +38,6 @@ fn main() -> Result<()> {
         }
         flags::XtaskCmd::Install(cmd) => cmd.run(),
         flags::XtaskCmd::FuzzTests(_) => run_fuzzer(),
-        flags::XtaskCmd::PreCache(cmd) => cmd.run(),
         flags::XtaskCmd::Release(cmd) => cmd.run(),
         flags::XtaskCmd::Promote(cmd) => cmd.run(),
         flags::XtaskCmd::Dist(cmd) => cmd.run(),

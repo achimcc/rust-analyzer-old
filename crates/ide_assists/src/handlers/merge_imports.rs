@@ -27,14 +27,14 @@ pub(crate) fn merge_imports(acc: &mut Assists, ctx: &AssistContext) -> Option<()
     if let Some(use_item) = tree.syntax().parent().and_then(ast::Use::cast) {
         let (merged, to_remove) =
             next_prev().filter_map(|dir| neighbor(&use_item, dir)).find_map(|use_item2| {
-                try_merge_imports(&use_item, &use_item2, MergeBehavior::Full).zip(Some(use_item2))
+                try_merge_imports(&use_item, &use_item2, MergeBehavior::Crate).zip(Some(use_item2))
             })?;
 
         imports = Some((use_item, merged, to_remove));
     } else {
         let (merged, to_remove) =
             next_prev().filter_map(|dir| neighbor(&tree, dir)).find_map(|use_tree| {
-                try_merge_trees(&tree, &use_tree, MergeBehavior::Full).zip(Some(use_tree))
+                try_merge_trees(&tree, &use_tree, MergeBehavior::Crate).zip(Some(use_tree))
             })?;
 
         uses = Some((tree.clone(), merged, to_remove))
@@ -47,16 +47,16 @@ pub(crate) fn merge_imports(acc: &mut Assists, ctx: &AssistContext) -> Option<()
         target,
         |builder| {
             if let Some((to_replace, replacement, to_remove)) = imports {
-                let to_replace = builder.make_ast_mut(to_replace);
-                let to_remove = builder.make_ast_mut(to_remove);
+                let to_replace = builder.make_mut(to_replace);
+                let to_remove = builder.make_mut(to_remove);
 
                 ted::replace(to_replace.syntax(), replacement.syntax());
                 to_remove.remove();
             }
 
             if let Some((to_replace, replacement, to_remove)) = uses {
-                let to_replace = builder.make_ast_mut(to_replace);
-                let to_remove = builder.make_ast_mut(to_remove);
+                let to_replace = builder.make_mut(to_replace);
+                let to_remove = builder.make_mut(to_remove);
 
                 ted::replace(to_replace.syntax(), replacement.syntax());
                 to_remove.remove()
@@ -208,6 +208,20 @@ pub(crate) use std::fmt::Display;
 ",
             r"
 pub(crate) use std::fmt::{Debug, Display};
+",
+        )
+    }
+
+    #[test]
+    fn merge_pub_in_path_crate() {
+        check_assist(
+            merge_imports,
+            r"
+pub(in this::path) use std::fmt$0::Debug;
+pub(in this::path) use std::fmt::Display;
+",
+            r"
+pub(in this::path) use std::fmt::{Debug, Display};
 ",
         )
     }

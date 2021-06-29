@@ -1,8 +1,10 @@
+use std::convert::TryFrom;
+
 use ide_assists::utils::extract_trivial_expression;
 use itertools::Itertools;
 use syntax::{
     algo::non_trivia_sibling,
-    ast::{self, AstNode, AstToken},
+    ast::{self, AstNode, AstToken, IsString},
     Direction, NodeOrToken, SourceFile,
     SyntaxKind::{self, USE_TREE, WHITESPACE},
     SyntaxNode, SyntaxToken, TextRange, TextSize, T,
@@ -58,21 +60,13 @@ fn remove_newlines(edit: &mut TextEditBuilder, token: &SyntaxToken, range: TextR
         let pos: TextSize = (pos as u32).into();
         let offset = token.text_range().start() + range.start() + pos;
         if !edit.invalidates_offset(offset) {
-            remove_newline(edit, &token, offset);
+            remove_newline(edit, token, offset);
         }
     }
 }
 
 fn remove_newline(edit: &mut TextEditBuilder, token: &SyntaxToken, offset: TextSize) {
     if token.kind() != WHITESPACE || token.text().bytes().filter(|&b| b == b'\n').count() != 1 {
-        let mut string_open_quote = false;
-        if let Some(string) = ast::String::cast(token.clone()) {
-            if let Some(range) = string.open_quote_text_range() {
-                cov_mark::hit!(join_string_literal);
-                string_open_quote = range.end() == offset;
-            }
-        }
-
         let n_spaces_after_line_break = {
             let suff = &token.text()[TextRange::new(
                 offset - token.text_range().start() + TextSize::of('\n'),
@@ -81,8 +75,23 @@ fn remove_newline(edit: &mut TextEditBuilder, token: &SyntaxToken, offset: TextS
             suff.bytes().take_while(|&b| b == b' ').count()
         };
 
+        let mut no_space = false;
+        if let Some(string) = ast::String::cast(token.clone()) {
+            if let Some(range) = string.open_quote_text_range() {
+                cov_mark::hit!(join_string_literal_open_quote);
+                no_space |= range.end() == offset;
+            }
+            if let Some(range) = string.close_quote_text_range() {
+                cov_mark::hit!(join_string_literal_close_quote);
+                no_space |= range.start()
+                    == offset
+                        + TextSize::of('\n')
+                        + TextSize::try_from(n_spaces_after_line_break).unwrap();
+            }
+        }
+
         let range = TextRange::at(offset, ((n_spaces_after_line_break + 1) as u32).into());
-        let replace_with = if string_open_quote { "" } else { " " };
+        let replace_with = if no_space { "" } else { " " };
         edit.replace(range, replace_with.to_string());
         return;
     }
@@ -188,7 +197,7 @@ fn join_single_use_tree(edit: &mut TextEditBuilder, token: &SyntaxToken) -> Opti
 }
 
 fn is_trailing_comma(left: SyntaxKind, right: SyntaxKind) -> bool {
-    matches!((left, right), (T![,], T![')']) | (T![,], T![']']))
+    matches!((left, right), (T![,], T![')'] | T![']']))
 }
 
 fn compute_ws(left: SyntaxKind, right: SyntaxKind) -> &'static str {
@@ -797,22 +806,54 @@ fn foo() {
 
     #[test]
     fn join_string_literal() {
-        cov_mark::check!(join_string_literal);
-        check_join_lines(
-            r#"
+        {
+            cov_mark::check!(join_string_literal_open_quote);
+            check_join_lines(
+                r#"
 fn main() {
     $0"
 hello
 ";
 }
 "#,
-            r#"
+                r#"
 fn main() {
     $0"hello
 ";
 }
 "#,
-        );
+            );
+        }
+
+        {
+            cov_mark::check!(join_string_literal_close_quote);
+            check_join_lines(
+                r#"
+fn main() {
+    $0"hello
+";
+}
+"#,
+                r#"
+fn main() {
+    $0"hello";
+}
+"#,
+            );
+            check_join_lines(
+                r#"
+fn main() {
+    $0r"hello
+    ";
+}
+"#,
+                r#"
+fn main() {
+    $0r"hello";
+}
+"#,
+            );
+        }
 
         check_join_lines(
             r#"

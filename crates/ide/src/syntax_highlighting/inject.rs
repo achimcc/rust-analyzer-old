@@ -6,7 +6,7 @@ use either::Either;
 use hir::{InFile, Semantics};
 use ide_db::{call_info::ActiveParameter, helpers::rust_doc::is_rust_fence, SymbolKind};
 use syntax::{
-    ast::{self, AstNode},
+    ast::{self, AstNode, IsString},
     AstToken, NodeOrToken, SyntaxNode, SyntaxToken, TextRange, TextSize,
 };
 
@@ -23,7 +23,7 @@ pub(super) fn ra_fixture(
     literal: ast::String,
     expanded: SyntaxToken,
 ) -> Option<()> {
-    let active_parameter = ActiveParameter::at_token(&sema, expanded)?;
+    let active_parameter = ActiveParameter::at_token(sema, expanded)?;
     if !active_parameter.ident().map_or(false, |name| name.text().starts_with("ra_fixture")) {
         return None;
     }
@@ -124,7 +124,7 @@ pub(super) fn doc_comment(
     }
 
     for attr in attributes.by_key("doc").attrs() {
-        let InFile { file_id, value: src } = attrs_source_map.source_of(&attr);
+        let InFile { file_id, value: src } = attrs_source_map.source_of(attr);
         if file_id != node.file_id {
             continue;
         }
@@ -232,7 +232,7 @@ fn find_doc_string_in_attr(attr: &hir::Attr, it: &ast::Attr) -> Option<ast::Stri
                     string.text().get(1..string.text().len() - 1).map_or(false, |it| it == text)
                 })
         }
-        _ => return None,
+        _ => None,
     }
 }
 

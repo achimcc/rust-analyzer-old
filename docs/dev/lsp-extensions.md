@@ -1,5 +1,5 @@
 <!---
-lsp_ext.rs hash: 28a9d5a24b7ca396
+lsp_ext.rs hash: 49f253e4a9307d4f
 
 If you need to change the above hash to make the test pass, please check if you
 need to adjust this doc as well and ping this issue:
@@ -25,15 +25,21 @@ rust-analyzer supports clangd's extension for opting into UTF-8 as the coordinat
 
 https://clangd.llvm.org/extensions.html#utf-8-offsets
 
-## `initializationOptions`
+## Configuration in `initializationOptions`
 
-For `initializationOptions`, `rust-analyzer` expects `"rust-analyzer"` section of the configuration.
-That is, `rust-analyzer` usually sends `"workspace/configuration"` request with `{ "items": ["rust-analyzer"] }` payload.
-`initializationOptions` should contain the same data that would be in the first item of the result.
+**Issue:** https://github.com/microsoft/language-server-protocol/issues/567
+
+The `initializationOptions` filed of the `InitializeParams` of the initialization request should contain `"rust-analyzer"` section of the configuration.
+
+`rust-analyzer` normally sends a `"workspace/configuration"` request with `{ "items": ["rust-analyzer"] }` payload.
+However, the server can't do this during initialization.
+At the same time some essential configuration parameters are needed early on, before servicing requests.
+For this reason, we ask that `initializationOptions` contains the configuration, as if the server did make a `"workspace/configuration"` request.
+
 If a language client does not know about `rust-analyzer`'s configuration options it can get sensible defaults by doing any of the following:
  * Not sending `initializationOptions`
- * Send `"initializationOptions": null`
- * Send `"initializationOptions": {}`
+ * Sending `"initializationOptions": null`
+ * Sending `"initializationOptions": {}`
 
 ## Snippet `TextEdit`
 
@@ -464,7 +470,7 @@ Clients are discouraged from but are allowed to use the `health` status to decid
 **Request:**
 
 ```typescript
-interface SyntaxTeeParams {
+interface SyntaxTreeParams {
     textDocument: TextDocumentIdentifier,
     range?: Range,
 }
@@ -485,6 +491,32 @@ Primarily for debugging, but very useful for all people working on rust-analyzer
 
 Returns a textual representation of the HIR of the function containing the cursor.
 For debugging or when working on rust-analyzer itself.
+
+## View ItemTree
+
+**Method:** `rust-analyzer/viewItemTree`
+
+**Request:**
+
+```typescript
+interface ViewItemTreeParams {
+    textDocument: TextDocumentIdentifier,
+}
+```
+
+**Response:** `string`
+
+Returns a textual representation of the `ItemTree` of the currently open file, for debugging.
+
+## View Crate Graph
+
+**Method:** `rust-analyzer/viewCrateGraph`
+
+**Request:** `null`
+
+**Response:** `string`
+
+Renders rust-analyzer's crate graph as an SVG image.
 
 ## Expand Macro
 
@@ -638,5 +670,39 @@ export interface MoveItemParams {
 export const enum Direction {
     Up = "Up",
     Down = "Down"
+}
+```
+
+## Workspace Symbols Filtering
+
+**Issue:** https://github.com/rust-analyzer/rust-analyzer/pull/7698
+
+**Experimental Server Capability:** `{ "workspaceSymbolScopeKindFiltering": boolean }`
+
+Extends the existing `workspace/symbol` request with ability to filter symbols by broad scope and kind of symbol.
+If this capability is set, `workspace/symbol` parameter gains two new optional fields:
+
+
+```typescript
+interface WorkspaceSymbolParams {
+    /**
+     * Return only the symbols defined in the specified scope.
+     */
+    searchScope?: WorkspaceSymbolSearchScope;
+    /**
+     * Return only the symbols of specified kinds.
+     */
+    searchKind?: WorkspaceSymbolSearchKind;
+    ...
+}
+
+const enum WorkspaceSymbolSearchScope {
+    Workspace = "workspace",
+    WorkspaceAndDependencies = "workspaceAndDependencies"
+}
+
+const enum WorkspaceSymbolSearchKind {
+    OnlyTypes = "onlyTypes",
+    AllSymbols = "allSymbols"
 }
 ```

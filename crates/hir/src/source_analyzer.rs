@@ -143,7 +143,7 @@ impl SourceAnalyzer {
         &self,
         db: &dyn HirDatabase,
         call: &ast::MethodCallExpr,
-    ) -> Option<FunctionId> {
+    ) -> Option<(FunctionId, Substitution)> {
         let expr_id = self.expr_id(db, &call.clone().into())?;
         self.infer.as_ref()?.method_resolution(expr_id)
     }
@@ -161,7 +161,7 @@ impl SourceAnalyzer {
         &self,
         db: &dyn HirDatabase,
         field: &ast::RecordExprField,
-    ) -> Option<(Field, Option<Local>)> {
+    ) -> Option<(Field, Option<Local>, Type)> {
         let record_expr = ast::RecordExpr::cast(field.syntax().parent().and_then(|p| p.parent())?)?;
         let expr = ast::Expr::from(record_expr);
         let expr_id = self.body_source_map.as_ref()?.node_expr(InFile::new(self.file_id, &expr))?;
@@ -178,10 +178,13 @@ impl SourceAnalyzer {
                 _ => None,
             }
         };
+        let (_, subst) = self.infer.as_ref()?.type_of_expr.get(expr_id)?.as_adt()?;
         let variant = self.infer.as_ref()?.variant_resolution_for_expr(expr_id)?;
         let variant_data = variant.variant_data(db.upcast());
         let field = FieldId { parent: variant, local_id: variant_data.field(&local_name)? };
-        Some((field.into(), local))
+        let field_ty =
+            db.field_types(variant).get(field.local_id)?.clone().substitute(&Interner, subst);
+        Some((field.into(), local, Type::new_with_resolver(db, &self.resolver, field_ty)?))
     }
 
     pub(crate) fn resolve_record_pat_field(
@@ -219,7 +222,7 @@ impl SourceAnalyzer {
             Pat::Path(path) => path,
             _ => return None,
         };
-        let res = resolve_hir_path(db, &self.resolver, &path)?;
+        let res = resolve_hir_path(db, &self.resolver, path)?;
         match res {
             PathResolution::Def(def) => Some(def),
             _ => None,
@@ -283,10 +286,10 @@ impl SourceAnalyzer {
 
         // This must be a normal source file rather than macro file.
         let hygiene = Hygiene::new(db.upcast(), self.file_id);
-        let ctx = body::LowerCtx::with_hygiene(&hygiene);
+        let ctx = body::LowerCtx::with_hygiene(db.upcast(), &hygiene);
         let hir_path = Path::from_src(path.clone(), &ctx)?;
 
-        // Case where path is a qualifier of another path, e.g. foo::bar::Baz where we
+        // Case where path is a qualifier of another path, e.g. foo::bar::Baz where we are
         // trying to resolve foo::bar.
         if let Some(outer_path) = parent().and_then(ast::Path::cast) {
             if let Some(qualifier) = outer_path.qualifier() {
@@ -295,8 +298,21 @@ impl SourceAnalyzer {
                 }
             }
         }
+        // Case where path is a qualifier of a use tree, e.g. foo::bar::{Baz, Qux} where we are
+        // trying to resolve foo::bar.
+        if let Some(use_tree) = parent().and_then(ast::UseTree::cast) {
+            if let Some(qualifier) = use_tree.path() {
+                if path == &qualifier && use_tree.coloncolon_token().is_some() {
+                    return resolve_hir_path_qualifier(db, &self.resolver, &hir_path);
+                }
+            }
+        }
 
-        resolve_hir_path_(db, &self.resolver, &hir_path, prefer_value_ns)
+        if parent().map_or(false, |it| ast::Visibility::can_cast(it.kind())) {
+            resolve_hir_path_qualifier(db, &self.resolver, &hir_path)
+        } else {
+            resolve_hir_path_(db, &self.resolver, &hir_path, prefer_value_ns)
+        }
     }
 
     pub(crate) fn record_literal_missing_fields(
@@ -313,7 +329,7 @@ impl SourceAnalyzer {
 
         let (variant, missing_fields, _exhaustive) =
             record_literal_missing_fields(db, infer, expr_id, &body[expr_id])?;
-        let res = self.missing_fields(db, krate, &substs, variant, missing_fields);
+        let res = self.missing_fields(db, krate, substs, variant, missing_fields);
         Some(res)
     }
 
@@ -331,7 +347,7 @@ impl SourceAnalyzer {
 
         let (variant, missing_fields, _exhaustive) =
             record_pattern_missing_fields(db, infer, pat_id, &body[pat_id])?;
-        let res = self.missing_fields(db, krate, &substs, variant, missing_fields);
+        let res = self.missing_fields(db, krate, substs, variant, missing_fields);
         Some(res)
     }
 

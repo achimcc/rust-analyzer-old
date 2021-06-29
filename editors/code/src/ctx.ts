@@ -7,6 +7,15 @@ import { createClient } from './client';
 import { isRustEditor, RustEditor } from './util';
 import { ServerStatusParams } from './lsp_ext';
 
+export type Workspace =
+    {
+        kind: 'Workspace Folder';
+    }
+    | {
+        kind: 'Detached Files';
+        files: vscode.TextDocument[];
+    };
+
 export class Ctx {
     private constructor(
         readonly config: Config,
@@ -22,14 +31,15 @@ export class Ctx {
         config: Config,
         extCtx: vscode.ExtensionContext,
         serverPath: string,
-        cwd: string,
+        workspace: Workspace,
     ): Promise<Ctx> {
-        const client = createClient(serverPath, cwd, config.serverExtraEnv);
+        const client = createClient(serverPath, workspace, config.serverExtraEnv);
 
         const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
         extCtx.subscriptions.push(statusBar);
         statusBar.text = "rust-analyzer";
         statusBar.tooltip = "ready";
+        statusBar.command = "rust-analyzer.analyzerStatus";
         statusBar.show();
 
         const res = new Ctx(config, extCtx, client, serverPath, statusBar);

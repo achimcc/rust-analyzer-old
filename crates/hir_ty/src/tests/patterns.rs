@@ -1,6 +1,6 @@
 use expect_test::expect;
 
-use super::{check_infer, check_infer_with_mismatches, check_types};
+use super::{check, check_infer, check_infer_with_mismatches, check_types};
 
 #[test]
 fn infer_pattern() {
@@ -20,6 +20,8 @@ fn infer_pattern() {
                 let h = val;
             }
 
+            if let x @ true = &true {}
+
             let lambda = |a: u64, b, c: i32| { a + b; c };
 
             let ref ref_to_x = x;
@@ -30,7 +32,7 @@ fn infer_pattern() {
         "#,
         expect![[r#"
             8..9 'x': &i32
-            17..368 '{     ...o_x; }': ()
+            17..400 '{     ...o_x; }': ()
             27..28 'y': &i32
             31..32 'x': &i32
             42..44 '&z': &i32
@@ -59,24 +61,31 @@ fn infer_pattern() {
             176..204 '{     ...     }': ()
             190..191 'h': {unknown}
             194..197 'val': {unknown}
-            214..220 'lambda': |u64, u64, i32| -> i32
-            223..255 '|a: u6...b; c }': |u64, u64, i32| -> i32
-            224..225 'a': u64
-            232..233 'b': u64
-            235..236 'c': i32
-            243..255 '{ a + b; c }': i32
-            245..246 'a': u64
-            245..250 'a + b': u64
-            249..250 'b': u64
-            252..253 'c': i32
-            266..278 'ref ref_to_x': &&i32
-            281..282 'x': &i32
-            292..301 'mut mut_x': &i32
-            304..305 'x': &i32
-            315..335 'ref mu...f_to_x': &mut &i32
-            338..339 'x': &i32
-            349..350 'k': &mut &i32
-            353..365 'mut_ref_to_x': &mut &i32
+            210..236 'if let...rue {}': ()
+            217..225 'x @ true': &bool
+            221..225 'true': bool
+            221..225 'true': bool
+            228..233 '&true': &bool
+            229..233 'true': bool
+            234..236 '{}': ()
+            246..252 'lambda': |u64, u64, i32| -> i32
+            255..287 '|a: u6...b; c }': |u64, u64, i32| -> i32
+            256..257 'a': u64
+            264..265 'b': u64
+            267..268 'c': i32
+            275..287 '{ a + b; c }': i32
+            277..278 'a': u64
+            277..282 'a + b': u64
+            281..282 'b': u64
+            284..285 'c': i32
+            298..310 'ref ref_to_x': &&i32
+            313..314 'x': &i32
+            324..333 'mut mut_x': &i32
+            336..337 'x': &i32
+            347..367 'ref mu...f_to_x': &mut &i32
+            370..371 'x': &i32
+            381..382 'k': &mut &i32
+            385..397 'mut_ref_to_x': &mut &i32
         "#]],
     );
 }
@@ -243,8 +252,8 @@ fn infer_pattern_match_slice() {
         expect![[r#"
             10..209 '{     ...   } }': ()
             20..25 'slice': &[f64]
-            36..42 '&[0.0]': &[f64; _]
-            37..42 '[0.0]': [f64; _]
+            36..42 '&[0.0]': &[f64; 1]
+            37..42 '[0.0]': [f64; 1]
             38..41 '0.0': f64
             48..207 'match ...     }': ()
             54..59 'slice': &[f64]
@@ -345,19 +354,19 @@ fn infer_pattern_match_arr() {
         "#,
         expect![[r#"
             10..179 '{     ...   } }': ()
-            20..23 'arr': [f64; _]
-            36..46 '[0.0, 1.0]': [f64; _]
+            20..23 'arr': [f64; 2]
+            36..46 '[0.0, 1.0]': [f64; 2]
             37..40 '0.0': f64
             42..45 '1.0': f64
             52..177 'match ...     }': ()
-            58..61 'arr': [f64; _]
-            72..80 '[1.0, a]': [f64; _]
+            58..61 'arr': [f64; 2]
+            72..80 '[1.0, a]': [f64; 2]
             73..76 '1.0': f64
             73..76 '1.0': f64
             78..79 'a': f64
             84..110 '{     ...     }': ()
             98..99 'a': f64
-            120..126 '[b, c]': [f64; _]
+            120..126 '[b, c]': [f64; 2]
             121..122 'b': f64
             124..125 'c': f64
             130..171 '{     ...     }': ()
@@ -509,45 +518,24 @@ fn infer_generics_in_patterns() {
 
 #[test]
 fn infer_const_pattern() {
-    check_infer_with_mismatches(
+    check(
         r#"
-        enum Option<T> { None }
-        use Option::None;
-        struct Foo;
-        const Bar: usize = 1;
+enum Option<T> { None }
+use Option::None;
+struct Foo;
+const Bar: usize = 1;
 
-        fn test() {
-            let a: Option<u32> = None;
-            let b: Option<i64> = match a {
-                None => None,
-            };
-            let _: () = match () { Foo => Foo }; // Expected mismatch
-            let _: () = match () { Bar => Bar }; // Expected mismatch
-        }
+fn test() {
+    let a: Option<u32> = None;
+    let b: Option<i64> = match a {
+        None => None,
+    };
+    let _: () = match () { Foo => () };
+                        // ^^^ expected (), got Foo
+    let _: () = match () { Bar => () };
+                        // ^^^ expected (), got usize
+}
         "#,
-        expect![[r#"
-            73..74 '1': usize
-            87..309 '{     ...atch }': ()
-            97..98 'a': Option<u32>
-            114..118 'None': Option<u32>
-            128..129 'b': Option<i64>
-            145..182 'match ...     }': Option<i64>
-            151..152 'a': Option<u32>
-            163..167 'None': Option<u32>
-            171..175 'None': Option<i64>
-            192..193 '_': ()
-            200..223 'match ... Foo }': Foo
-            206..208 '()': ()
-            211..214 'Foo': Foo
-            218..221 'Foo': Foo
-            254..255 '_': ()
-            262..285 'match ... Bar }': usize
-            268..270 '()': ()
-            273..276 'Bar': usize
-            280..283 'Bar': usize
-            200..223: expected (), got Foo
-            262..285: expected (), got usize
-        "#]],
     );
 }
 
@@ -583,48 +571,44 @@ fn main() {
 fn match_ergonomics_in_closure_params() {
     check_infer(
         r#"
-        #[lang = "fn_once"]
-        trait FnOnce<Args> {
-            type Output;
-        }
+//- minicore: fn
+fn foo<T, U, F: FnOnce(T) -> U>(t: T, f: F) -> U { loop {} }
 
-        fn foo<T, U, F: FnOnce(T) -> U>(t: T, f: F) -> U { loop {} }
-
-        fn test() {
-            foo(&(1, "a"), |&(x, y)| x); // normal, no match ergonomics
-            foo(&(1, "a"), |(x, y)| x);
-        }
-        "#,
+fn test() {
+    foo(&(1, "a"), |&(x, y)| x); // normal, no match ergonomics
+    foo(&(1, "a"), |(x, y)| x);
+}
+"#,
         expect![[r#"
-            93..94 't': T
-            99..100 'f': F
-            110..121 '{ loop {} }': U
-            112..119 'loop {}': !
-            117..119 '{}': ()
-            133..232 '{     ... x); }': ()
-            139..142 'foo': fn foo<&(i32, &str), i32, |&(i32, &str)| -> i32>(&(i32, &str), |&(i32, &str)| -> i32) -> i32
-            139..166 'foo(&(...y)| x)': i32
-            143..152 '&(1, "a")': &(i32, &str)
-            144..152 '(1, "a")': (i32, &str)
-            145..146 '1': i32
-            148..151 '"a"': &str
-            154..165 '|&(x, y)| x': |&(i32, &str)| -> i32
-            155..162 '&(x, y)': &(i32, &str)
-            156..162 '(x, y)': (i32, &str)
-            157..158 'x': i32
-            160..161 'y': &str
-            164..165 'x': i32
-            203..206 'foo': fn foo<&(i32, &str), &i32, |&(i32, &str)| -> &i32>(&(i32, &str), |&(i32, &str)| -> &i32) -> &i32
-            203..229 'foo(&(...y)| x)': &i32
-            207..216 '&(1, "a")': &(i32, &str)
-            208..216 '(1, "a")': (i32, &str)
-            209..210 '1': i32
-            212..215 '"a"': &str
-            218..228 '|(x, y)| x': |&(i32, &str)| -> &i32
-            219..225 '(x, y)': (i32, &str)
-            220..221 'x': &i32
-            223..224 'y': &&str
-            227..228 'x': &i32
+            32..33 't': T
+            38..39 'f': F
+            49..60 '{ loop {} }': U
+            51..58 'loop {}': !
+            56..58 '{}': ()
+            72..171 '{     ... x); }': ()
+            78..81 'foo': fn foo<&(i32, &str), i32, |&(i32, &str)| -> i32>(&(i32, &str), |&(i32, &str)| -> i32) -> i32
+            78..105 'foo(&(...y)| x)': i32
+            82..91 '&(1, "a")': &(i32, &str)
+            83..91 '(1, "a")': (i32, &str)
+            84..85 '1': i32
+            87..90 '"a"': &str
+            93..104 '|&(x, y)| x': |&(i32, &str)| -> i32
+            94..101 '&(x, y)': &(i32, &str)
+            95..101 '(x, y)': (i32, &str)
+            96..97 'x': i32
+            99..100 'y': &str
+            103..104 'x': i32
+            142..145 'foo': fn foo<&(i32, &str), &i32, |&(i32, &str)| -> &i32>(&(i32, &str), |&(i32, &str)| -> &i32) -> &i32
+            142..168 'foo(&(...y)| x)': &i32
+            146..155 '&(1, "a")': &(i32, &str)
+            147..155 '(1, "a")': (i32, &str)
+            148..149 '1': i32
+            151..154 '"a"': &str
+            157..167 '|(x, y)| x': |&(i32, &str)| -> &i32
+            158..164 '(x, y)': (i32, &str)
+            159..160 'x': &i32
+            162..163 'y': &&str
+            166..167 'x': &i32
         "#]],
     );
 }
@@ -703,7 +687,7 @@ fn box_pattern() {
 
 #[test]
 fn tuple_ellipsis_pattern() {
-    check_infer(
+    check_infer_with_mismatches(
         r#"
 fn foo(tuple: (u8, i16, f32)) {
     match tuple {
@@ -732,7 +716,7 @@ fn foo(tuple: (u8, i16, f32)) {
             111..112 'a': u8
             114..115 'b': i16
             124..126 '{}': ()
-            136..142 '(a, b)': (u8, i16, f32)
+            136..142 '(a, b)': (u8, i16)
             137..138 'a': u8
             140..141 'b': i16
             146..161 '{/*too short*/}': ()
@@ -744,6 +728,8 @@ fn foo(tuple: (u8, i16, f32)) {
             186..200 '{/*too long*/}': ()
             209..210 '_': (u8, i16, f32)
             214..216 '{}': ()
+            136..142: expected (u8, i16, f32), got (u8, i16)
+            170..182: expected (u8, i16, f32), got (u8, i16, f32, {unknown})
         "#]],
     );
 }
@@ -850,4 +836,56 @@ fn f(e: Enum) {
 }
     "#,
     )
+}
+
+#[test]
+fn type_mismatch_in_or_pattern() {
+    check_infer_with_mismatches(
+        r#"
+fn main() {
+    match (false,) {
+        (true | (),) => {}
+        (() | true,) => {}
+        (_ | (),) => {}
+        (() | _,) => {}
+    }
+}
+"#,
+        expect![[r#"
+            10..142 '{     ...   } }': ()
+            16..140 'match ...     }': ()
+            22..30 '(false,)': (bool,)
+            23..28 'false': bool
+            41..53 '(true | (),)': (bool,)
+            42..46 'true': bool
+            42..46 'true': bool
+            42..51 'true | ()': bool
+            49..51 '()': ()
+            57..59 '{}': ()
+            68..80 '(() | true,)': ((),)
+            69..71 '()': ()
+            69..78 '() | true': ()
+            74..78 'true': bool
+            74..78 'true': bool
+            84..86 '{}': ()
+            95..104 '(_ | (),)': (bool,)
+            96..97 '_': bool
+            96..102 '_ | ()': bool
+            100..102 '()': ()
+            108..110 '{}': ()
+            119..128 '(() | _,)': ((),)
+            120..122 '()': ()
+            120..126 '() | _': ()
+            125..126 '_': bool
+            132..134 '{}': ()
+            49..51: expected bool, got ()
+            68..80: expected (bool,), got ((),)
+            69..71: expected bool, got ()
+            69..78: expected bool, got ()
+            100..102: expected bool, got ()
+            119..128: expected (bool,), got ((),)
+            120..122: expected bool, got ()
+            120..126: expected bool, got ()
+        "#]],
+    );
 }

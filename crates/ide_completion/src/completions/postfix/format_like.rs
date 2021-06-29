@@ -1,18 +1,18 @@
-// Feature: Format String Completion.
+// Feature: Format String Completion
 //
 // `"Result {result} is {2 + 2}"` is expanded to the `"Result {} is {}", result, 2 + 2`.
 //
 // The following postfix snippets are available:
 //
-// - `format` -> `format!(...)`
-// - `panic` -> `panic!(...)`
-// - `println` -> `println!(...)`
-// - `log`:
-//   + `logd` -> `log::debug!(...)`
-//   + `logt` -> `log::trace!(...)`
-//   + `logi` -> `log::info!(...)`
-//   + `logw` -> `log::warn!(...)`
-//   + `loge` -> `log::error!(...)`
+// * `format` -> `format!(...)`
+// * `panic` -> `panic!(...)`
+// * `println` -> `println!(...)`
+// * `log`:
+// ** `logd` -> `log::debug!(...)`
+// ** `logt` -> `log::trace!(...)`
+// ** `logi` -> `log::info!(...)`
+// ** `logw` -> `log::warn!(...)`
+// ** `loge` -> `log::error!(...)`
 //
 // image::https://user-images.githubusercontent.com/48062697/113020656-b560f500-917a-11eb-87de-02991f61beb8.gif[]
 
@@ -53,7 +53,7 @@ pub(crate) fn add_format_like_completions(
         for (label, macro_name) in KINDS {
             let snippet = parser.into_suggestion(macro_name);
 
-            postfix_snippet(ctx, cap, &dot_receiver, label, macro_name, &snippet).add_to(acc);
+            postfix_snippet(ctx, cap, dot_receiver, label, macro_name, &snippet).add_to(acc);
         }
     }
 }
@@ -91,7 +91,7 @@ enum State {
 impl FormatStrParser {
     pub(crate) fn new(input: String) -> Self {
         Self {
-            input: input,
+            input,
             output: String::new(),
             extracted_expressions: Vec::new(),
             state: State::NotExpr,

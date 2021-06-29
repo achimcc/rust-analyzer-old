@@ -3,7 +3,6 @@
 mod lower_use;
 
 use crate::intern::Interned;
-use std::sync::Arc;
 
 use either::Either;
 use hir_expand::name::{name, AsName};
@@ -16,7 +15,7 @@ use crate::{
     type_ref::{LifetimeRef, TypeBound, TypeRef},
 };
 
-pub(super) use lower_use::lower_use_tree;
+pub(super) use lower_use::convert_path;
 
 /// Converts an `ast::Path` to `Path`. Works with use trees.
 /// It correctly handles `$crate` based path from macro call.
@@ -36,7 +35,7 @@ pub(super) fn lower_path(mut path: ast::Path, ctx: &LowerCtx) -> Option<Path> {
         match segment.kind()? {
             ast::PathSegmentKind::Name(name_ref) => {
                 // FIXME: this should just return name
-                match hygiene.name_ref_to_name(name_ref) {
+                match hygiene.name_ref_to_name(ctx.db.upcast(), name_ref) {
                     Either::Left(name) => {
                         let args = segment
                             .generic_arg_list()
@@ -48,7 +47,7 @@ pub(super) fn lower_path(mut path: ast::Path, ctx: &LowerCtx) -> Option<Path> {
                                     segment.ret_type(),
                                 )
                             })
-                            .map(Arc::new);
+                            .map(Interned::new);
                         segments.push(name);
                         generic_args.push(args)
                     }
@@ -87,13 +86,13 @@ pub(super) fn lower_path(mut path: ast::Path, ctx: &LowerCtx) -> Option<Path> {
                         // Insert the type reference (T in the above example) as Self parameter for the trait
                         let last_segment =
                             generic_args.iter_mut().rev().nth(num_segments.saturating_sub(1))?;
-                        if last_segment.is_none() {
-                            *last_segment = Some(Arc::new(GenericArgs::empty()));
+                        let mut args_inner = match last_segment {
+                            Some(it) => it.as_ref().clone(),
+                            None => GenericArgs::empty(),
                         };
-                        let args = last_segment.as_mut().unwrap();
-                        let mut args_inner = Arc::make_mut(args);
                         args_inner.has_self_type = true;
                         args_inner.args.insert(0, GenericArg::Type(self_type));
+                        *last_segment = Some(Interned::new(args_inner));
                     }
                 }
             }
@@ -133,7 +132,7 @@ pub(super) fn lower_path(mut path: ast::Path, ctx: &LowerCtx) -> Option<Path> {
     // We follow what it did anyway :)
     if segments.len() == 1 && kind == PathKind::Plain {
         if let Some(_macro_call) = path.syntax().parent().and_then(ast::MacroCall::cast) {
-            if let Some(crate_id) = hygiene.local_inner_macros(path) {
+            if let Some(crate_id) = hygiene.local_inner_macros(ctx.db.upcast(), path) {
                 kind = PathKind::DollarCrate(crate_id);
             }
         }
@@ -171,7 +170,9 @@ pub(super) fn lower_generic_args(
                     let name = name_ref.as_name();
                     let type_ref = assoc_type_arg.ty().map(|it| TypeRef::from_ast(lower_ctx, it));
                     let bounds = if let Some(l) = assoc_type_arg.type_bound_list() {
-                        l.bounds().map(|it| TypeBound::from_ast(lower_ctx, it)).collect()
+                        l.bounds()
+                            .map(|it| Interned::new(TypeBound::from_ast(lower_ctx, it)))
+                            .collect()
                     } else {
                         Vec::new()
                     };
@@ -204,26 +205,29 @@ fn lower_generic_args_from_fn_path(
 ) -> Option<GenericArgs> {
     let mut args = Vec::new();
     let mut bindings = Vec::new();
-    if let Some(params) = params {
-        let mut param_types = Vec::new();
-        for param in params.params() {
-            let type_ref = TypeRef::from_ast_opt(&ctx, param.ty());
-            param_types.push(type_ref);
-        }
-        let arg = GenericArg::Type(TypeRef::Tuple(param_types));
-        args.push(arg);
+    let params = params?;
+    let mut param_types = Vec::new();
+    for param in params.params() {
+        let type_ref = TypeRef::from_ast_opt(ctx, param.ty());
+        param_types.push(type_ref);
     }
+    let arg = GenericArg::Type(TypeRef::Tuple(param_types));
+    args.push(arg);
     if let Some(ret_type) = ret_type {
-        let type_ref = TypeRef::from_ast_opt(&ctx, ret_type.ty());
+        let type_ref = TypeRef::from_ast_opt(ctx, ret_type.ty());
+        bindings.push(AssociatedTypeBinding {
+            name: name![Output],
+            type_ref: Some(type_ref),
+            bounds: Vec::new(),
+        });
+    } else {
+        // -> ()
+        let type_ref = TypeRef::Tuple(Vec::new());
         bindings.push(AssociatedTypeBinding {
             name: name![Output],
             type_ref: Some(type_ref),
             bounds: Vec::new(),
         });
     }
-    if args.is_empty() && bindings.is_empty() {
-        None
-    } else {
-        Some(GenericArgs { args, has_self_type: false, bindings })
-    }
+    Some(GenericArgs { args, has_self_type: false, bindings })
 }

@@ -4,7 +4,7 @@
 
 use std::{
     collections::HashMap,
-    fmt::{self, Debug},
+    fmt::{self, Debug, Display},
     hash::{BuildHasherDefault, Hash, Hasher},
     ops::Deref,
     sync::Arc,
@@ -171,6 +171,12 @@ impl<T: Debug + Internable + ?Sized> Debug for Interned<T> {
     }
 }
 
+impl<T: Display + Internable + ?Sized> Display for Interned<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (*self.arc).fmt(f)
+    }
+}
+
 pub struct InternStorage<T: ?Sized> {
     map: OnceCell<InternMap<T>>,
 }
@@ -210,7 +216,10 @@ pub use crate::_impl_internable as impl_internable;
 impl_internable!(
     crate::type_ref::TypeRef,
     crate::type_ref::TraitRef,
+    crate::type_ref::TypeBound,
     crate::path::ModPath,
+    crate::path::GenericArgs,
+    crate::attr::AttrInput,
     GenericParams,
     str,
 );

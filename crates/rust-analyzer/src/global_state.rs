@@ -7,7 +7,7 @@ use std::{sync::Arc, time::Instant};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use flycheck::FlycheckHandle;
-use ide::{Analysis, AnalysisHost, Cancelable, Change, FileId};
+use ide::{Analysis, AnalysisHost, Cancellable, Change, FileId};
 use ide_db::base_db::{CrateId, VfsPath};
 use lsp_types::{SemanticTokens, Url};
 use parking_lot::{Mutex, RwLock};
@@ -84,6 +84,7 @@ pub(crate) struct GlobalState {
     pub(crate) workspace_build_data: Option<BuildDataResult>,
     pub(crate) fetch_build_data_queue:
         OpQueue<BuildDataCollector, Option<anyhow::Result<BuildDataResult>>>,
+    pub(crate) prime_caches_queue: OpQueue<(), ()>,
 
     latest_requests: Arc<RwLock<LatestRequests>>,
 }
@@ -118,12 +119,12 @@ impl GlobalState {
 
         let analysis_host = AnalysisHost::new(config.lru_capacity());
         let (flycheck_sender, flycheck_receiver) = unbounded();
-        GlobalState {
+        let mut this = GlobalState {
             sender,
             req_queue: ReqQueue::default(),
             task_pool,
             loader,
-            config: Arc::new(config),
+            config: Arc::new(config.clone()),
             analysis_host,
             diagnostics: Default::default(),
             mem_docs: FxHashMap::default(),
@@ -146,10 +147,14 @@ impl GlobalState {
             workspaces: Arc::new(Vec::new()),
             fetch_workspaces_queue: OpQueue::default(),
             workspace_build_data: None,
+            prime_caches_queue: OpQueue::default(),
 
             fetch_build_data_queue: OpQueue::default(),
             latest_requests: Default::default(),
-        }
+        };
+        // Apply any required database inputs from the config.
+        this.update_configuration(config);
+        this
     }
 
     pub(crate) fn process_changes(&mut self) -> bool {
@@ -189,7 +194,7 @@ impl GlobalState {
                 change.change_file(file.file_id, text);
             }
             if has_fs_changes {
-                let roots = self.source_root_config.partition(&vfs);
+                let roots = self.source_root_config.partition(vfs);
                 change.set_roots(roots);
             }
             change
@@ -278,7 +283,7 @@ impl GlobalStateSnapshot {
         file_id_to_url(&self.vfs.read().0, id)
     }
 
-    pub(crate) fn file_line_index(&self, file_id: FileId) -> Cancelable<LineIndex> {
+    pub(crate) fn file_line_index(&self, file_id: FileId) -> Cancellable<LineIndex> {
         let endings = self.vfs.read().1[&file_id];
         let index = self.analysis.file_line_index(file_id)?;
         let res = LineIndex { index, endings, encoding: self.config.offset_encoding() };
@@ -286,7 +291,7 @@ impl GlobalStateSnapshot {
     }
 
     pub(crate) fn url_file_version(&self, url: &Url) -> Option<i32> {
-        let path = from_proto::vfs_path(&url).ok()?;
+        let path = from_proto::vfs_path(url).ok()?;
         Some(self.mem_docs.get(&path)?.version)
     }
 
@@ -295,7 +300,7 @@ impl GlobalStateSnapshot {
         base.pop();
         let path = base.join(&path.path).unwrap();
         let path = path.as_path().unwrap();
-        url_from_abs_path(&path)
+        url_from_abs_path(path)
     }
 
     pub(crate) fn cargo_target_for_crate_root(
@@ -307,9 +312,10 @@ impl GlobalStateSnapshot {
         let path = path.as_path()?;
         self.workspaces.iter().find_map(|ws| match ws {
             ProjectWorkspace::Cargo { cargo, .. } => {
-                cargo.target_by_root(&path).map(|it| (cargo, it))
+                cargo.target_by_root(path).map(|it| (cargo, it))
             }
             ProjectWorkspace::Json { .. } => None,
+            ProjectWorkspace::DetachedFiles { .. } => None,
         })
     }
 }
@@ -317,7 +323,7 @@ impl GlobalStateSnapshot {
 pub(crate) fn file_id_to_url(vfs: &vfs::Vfs, id: FileId) -> Url {
     let path = vfs.file_path(id);
     let path = path.as_path().unwrap();
-    url_from_abs_path(&path)
+    url_from_abs_path(path)
 }
 
 pub(crate) fn url_to_file_id(vfs: &vfs::Vfs, url: &Url) -> Result<FileId> {

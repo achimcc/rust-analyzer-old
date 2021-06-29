@@ -4,7 +4,7 @@ import { log } from "./util";
 
 export type UpdatesChannel = "stable" | "nightly";
 
-export const NIGHTLY_TAG = "nightly";
+const NIGHTLY_TAG = "nightly";
 
 export type RunnableEnvCfg = undefined | Record<string, string> | { mask?: string; env: Record<string, string> }[];
 
@@ -31,10 +31,10 @@ export class Config {
         enableProposedApi: boolean | undefined;
     } = vscode.extensions.getExtension(this.extensionId)!.packageJSON;
 
-    readonly globalStoragePath: string;
+    readonly globalStorageUri: vscode.Uri;
 
     constructor(ctx: vscode.ExtensionContext) {
-        this.globalStoragePath = ctx.globalStoragePath;
+        this.globalStorageUri = ctx.globalStorageUri;
         vscode.workspace.onDidChangeConfiguration(this.onDidChangeConfiguration, this, ctx.subscriptions);
         this.refreshLogging();
     }
@@ -165,9 +165,14 @@ export class Config {
         return {
             enable: this.get<boolean>("hoverActions.enable"),
             implementations: this.get<boolean>("hoverActions.implementations"),
+            references: this.get<boolean>("hoverActions.references"),
             run: this.get<boolean>("hoverActions.run"),
             debug: this.get<boolean>("hoverActions.debug"),
             gotoTypeDef: this.get<boolean>("hoverActions.gotoTypeDef"),
         };
+    }
+
+    get currentExtensionIsNightly() {
+        return this.package.releaseTag === NIGHTLY_TAG;
     }
 }

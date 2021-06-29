@@ -10,18 +10,18 @@ use ide_db::{
 use itertools::Itertools;
 use stdx::format_to;
 use syntax::{
-    algo::SyntaxRewriter,
     ast::{
         self,
         edit::{AstNodeEdit, IndentLevel},
         AstNode,
     },
+    ted,
     SyntaxKind::{self, BLOCK_EXPR, BREAK_EXPR, COMMENT, PATH_EXPR, RETURN_EXPR},
     SyntaxNode, SyntaxToken, TextRange, TextSize, TokenAtOffset, WalkEvent, T,
 };
 
 use crate::{
-    assist_context::{AssistContext, Assists},
+    assist_context::{AssistContext, Assists, TreeMutator},
     AssistId,
 };
 
@@ -76,7 +76,7 @@ pub(crate) fn extract_function(acc: &mut Assists, ctx: &AssistContext) -> Option
     let module = ctx.sema.scope(&insert_after).module()?;
 
     let vars_defined_in_body_and_outlive =
-        vars_defined_in_body_and_outlive(ctx, &body, &node.parent().as_ref().unwrap_or(&node));
+        vars_defined_in_body_and_outlive(ctx, &body, node.parent().as_ref().unwrap_or(&node));
     let ret_ty = body_return_ty(ctx, &body)?;
 
     // FIXME: we compute variables that outlive here just to check `never!` condition
@@ -109,10 +109,15 @@ pub(crate) fn extract_function(acc: &mut Assists, ctx: &AssistContext) -> Option
 
             let new_indent = IndentLevel::from_node(&insert_after);
             let old_indent = fun.body.indent_level();
+            let body_contains_await = body_contains_await(&fun.body);
 
-            builder.replace(target_range, format_replacement(ctx, &fun, old_indent));
+            builder.replace(
+                target_range,
+                format_replacement(ctx, &fun, old_indent, body_contains_await),
+            );
 
-            let fn_def = format_function(ctx, module, &fun, old_indent, new_indent);
+            let fn_def =
+                format_function(ctx, module, &fun, old_indent, new_indent, body_contains_await);
             let insert_offset = insert_after.text_range().end();
             match ctx.config.snippet_cap {
                 Some(cap) => builder.insert_snippet(cap, insert_offset, fn_def),
@@ -642,6 +647,10 @@ fn vars_used_in_body(ctx: &AssistContext, body: &FunctionBody) -> Vec<Local> {
         .collect()
 }
 
+fn body_contains_await(body: &FunctionBody) -> bool {
+    body.descendants().any(|d| matches!(d.kind(), SyntaxKind::AWAIT_EXPR))
+}
+
 /// find `self` param, that was not defined inside `body`
 ///
 /// It should skip `self` params from impls inside `body`
@@ -778,7 +787,7 @@ fn expr_require_exclusive_access(ctx: &AssistContext, expr: &ast::Expr) -> Optio
     Some(false)
 }
 
-/// Container of local varaible usages
+/// Container of local variable usages
 ///
 /// Semanticall same as `UsageSearchResult`, but provides more convenient interface
 struct LocalUsages(ide_db::search::UsageSearchResult);
@@ -804,7 +813,7 @@ trait HasTokenAtOffset {
 
 impl HasTokenAtOffset for SyntaxNode {
     fn token_at_offset(&self, offset: TextSize) -> TokenAtOffset<SyntaxToken> {
-        SyntaxNode::token_at_offset(&self, offset)
+        SyntaxNode::token_at_offset(self, offset)
     }
 }
 
@@ -850,7 +859,7 @@ fn vars_defined_in_body_and_outlive(
     body: &FunctionBody,
     parent: &SyntaxNode,
 ) -> Vec<OutlivedLocal> {
-    let vars_defined_in_body = vars_defined_in_body(&body, ctx);
+    let vars_defined_in_body = vars_defined_in_body(body, ctx);
     vars_defined_in_body
         .into_iter()
         .filter_map(|var| var_outlives_body(ctx, body, var, parent))
@@ -864,7 +873,7 @@ fn is_defined_before(
     src: &hir::InFile<Either<ast::IdentPat, ast::SelfParam>>,
 ) -> bool {
     src.file_id.original_file(ctx.db()) == ctx.frange.file_id
-        && !body.contains_node(&either_syntax(&src.value))
+        && !body.contains_node(either_syntax(&src.value))
 }
 
 fn either_syntax(value: &Either<ast::IdentPat, ast::SelfParam>) -> &SyntaxNode {
@@ -950,16 +959,21 @@ fn scope_for_fn_insertion_node(node: &SyntaxNode, anchor: Anchor) -> Option<Synt
     last_ancestor
 }
 
-fn format_replacement(ctx: &AssistContext, fun: &Function, indent: IndentLevel) -> String {
+fn format_replacement(
+    ctx: &AssistContext,
+    fun: &Function,
+    indent: IndentLevel,
+    body_contains_await: bool,
+) -> String {
     let ret_ty = fun.return_type(ctx);
 
     let args = fun.params.iter().map(|param| param.to_arg(ctx));
     let args = make::arg_list(args);
     let call_expr = if fun.self_param.is_some() {
-        let self_arg = make::expr_path(make_path_from_text("self"));
+        let self_arg = make::expr_path(make::ext::ident_path("self"));
         make::expr_method_call(self_arg, &fun.name, args)
     } else {
-        let func = make::expr_path(make_path_from_text(&fun.name));
+        let func = make::expr_path(make::ext::ident_path(&fun.name));
         make::expr_call(func, args)
     };
 
@@ -990,6 +1004,9 @@ fn format_replacement(ctx: &AssistContext, fun: &Function, indent: IndentLevel) 
         }
     }
     format_to!(buf, "{}", expr);
+    if body_contains_await {
+        buf.push_str(".await");
+    }
     if fun.ret_ty.is_unit()
         && (!fun.vars_defined_in_body_and_outlive.is_empty() || !expr.is_block_like())
     {
@@ -1054,11 +1071,11 @@ impl FlowHandler {
                 make::expr_if(condition, block, None)
             }
             FlowHandler::IfOption { action } => {
-                let path = make_path_from_text("Some");
+                let path = make::ext::ident_path("Some");
                 let value_pat = make::ident_pat(make::name("value"));
                 let pattern = make::tuple_struct_pat(path, iter::once(value_pat.into()));
                 let cond = make::condition(call_expr, Some(pattern.into()));
-                let value = make::expr_path(make_path_from_text("value"));
+                let value = make::expr_path(make::ext::ident_path("value"));
                 let action_expr = action.make_result_handler(Some(value));
                 let action_stmt = make::expr_stmt(action_expr);
                 let then = make::block_expr(iter::once(action_stmt.into()), None);
@@ -1068,14 +1085,14 @@ impl FlowHandler {
                 let some_name = "value";
 
                 let some_arm = {
-                    let path = make_path_from_text("Some");
+                    let path = make::ext::ident_path("Some");
                     let value_pat = make::ident_pat(make::name(some_name));
                     let pat = make::tuple_struct_pat(path, iter::once(value_pat.into()));
-                    let value = make::expr_path(make_path_from_text(some_name));
+                    let value = make::expr_path(make::ext::ident_path(some_name));
                     make::match_arm(iter::once(pat.into()), value)
                 };
                 let none_arm = {
-                    let path = make_path_from_text("None");
+                    let path = make::ext::ident_path("None");
                     let pat = make::path_pat(path);
                     make::match_arm(iter::once(pat), none.make_result_handler(None))
                 };
@@ -1087,17 +1104,17 @@ impl FlowHandler {
                 let err_name = "value";
 
                 let ok_arm = {
-                    let path = make_path_from_text("Ok");
+                    let path = make::ext::ident_path("Ok");
                     let value_pat = make::ident_pat(make::name(ok_name));
                     let pat = make::tuple_struct_pat(path, iter::once(value_pat.into()));
-                    let value = make::expr_path(make_path_from_text(ok_name));
+                    let value = make::expr_path(make::ext::ident_path(ok_name));
                     make::match_arm(iter::once(pat.into()), value)
                 };
                 let err_arm = {
-                    let path = make_path_from_text("Err");
+                    let path = make::ext::ident_path("Err");
                     let value_pat = make::ident_pat(make::name(err_name));
                     let pat = make::tuple_struct_pat(path, iter::once(value_pat.into()));
-                    let value = make::expr_path(make_path_from_text(err_name));
+                    let value = make::expr_path(make::ext::ident_path(err_name));
                     make::match_arm(iter::once(pat.into()), err.make_result_handler(Some(value)))
                 };
                 let arms = make::match_arm_list(vec![ok_arm, err_arm]);
@@ -1107,13 +1124,9 @@ impl FlowHandler {
     }
 }
 
-fn make_path_from_text(text: &str) -> ast::Path {
-    make::path_unqualified(make::path_segment(make::name_ref(text)))
-}
-
 fn path_expr_from_local(ctx: &AssistContext, var: Local) -> ast::Expr {
     let name = var.name(ctx.db()).unwrap().to_string();
-    make::expr_path(make_path_from_text(&name))
+    make::expr_path(make::ext::ident_path(&name))
 }
 
 fn format_function(
@@ -1122,14 +1135,16 @@ fn format_function(
     fun: &Function,
     old_indent: IndentLevel,
     new_indent: IndentLevel,
+    body_contains_await: bool,
 ) -> String {
     let mut fn_def = String::new();
     let params = make_param_list(ctx, module, fun);
     let ret_ty = make_ret_ty(ctx, module, fun);
     let body = make_body(ctx, old_indent, new_indent, fun);
+    let async_kw = if body_contains_await { "async " } else { "" };
     match ctx.config.snippet_cap {
-        Some(_) => format_to!(fn_def, "\n\n{}fn $0{}{}", new_indent, fun.name, params),
-        None => format_to!(fn_def, "\n\n{}fn {}{}", new_indent, fun.name, params),
+        Some(_) => format_to!(fn_def, "\n\n{}{}fn $0{}{}", new_indent, async_kw, fun.name, params),
+        None => format_to!(fn_def, "\n\n{}{}fn {}{}", new_indent, async_kw, fun.name, params),
     }
     if let Some(ret_ty) = ret_ty {
         format_to!(fn_def, " {}", ret_ty);
@@ -1179,7 +1194,7 @@ fn make_ret_ty(ctx: &AssistContext, module: hir::Module, fun: &Function) -> Opti
             fun_ty.make_ty(ctx, module)
         }
         FlowHandler::Try { kind: TryKind::Option } => {
-            make::ty_generic(make::name_ref("Option"), iter::once(fun_ty.make_ty(ctx, module)))
+            make::ext::ty_option(fun_ty.make_ty(ctx, module))
         }
         FlowHandler::Try { kind: TryKind::Result { ty: parent_ret_ty } } => {
             let handler_ty = parent_ret_ty
@@ -1187,29 +1202,21 @@ fn make_ret_ty(ctx: &AssistContext, module: hir::Module, fun: &Function) -> Opti
                 .nth(1)
                 .map(|ty| make_ty(&ty, ctx, module))
                 .unwrap_or_else(make::ty_unit);
-            make::ty_generic(
-                make::name_ref("Result"),
-                vec![fun_ty.make_ty(ctx, module), handler_ty],
-            )
+            make::ext::ty_result(fun_ty.make_ty(ctx, module), handler_ty)
         }
-        FlowHandler::If { .. } => make::ty("bool"),
+        FlowHandler::If { .. } => make::ext::ty_bool(),
         FlowHandler::IfOption { action } => {
             let handler_ty = action
                 .expr_ty(ctx)
                 .map(|ty| make_ty(&ty, ctx, module))
                 .unwrap_or_else(make::ty_unit);
-            make::ty_generic(make::name_ref("Option"), iter::once(handler_ty))
+            make::ext::ty_option(handler_ty)
         }
-        FlowHandler::MatchOption { .. } => {
-            make::ty_generic(make::name_ref("Option"), iter::once(fun_ty.make_ty(ctx, module)))
-        }
+        FlowHandler::MatchOption { .. } => make::ext::ty_option(fun_ty.make_ty(ctx, module)),
         FlowHandler::MatchResult { err } => {
             let handler_ty =
                 err.expr_ty(ctx).map(|ty| make_ty(&ty, ctx, module)).unwrap_or_else(make::ty_unit);
-            make::ty_generic(
-                make::name_ref("Result"),
-                vec![fun_ty.make_ty(ctx, module), handler_ty],
-            )
+            make::ext::ty_result(fun_ty.make_ty(ctx, module), handler_ty)
         }
     };
     Some(make::ret_type(ret_ty))
@@ -1296,7 +1303,7 @@ fn make_body(
                     TryKind::Option => "Some",
                     TryKind::Result { .. } => "Ok",
                 };
-                let func = make::expr_path(make_path_from_text(constructor));
+                let func = make::expr_path(make::ext::ident_path(constructor));
                 let args = make::arg_list(iter::once(tail_expr));
                 make::expr_call(func, args)
             })
@@ -1306,16 +1313,16 @@ fn make_body(
             with_tail_expr(block, lit_false.into())
         }
         FlowHandler::IfOption { .. } => {
-            let none = make::expr_path(make_path_from_text("None"));
+            let none = make::expr_path(make::ext::ident_path("None"));
             with_tail_expr(block, none)
         }
         FlowHandler::MatchOption { .. } => map_tail_expr(block, |tail_expr| {
-            let some = make::expr_path(make_path_from_text("Some"));
+            let some = make::expr_path(make::ext::ident_path("Some"));
             let args = make::arg_list(iter::once(tail_expr));
             make::expr_call(some, args)
         }),
         FlowHandler::MatchResult { .. } => map_tail_expr(block, |tail_expr| {
-            let ok = make::expr_path(make_path_from_text("Ok"));
+            let ok = make::expr_path(make::ext::ident_path("Ok"));
             let args = make::arg_list(iter::once(tail_expr));
             make::expr_call(ok, args)
         }),
@@ -1361,12 +1368,16 @@ fn rewrite_body_segment(
     syntax: &SyntaxNode,
 ) -> SyntaxNode {
     let syntax = fix_param_usages(ctx, params, syntax);
-    update_external_control_flow(handler, &syntax)
+    update_external_control_flow(handler, &syntax);
+    syntax
 }
 
 /// change all usages to account for added `&`/`&mut` for some params
 fn fix_param_usages(ctx: &AssistContext, params: &[Param], syntax: &SyntaxNode) -> SyntaxNode {
-    let mut rewriter = SyntaxRewriter::default();
+    let mut usages_for_param: Vec<(&Param, Vec<ast::Expr>)> = Vec::new();
+
+    let tm = TreeMutator::new(syntax);
+
     for param in params {
         if !param.kind().is_ref() {
             continue;
@@ -1376,101 +1387,100 @@ fn fix_param_usages(ctx: &AssistContext, params: &[Param], syntax: &SyntaxNode) 
         let usages = usages
             .iter()
             .filter(|reference| syntax.text_range().contains_range(reference.range))
-            .filter_map(|reference| path_element_of_reference(syntax, reference));
-        for path in usages {
-            match path.syntax().ancestors().skip(1).find_map(ast::Expr::cast) {
-                Some(ast::Expr::MethodCallExpr(_)) | Some(ast::Expr::FieldExpr(_)) => {
+            .filter_map(|reference| path_element_of_reference(syntax, reference))
+            .map(|expr| tm.make_mut(&expr));
+
+        usages_for_param.push((param, usages.collect()));
+    }
+
+    let res = tm.make_syntax_mut(syntax);
+
+    for (param, usages) in usages_for_param {
+        for usage in usages {
+            match usage.syntax().ancestors().skip(1).find_map(ast::Expr::cast) {
+                Some(ast::Expr::MethodCallExpr(_) | ast::Expr::FieldExpr(_)) => {
                     // do nothing
                 }
                 Some(ast::Expr::RefExpr(node))
                     if param.kind() == ParamKind::MutRef && node.mut_token().is_some() =>
                 {
-                    rewriter.replace_ast(&node.clone().into(), &node.expr().unwrap());
+                    ted::replace(node.syntax(), node.expr().unwrap().syntax());
                 }
                 Some(ast::Expr::RefExpr(node))
                     if param.kind() == ParamKind::SharedRef && node.mut_token().is_none() =>
                 {
-                    rewriter.replace_ast(&node.clone().into(), &node.expr().unwrap());
+                    ted::replace(node.syntax(), node.expr().unwrap().syntax());
                 }
                 Some(_) | None => {
-                    rewriter.replace_ast(&path, &make::expr_prefix(T![*], path.clone()));
+                    let p = &make::expr_prefix(T![*], usage.clone()).clone_for_update();
+                    ted::replace(usage.syntax(), p.syntax())
                 }
-            };
+            }
         }
     }
 
-    rewriter.rewrite(syntax)
+    res
 }
 
-fn update_external_control_flow(handler: &FlowHandler, syntax: &SyntaxNode) -> SyntaxNode {
-    let mut rewriter = SyntaxRewriter::default();
-
+fn update_external_control_flow(handler: &FlowHandler, syntax: &SyntaxNode) {
     let mut nested_loop = None;
     let mut nested_scope = None;
     for event in syntax.preorder() {
-        let node = match event {
-            WalkEvent::Enter(e) => {
-                match e.kind() {
-                    SyntaxKind::LOOP_EXPR | SyntaxKind::WHILE_EXPR | SyntaxKind::FOR_EXPR => {
-                        if nested_loop.is_none() {
-                            nested_loop = Some(e.clone());
-                        }
+        match event {
+            WalkEvent::Enter(e) => match e.kind() {
+                SyntaxKind::LOOP_EXPR | SyntaxKind::WHILE_EXPR | SyntaxKind::FOR_EXPR => {
+                    if nested_loop.is_none() {
+                        nested_loop = Some(e.clone());
                     }
-                    SyntaxKind::FN
-                    | SyntaxKind::CONST
-                    | SyntaxKind::STATIC
-                    | SyntaxKind::IMPL
-                    | SyntaxKind::MODULE => {
-                        if nested_scope.is_none() {
-                            nested_scope = Some(e.clone());
-                        }
-                    }
-                    _ => {}
                 }
-                e
-            }
+                SyntaxKind::FN
+                | SyntaxKind::CONST
+                | SyntaxKind::STATIC
+                | SyntaxKind::IMPL
+                | SyntaxKind::MODULE => {
+                    if nested_scope.is_none() {
+                        nested_scope = Some(e.clone());
+                    }
+                }
+                _ => {}
+            },
             WalkEvent::Leave(e) => {
+                if nested_scope.is_none() {
+                    if let Some(expr) = ast::Expr::cast(e.clone()) {
+                        match expr {
+                            ast::Expr::ReturnExpr(return_expr) if nested_scope.is_none() => {
+                                let expr = return_expr.expr();
+                                if let Some(replacement) = make_rewritten_flow(handler, expr) {
+                                    ted::replace(return_expr.syntax(), replacement.syntax())
+                                }
+                            }
+                            ast::Expr::BreakExpr(break_expr) if nested_loop.is_none() => {
+                                let expr = break_expr.expr();
+                                if let Some(replacement) = make_rewritten_flow(handler, expr) {
+                                    ted::replace(break_expr.syntax(), replacement.syntax())
+                                }
+                            }
+                            ast::Expr::ContinueExpr(continue_expr) if nested_loop.is_none() => {
+                                if let Some(replacement) = make_rewritten_flow(handler, None) {
+                                    ted::replace(continue_expr.syntax(), replacement.syntax())
+                                }
+                            }
+                            _ => {
+                                // do nothing
+                            }
+                        }
+                    }
+                }
+
                 if nested_loop.as_ref() == Some(&e) {
                     nested_loop = None;
                 }
                 if nested_scope.as_ref() == Some(&e) {
                     nested_scope = None;
                 }
-                continue;
             }
         };
-        if nested_scope.is_some() {
-            continue;
-        }
-        let expr = match ast::Expr::cast(node) {
-            Some(e) => e,
-            None => continue,
-        };
-        match expr {
-            ast::Expr::ReturnExpr(return_expr) if nested_scope.is_none() => {
-                let expr = return_expr.expr();
-                if let Some(replacement) = make_rewritten_flow(handler, expr) {
-                    rewriter.replace_ast(&return_expr.into(), &replacement);
-                }
-            }
-            ast::Expr::BreakExpr(break_expr) if nested_loop.is_none() => {
-                let expr = break_expr.expr();
-                if let Some(replacement) = make_rewritten_flow(handler, expr) {
-                    rewriter.replace_ast(&break_expr.into(), &replacement);
-                }
-            }
-            ast::Expr::ContinueExpr(continue_expr) if nested_loop.is_none() => {
-                if let Some(replacement) = make_rewritten_flow(handler, None) {
-                    rewriter.replace_ast(&continue_expr.into(), &replacement);
-                }
-            }
-            _ => {
-                // do nothing
-            }
-        }
     }
-
-    rewriter.rewrite(syntax)
 }
 
 fn make_rewritten_flow(handler: &FlowHandler, arg_expr: Option<ast::Expr>) -> Option<ast::Expr> {
@@ -1480,16 +1490,16 @@ fn make_rewritten_flow(handler: &FlowHandler, arg_expr: Option<ast::Expr>) -> Op
         FlowHandler::IfOption { .. } => {
             let expr = arg_expr.unwrap_or_else(|| make::expr_tuple(Vec::new()));
             let args = make::arg_list(iter::once(expr));
-            make::expr_call(make::expr_path(make_path_from_text("Some")), args)
+            make::expr_call(make::expr_path(make::ext::ident_path("Some")), args)
         }
-        FlowHandler::MatchOption { .. } => make::expr_path(make_path_from_text("None")),
+        FlowHandler::MatchOption { .. } => make::expr_path(make::ext::ident_path("None")),
         FlowHandler::MatchResult { .. } => {
             let expr = arg_expr.unwrap_or_else(|| make::expr_tuple(Vec::new()));
             let args = make::arg_list(iter::once(expr));
-            make::expr_call(make::expr_path(make_path_from_text("Err")), args)
+            make::expr_call(make::expr_path(make::ext::ident_path("Err")), args)
         }
     };
-    Some(make::expr_return(Some(value)))
+    Some(make::expr_return(Some(value)).clone_for_update())
 }
 
 #[cfg(test)]
@@ -1505,7 +1515,8 @@ mod tests {
             r#"
 fn foo() {
     foo($01 + 1$0);
-}"#,
+}
+"#,
             r#"
 fn foo() {
     foo(fun_name());
@@ -1513,7 +1524,8 @@ fn foo() {
 
 fn $0fun_name() -> i32 {
     1 + 1
-}"#,
+}
+"#,
         );
     }
 
@@ -1526,7 +1538,8 @@ mod bar {
     fn foo() {
         foo($01 + 1$0);
     }
-}"#,
+}
+"#,
             r#"
 mod bar {
     fn foo() {
@@ -1536,7 +1549,8 @@ mod bar {
     fn $0fun_name() -> i32 {
         1 + 1
     }
-}"#,
+}
+"#,
         );
     }
 
@@ -1547,7 +1561,8 @@ mod bar {
             r#"
 fn foo() {
     $0{ 1 + 1 }$0;
-}"#,
+}
+"#,
             r#"
 fn foo() {
     fun_name();
@@ -1555,7 +1570,8 @@ fn foo() {
 
 fn $0fun_name() -> i32 {
     1 + 1
-}"#,
+}
+"#,
         );
     }
 
@@ -1568,7 +1584,8 @@ fn foo() -> i32 {
     let k = 1;
     $0let m = 1;
     m + 1$0
-}"#,
+}
+"#,
             r#"
 fn foo() -> i32 {
     let k = 1;
@@ -1578,7 +1595,8 @@ fn foo() -> i32 {
 fn $0fun_name() -> i32 {
     let m = 1;
     m + 1
-}"#,
+}
+"#,
         );
     }
 
@@ -1592,7 +1610,8 @@ fn foo() {
     $0let m = 1;
     let n = m + 1;$0
     let g = 5;
-}"#,
+}
+"#,
             r#"
 fn foo() {
     let k = 3;
@@ -1603,7 +1622,8 @@ fn foo() {
 fn $0fun_name() {
     let m = 1;
     let n = m + 1;
-}"#,
+}
+"#,
         );
     }
 
@@ -1614,7 +1634,8 @@ fn $0fun_name() {
             r#"
 fn foo() {
     $0if true { }$0
-}"#,
+}
+"#,
             r#"
 fn foo() {
     fun_name();
@@ -1622,7 +1643,8 @@ fn foo() {
 
 fn $0fun_name() {
     if true { }
-}"#,
+}
+"#,
         );
     }
 
@@ -1633,7 +1655,8 @@ fn $0fun_name() {
             r#"
 fn foo() -> i32 {
     $0if true { 1 } else { 2 }$0
-}"#,
+}
+"#,
             r#"
 fn foo() -> i32 {
     fun_name()
@@ -1641,7 +1664,8 @@ fn foo() -> i32 {
 
 fn $0fun_name() -> i32 {
     if true { 1 } else { 2 }
-}"#,
+}
+"#,
         );
     }
 
@@ -1652,7 +1676,8 @@ fn $0fun_name() -> i32 {
             r#"
 fn foo() -> i32 {
     $0if let true = false { 1 } else { 2 }$0
-}"#,
+}
+"#,
             r#"
 fn foo() -> i32 {
     fun_name()
@@ -1660,7 +1685,8 @@ fn foo() -> i32 {
 
 fn $0fun_name() -> i32 {
     if let true = false { 1 } else { 2 }
-}"#,
+}
+"#,
         );
     }
 
@@ -1674,7 +1700,8 @@ fn foo() -> i32 {
         true => 1,
         false => 2,
     }$0
-}"#,
+}
+"#,
             r#"
 fn foo() -> i32 {
     fun_name()
@@ -1685,7 +1712,8 @@ fn $0fun_name() -> i32 {
         true => 1,
         false => 2,
     }
-}"#,
+}
+"#,
         );
     }
 
@@ -1696,7 +1724,8 @@ fn $0fun_name() -> i32 {
             r#"
 fn foo() {
     $0while true { }$0
-}"#,
+}
+"#,
             r#"
 fn foo() {
     fun_name();
@@ -1704,7 +1733,8 @@ fn foo() {
 
 fn $0fun_name() {
     while true { }
-}"#,
+}
+"#,
         );
     }
 
@@ -1715,7 +1745,8 @@ fn $0fun_name() {
             r#"
 fn foo() {
     $0for v in &[0, 1] { }$0
-}"#,
+}
+"#,
             r#"
 fn foo() {
     fun_name();
@@ -1723,7 +1754,8 @@ fn foo() {
 
 fn $0fun_name() {
     for v in &[0, 1] { }
-}"#,
+}
+"#,
         );
     }
 
@@ -1736,7 +1768,8 @@ fn foo() {
     $0loop {
         let m = 1;
     }$0
-}"#,
+}
+"#,
             r#"
 fn foo() {
     fun_name()
@@ -1746,7 +1779,8 @@ fn $0fun_name() -> ! {
     loop {
         let m = 1;
     }
-}"#,
+}
+"#,
         );
     }
 
@@ -1760,7 +1794,8 @@ fn foo() {
         let m = 1;
         break m;
     }$0;
-}"#,
+}
+"#,
             r#"
 fn foo() {
     let v = fun_name();
@@ -1771,7 +1806,8 @@ fn $0fun_name() -> i32 {
         let m = 1;
         break m;
     }
-}"#,
+}
+"#,
         );
     }
 
@@ -1785,7 +1821,8 @@ fn foo() {
         Some(x) => x,
         None => 0,
     }$0;
-}"#,
+}
+"#,
             r#"
 fn foo() {
     let v: i32 = fun_name();
@@ -1796,7 +1833,8 @@ fn $0fun_name() -> i32 {
         Some(x) => x,
         None => 0,
     }
-}"#,
+}
+"#,
         );
     }
 
@@ -1809,7 +1847,8 @@ fn foo() {
     let n = 1;
     let mut v = $0n * n;$0
     v += 1;
-}"#,
+}
+"#,
             r#"
 fn foo() {
     let n = 1;
@@ -1820,7 +1859,8 @@ fn foo() {
 fn $0fun_name(n: i32) -> i32 {
     let mut v = n * n;
     v
-}"#,
+}
+"#,
         );
     }
 
@@ -1836,7 +1876,8 @@ fn foo() {
     let mut w = 3;$0
     v += 1;
     w += 1;
-}"#,
+}
+"#,
             r#"
 fn foo() {
     let m = 2;
@@ -1850,7 +1891,8 @@ fn $0fun_name(m: i32, n: i32) -> (i32, i32) {
     let mut v = m * n;
     let mut w = 3;
     (v, w)
-}"#,
+}
+"#,
         );
     }
 
@@ -1858,12 +1900,13 @@ fn $0fun_name(m: i32, n: i32) -> (i32, i32) {
     fn argument_form_expr() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn foo() -> u32 {
     let n = 2;
     $0n+2$0
-}",
-            r"
+}
+"#,
+            r#"
 fn foo() -> u32 {
     let n = 2;
     fun_name(n)
@@ -1871,7 +1914,8 @@ fn foo() -> u32 {
 
 fn $0fun_name(n: u32) -> u32 {
     n+2
-}",
+}
+"#,
         )
     }
 
@@ -1879,12 +1923,13 @@ fn $0fun_name(n: u32) -> u32 {
     fn argument_used_twice_form_expr() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn foo() -> u32 {
     let n = 2;
     $0n+n$0
-}",
-            r"
+}
+"#,
+            r#"
 fn foo() -> u32 {
     let n = 2;
     fun_name(n)
@@ -1892,7 +1937,8 @@ fn foo() -> u32 {
 
 fn $0fun_name(n: u32) -> u32 {
     n+n
-}",
+}
+"#,
         )
     }
 
@@ -1900,13 +1946,14 @@ fn $0fun_name(n: u32) -> u32 {
     fn two_arguments_form_expr() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn foo() -> u32 {
     let n = 2;
     let m = 3;
     $0n+n*m$0
-}",
-            r"
+}
+"#,
+            r#"
 fn foo() -> u32 {
     let n = 2;
     let m = 3;
@@ -1915,7 +1962,8 @@ fn foo() -> u32 {
 
 fn $0fun_name(n: u32, m: u32) -> u32 {
     n+n*m
-}",
+}
+"#,
         )
     }
 
@@ -1923,13 +1971,14 @@ fn $0fun_name(n: u32, m: u32) -> u32 {
     fn argument_and_locals() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn foo() -> u32 {
     let n = 2;
     $0let m = 1;
     n + m$0
-}",
-            r"
+}
+"#,
+            r#"
 fn foo() -> u32 {
     let n = 2;
     fun_name(n)
@@ -1938,7 +1987,8 @@ fn foo() -> u32 {
 fn $0fun_name(n: u32) -> u32 {
     let m = 1;
     n + m
-}",
+}
+"#,
         )
     }
 
@@ -1952,18 +2002,20 @@ fn $0fun_name(n: u32) -> u32 {
     fn part_of_expr_stmt() {
         check_assist(
             extract_function,
-            "
+            r#"
 fn foo() {
     $01$0 + 1;
-}",
-            "
+}
+"#,
+            r#"
 fn foo() {
     fun_name() + 1;
 }
 
 fn $0fun_name() -> i32 {
     1
-}",
+}
+"#,
         );
     }
 
@@ -1974,7 +2026,8 @@ fn $0fun_name() -> i32 {
             r#"
 fn foo() {
     $0bar(1 + 1)$0
-}"#,
+}
+"#,
             r#"
 fn foo() {
     fun_name();
@@ -1982,7 +2035,8 @@ fn foo() {
 
 fn $0fun_name() {
     bar(1 + 1)
-}"#,
+}
+"#,
         )
     }
 
@@ -1990,15 +2044,16 @@ fn $0fun_name() {
     fn extract_from_nested() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn main() {
     let x = true;
     let tuple = match x {
         true => ($02 + 2$0, true)
         _ => (0, false)
     };
-}",
-            r"
+}
+"#,
+            r#"
 fn main() {
     let x = true;
     let tuple = match x {
@@ -2009,7 +2064,8 @@ fn main() {
 
 fn $0fun_name() -> i32 {
     2 + 2
-}",
+}
+"#,
         );
     }
 
@@ -2017,18 +2073,20 @@ fn $0fun_name() -> i32 {
     fn param_from_closure() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn main() {
     let lambda = |x: u32| $0x * 2$0;
-}",
-            r"
+}
+"#,
+            r#"
 fn main() {
     let lambda = |x: u32| fun_name(x);
 }
 
 fn $0fun_name(x: u32) -> u32 {
     x * 2
-}",
+}
+"#,
         );
     }
 
@@ -2036,18 +2094,20 @@ fn $0fun_name(x: u32) -> u32 {
     fn extract_return_stmt() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn foo() -> u32 {
     $0return 2 + 2$0;
-}",
-            r"
+}
+"#,
+            r#"
 fn foo() -> u32 {
     return fun_name();
 }
 
 fn $0fun_name() -> u32 {
     2 + 2
-}",
+}
+"#,
         );
     }
 
@@ -2055,13 +2115,14 @@ fn $0fun_name() -> u32 {
     fn does_not_add_extra_whitespace() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn foo() -> u32 {
 
 
     $0return 2 + 2$0;
-}",
-            r"
+}
+"#,
+            r#"
 fn foo() -> u32 {
 
 
@@ -2070,7 +2131,8 @@ fn foo() -> u32 {
 
 fn $0fun_name() -> u32 {
     2 + 2
-}",
+}
+"#,
         );
     }
 
@@ -2078,13 +2140,14 @@ fn $0fun_name() -> u32 {
     fn break_stmt() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn main() {
     let result = loop {
         $0break 2 + 2$0;
     };
-}",
-            r"
+}
+"#,
+            r#"
 fn main() {
     let result = loop {
         break fun_name();
@@ -2093,7 +2156,8 @@ fn main() {
 
 fn $0fun_name() -> i32 {
     2 + 2
-}",
+}
+"#,
         );
     }
 
@@ -2101,18 +2165,20 @@ fn $0fun_name() -> i32 {
     fn extract_cast() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn main() {
     let v = $00f32 as u32$0;
-}",
-            r"
+}
+"#,
+            r#"
 fn main() {
     let v = fun_name();
 }
 
 fn $0fun_name() -> u32 {
     0f32 as u32
-}",
+}
+"#,
         );
     }
 
@@ -2125,15 +2191,16 @@ fn $0fun_name() -> u32 {
     fn method_to_freestanding() {
         check_assist(
             extract_function,
-            r"
+            r#"
 struct S;
 
 impl S {
     fn foo(&self) -> i32 {
         $01+1$0
     }
-}",
-            r"
+}
+"#,
+            r#"
 struct S;
 
 impl S {
@@ -2144,7 +2211,8 @@ impl S {
 
 fn $0fun_name() -> i32 {
     1+1
-}",
+}
+"#,
         );
     }
 
@@ -2152,15 +2220,16 @@ fn $0fun_name() -> i32 {
     fn method_with_reference() {
         check_assist(
             extract_function,
-            r"
+            r#"
 struct S { f: i32 };
 
 impl S {
     fn foo(&self) -> i32 {
         $01+self.f$0
     }
-}",
-            r"
+}
+"#,
+            r#"
 struct S { f: i32 };
 
 impl S {
@@ -2171,7 +2240,8 @@ impl S {
     fn $0fun_name(&self) -> i32 {
         1+self.f
     }
-}",
+}
+"#,
         );
     }
 
@@ -2179,15 +2249,16 @@ impl S {
     fn method_with_mut() {
         check_assist(
             extract_function,
-            r"
+            r#"
 struct S { f: i32 };
 
 impl S {
     fn foo(&mut self) {
         $0self.f += 1;$0
     }
-}",
-            r"
+}
+"#,
+            r#"
 struct S { f: i32 };
 
 impl S {
@@ -2198,7 +2269,8 @@ impl S {
     fn $0fun_name(&mut self) {
         self.f += 1;
     }
-}",
+}
+"#,
         );
     }
 
@@ -2206,13 +2278,14 @@ impl S {
     fn variable_defined_inside_and_used_after_no_ret() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn foo() {
     let n = 1;
     $0let k = n * n;$0
     let m = k + 1;
-}",
-            r"
+}
+"#,
+            r#"
 fn foo() {
     let n = 1;
     let k = fun_name(n);
@@ -2222,7 +2295,8 @@ fn foo() {
 fn $0fun_name(n: i32) -> i32 {
     let k = n * n;
     k
-}",
+}
+"#,
         );
     }
 
@@ -2230,13 +2304,14 @@ fn $0fun_name(n: i32) -> i32 {
     fn variable_defined_inside_and_used_after_mutably_no_ret() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn foo() {
     let n = 1;
     $0let mut k = n * n;$0
     k += 1;
-}",
-            r"
+}
+"#,
+            r#"
 fn foo() {
     let n = 1;
     let mut k = fun_name(n);
@@ -2246,7 +2321,8 @@ fn foo() {
 fn $0fun_name(n: i32) -> i32 {
     let mut k = n * n;
     k
-}",
+}
+"#,
         );
     }
 
@@ -2254,14 +2330,15 @@ fn $0fun_name(n: i32) -> i32 {
     fn two_variables_defined_inside_and_used_after_no_ret() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn foo() {
     let n = 1;
     $0let k = n * n;
     let m = k + 2;$0
     let h = k + m;
-}",
-            r"
+}
+"#,
+            r#"
 fn foo() {
     let n = 1;
     let (k, m) = fun_name(n);
@@ -2272,7 +2349,8 @@ fn $0fun_name(n: i32) -> (i32, i32) {
     let k = n * n;
     let m = k + 2;
     (k, m)
-}",
+}
+"#,
         );
     }
 
@@ -2280,7 +2358,7 @@ fn $0fun_name(n: i32) -> (i32, i32) {
     fn multi_variables_defined_inside_and_used_after_mutably_no_ret() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn foo() {
     let n = 1;
     $0let mut k = n * n;
@@ -2289,8 +2367,9 @@ fn foo() {
     o += 1;$0
     k += o;
     m = 1;
-}",
-            r"
+}
+"#,
+            r#"
 fn foo() {
     let n = 1;
     let (mut k, mut m, o) = fun_name(n);
@@ -2304,7 +2383,8 @@ fn $0fun_name(n: i32) -> (i32, i32, i32) {
     let mut o = m + 3;
     o += 1;
     (k, m, o)
-}",
+}
+"#,
         );
     }
 
@@ -2312,13 +2392,14 @@ fn $0fun_name(n: i32) -> (i32, i32, i32) {
     fn nontrivial_patterns_define_variables() {
         check_assist(
             extract_function,
-            r"
+            r#"
 struct Counter(i32);
 fn foo() {
     $0let Counter(n) = Counter(0);$0
     let m = n;
-}",
-            r"
+}
+"#,
+            r#"
 struct Counter(i32);
 fn foo() {
     let n = fun_name();
@@ -2328,7 +2409,8 @@ fn foo() {
 fn $0fun_name() -> i32 {
     let Counter(n) = Counter(0);
     n
-}",
+}
+"#,
         );
     }
 
@@ -2336,13 +2418,14 @@ fn $0fun_name() -> i32 {
     fn struct_with_two_fields_pattern_define_variables() {
         check_assist(
             extract_function,
-            r"
+            r#"
 struct Counter { n: i32, m: i32 };
 fn foo() {
     $0let Counter { n, m: k } = Counter { n: 1, m: 2 };$0
     let h = n + k;
-}",
-            r"
+}
+"#,
+            r#"
 struct Counter { n: i32, m: i32 };
 fn foo() {
     let (n, k) = fun_name();
@@ -2352,7 +2435,8 @@ fn foo() {
 fn $0fun_name() -> (i32, i32) {
     let Counter { n, m: k } = Counter { n: 1, m: 2 };
     (n, k)
-}",
+}
+"#,
         );
     }
 
@@ -2360,13 +2444,14 @@ fn $0fun_name() -> (i32, i32) {
     fn mut_var_from_outer_scope() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn foo() {
     let mut n = 1;
     $0n += 1;$0
     let m = n + 1;
-}",
-            r"
+}
+"#,
+            r#"
 fn foo() {
     let mut n = 1;
     fun_name(&mut n);
@@ -2375,7 +2460,8 @@ fn foo() {
 
 fn $0fun_name(n: &mut i32) {
     *n += 1;
-}",
+}
+"#,
         );
     }
 
@@ -2383,14 +2469,15 @@ fn $0fun_name(n: &mut i32) {
     fn mut_field_from_outer_scope() {
         check_assist(
             extract_function,
-            r"
+            r#"
 struct C { n: i32 }
 fn foo() {
     let mut c = C { n: 0 };
     $0c.n += 1;$0
     let m = c.n + 1;
-}",
-            r"
+}
+"#,
+            r#"
 struct C { n: i32 }
 fn foo() {
     let mut c = C { n: 0 };
@@ -2400,7 +2487,8 @@ fn foo() {
 
 fn $0fun_name(c: &mut C) {
     c.n += 1;
-}",
+}
+"#,
         );
     }
 
@@ -2408,7 +2496,7 @@ fn $0fun_name(c: &mut C) {
     fn mut_nested_field_from_outer_scope() {
         check_assist(
             extract_function,
-            r"
+            r#"
 struct P { n: i32}
 struct C { p: P }
 fn foo() {
@@ -2418,8 +2506,9 @@ fn foo() {
     $0c.p.n += u.p.n;
     let r = &mut v.p.n;$0
     let m = c.p.n + v.p.n + u.p.n;
-}",
-            r"
+}
+"#,
+            r#"
 struct P { n: i32}
 struct C { p: P }
 fn foo() {
@@ -2433,7 +2522,8 @@ fn foo() {
 fn $0fun_name(c: &mut C, u: &C, v: &mut C) {
     c.p.n += u.p.n;
     let r = &mut v.p.n;
-}",
+}
+"#,
         );
     }
 
@@ -2441,7 +2531,7 @@ fn $0fun_name(c: &mut C, u: &C, v: &mut C) {
     fn mut_param_many_usages_stmt() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn bar(k: i32) {}
 trait I: Copy {
     fn succ(&self) -> Self;
@@ -2462,8 +2552,9 @@ fn foo() {
     *v = v.succ();
     n.succ();$0
     let m = n + 1;
-}",
-            r"
+}
+"#,
+            r#"
 fn bar(k: i32) {}
 trait I: Copy {
     fn succ(&self) -> Self;
@@ -2488,7 +2579,8 @@ fn $0fun_name(n: &mut i32) {
     let v = n;
     *v = v.succ();
     n.succ();
-}",
+}
+"#,
         );
     }
 
@@ -2496,7 +2588,7 @@ fn $0fun_name(n: &mut i32) {
     fn mut_param_many_usages_expr() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn bar(k: i32) {}
 trait I: Copy {
     fn succ(&self) -> Self;
@@ -2519,8 +2611,9 @@ fn foo() {
         n.succ();
     }$0
     let m = n + 1;
-}",
-            r"
+}
+"#,
+            r#"
 fn bar(k: i32) {}
 trait I: Copy {
     fn succ(&self) -> Self;
@@ -2545,7 +2638,8 @@ fn $0fun_name(n: &mut i32) {
     let v = n;
     *v = v.succ();
     n.succ();
-}",
+}
+"#,
         );
     }
 
@@ -2553,11 +2647,12 @@ fn $0fun_name(n: &mut i32) {
     fn mut_param_by_value() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn foo() {
     let mut n = 1;
     $0n += 1;$0
-}",
+}
+"#,
             r"
 fn foo() {
     let mut n = 1;
@@ -2566,7 +2661,8 @@ fn foo() {
 
 fn $0fun_name(mut n: i32) {
     n += 1;
-}",
+}
+",
         );
     }
 
@@ -2574,14 +2670,15 @@ fn $0fun_name(mut n: i32) {
     fn mut_param_because_of_mut_ref() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn foo() {
     let mut n = 1;
     $0let v = &mut n;
     *v += 1;$0
     let k = n;
-}",
-            r"
+}
+"#,
+            r#"
 fn foo() {
     let mut n = 1;
     fun_name(&mut n);
@@ -2591,7 +2688,8 @@ fn foo() {
 fn $0fun_name(n: &mut i32) {
     let v = n;
     *v += 1;
-}",
+}
+"#,
         );
     }
 
@@ -2604,8 +2702,9 @@ fn foo() {
     let mut n = 1;
     $0let v = &mut n;
     *v += 1;$0
-}",
-            r"
+}
+",
+            r#"
 fn foo() {
     let mut n = 1;
     fun_name(n);
@@ -2614,7 +2713,8 @@ fn foo() {
 fn $0fun_name(mut n: i32) {
     let v = &mut n;
     *v += 1;
-}",
+}
+"#,
         );
     }
 
@@ -2622,7 +2722,7 @@ fn $0fun_name(mut n: i32) {
     fn mut_method_call() {
         check_assist(
             extract_function,
-            r"
+            r#"
 trait I {
     fn inc(&mut self);
 }
@@ -2632,8 +2732,9 @@ impl I for i32 {
 fn foo() {
     let mut n = 1;
     $0n.inc();$0
-}",
-            r"
+}
+"#,
+            r#"
 trait I {
     fn inc(&mut self);
 }
@@ -2647,7 +2748,8 @@ fn foo() {
 
 fn $0fun_name(mut n: i32) {
     n.inc();
-}",
+}
+"#,
         );
     }
 
@@ -2655,7 +2757,7 @@ fn $0fun_name(mut n: i32) {
     fn shared_method_call() {
         check_assist(
             extract_function,
-            r"
+            r#"
 trait I {
     fn succ(&self);
 }
@@ -2665,7 +2767,8 @@ impl I for i32 {
 fn foo() {
     let mut n = 1;
     $0n.succ();$0
-}",
+}
+"#,
             r"
 trait I {
     fn succ(&self);
@@ -2680,7 +2783,8 @@ fn foo() {
 
 fn $0fun_name(n: i32) {
     n.succ();
-}",
+}
+",
         );
     }
 
@@ -2688,7 +2792,7 @@ fn $0fun_name(n: i32) {
     fn mut_method_call_with_other_receiver() {
         check_assist(
             extract_function,
-            r"
+            r#"
 trait I {
     fn inc(&mut self, n: i32);
 }
@@ -2699,7 +2803,8 @@ fn foo() {
     let mut n = 1;
     $0let mut m = 2;
     m.inc(n);$0
-}",
+}
+"#,
             r"
 trait I {
     fn inc(&mut self, n: i32);
@@ -2715,7 +2820,8 @@ fn foo() {
 fn $0fun_name(n: i32) {
     let mut m = 2;
     m.inc(n);
-}",
+}
+",
         );
     }
 
@@ -2723,12 +2829,13 @@ fn $0fun_name(n: i32) {
     fn non_copy_without_usages_after() {
         check_assist(
             extract_function,
-            r"
+            r#"
 struct Counter(i32);
 fn foo() {
     let c = Counter(0);
     $0let n = c.0;$0
-}",
+}
+"#,
             r"
 struct Counter(i32);
 fn foo() {
@@ -2738,7 +2845,8 @@ fn foo() {
 
 fn $0fun_name(c: Counter) {
     let n = c.0;
-}",
+}
+",
         );
     }
 
@@ -2752,8 +2860,9 @@ fn foo() {
     let c = Counter(0);
     $0let n = c.0;$0
     let m = c.0;
-}",
-            r"
+}
+",
+            r#"
 struct Counter(i32);
 fn foo() {
     let c = Counter(0);
@@ -2763,7 +2872,8 @@ fn foo() {
 
 fn $0fun_name(c: &Counter) {
     let n = c.0;
-}",
+}
+"#,
         );
     }
 
@@ -2771,19 +2881,15 @@ fn $0fun_name(c: &Counter) {
     fn copy_used_after() {
         check_assist(
             extract_function,
-            r##"
-#[lang = "copy"]
-pub trait Copy {}
-impl Copy for i32 {}
+            r#"
+//- minicore: copy
 fn foo() {
     let n = 0;
     $0let m = n;$0
     let k = n;
-}"##,
-            r##"
-#[lang = "copy"]
-pub trait Copy {}
-impl Copy for i32 {}
+}
+"#,
+            r#"
 fn foo() {
     let n = 0;
     fun_name(n);
@@ -2792,7 +2898,8 @@ fn foo() {
 
 fn $0fun_name(n: i32) {
     let m = n;
-}"##,
+}
+"#,
         )
     }
 
@@ -2800,21 +2907,19 @@ fn $0fun_name(n: i32) {
     fn copy_custom_used_after() {
         check_assist(
             extract_function,
-            r##"
-#[lang = "copy"]
-pub trait Copy {}
+            r#"
+//- minicore: copy, derive
+#[derive(Clone, Copy)]
 struct Counter(i32);
-impl Copy for Counter {}
 fn foo() {
     let c = Counter(0);
     $0let n = c.0;$0
     let m = c.0;
-}"##,
-            r##"
-#[lang = "copy"]
-pub trait Copy {}
+}
+"#,
+            r#"
+#[derive(Clone, Copy)]
 struct Counter(i32);
-impl Copy for Counter {}
 fn foo() {
     let c = Counter(0);
     fun_name(c);
@@ -2823,7 +2928,8 @@ fn foo() {
 
 fn $0fun_name(c: Counter) {
     let n = c.0;
-}"##,
+}
+"#,
         );
     }
 
@@ -2831,7 +2937,7 @@ fn $0fun_name(c: Counter) {
     fn indented_stmts() {
         check_assist(
             extract_function,
-            r"
+            r#"
 fn foo() {
     if true {
         loop {
@@ -2839,8 +2945,9 @@ fn foo() {
             let m = 2;$0
         }
     }
-}",
-            r"
+}
+"#,
+            r#"
 fn foo() {
     if true {
         loop {
@@ -2852,7 +2959,8 @@ fn foo() {
 fn $0fun_name() {
     let n = 1;
     let m = 2;
-}",
+}
+"#,
         );
     }
 
@@ -2860,7 +2968,7 @@ fn $0fun_name() {
     fn indented_stmts_inside_mod() {
         check_assist(
             extract_function,
-            r"
+            r#"
 mod bar {
     fn foo() {
         if true {
@@ -2870,8 +2978,9 @@ mod bar {
             }
         }
     }
-}",
-            r"
+}
+"#,
+            r#"
 mod bar {
     fn foo() {
         if true {
@@ -2885,7 +2994,8 @@ mod bar {
         let n = 1;
         let m = 2;
     }
-}",
+}
+"#,
         );
     }
 
@@ -2893,12 +3003,8 @@ mod bar {
     fn break_loop() {
         check_assist(
             extract_function,
-            r##"
-enum Option<T> {
-    #[lang = "None"] None,
-    #[lang = "Some"] Some(T),
-}
-use Option::*;
+            r#"
+//- minicore: option
 fn foo() {
     loop {
         let n = 1;
@@ -2907,13 +3013,9 @@ fn foo() {
         let k = 2;$0
         let h = 1 + k;
     }
-}"##,
-            r##"
-enum Option<T> {
-    #[lang = "None"] None,
-    #[lang = "Some"] Some(T),
 }
-use Option::*;
+"#,
+            r#"
 fn foo() {
     loop {
         let n = 1;
@@ -2930,7 +3032,8 @@ fn $0fun_name(n: i32) -> Option<i32> {
     return None;
     let k = 2;
     Some(k)
-}"##,
+}
+"#,
         );
     }
 
@@ -2938,31 +3041,17 @@ fn $0fun_name(n: i32) -> Option<i32> {
     fn return_to_parent() {
         check_assist(
             extract_function,
-            r##"
-#[lang = "copy"]
-pub trait Copy {}
-impl Copy for i32 {}
-enum Result<T, E> {
-    #[lang = "Ok"] Ok(T),
-    #[lang = "Err"] Err(E),
-}
-use Result::*;
+            r#"
+//- minicore: copy, result
 fn foo() -> i64 {
     let n = 1;
     $0let m = n + 1;
     return 1;
     let k = 2;$0
     (n + k) as i64
-}"##,
-            r##"
-#[lang = "copy"]
-pub trait Copy {}
-impl Copy for i32 {}
-enum Result<T, E> {
-    #[lang = "Ok"] Ok(T),
-    #[lang = "Err"] Err(E),
 }
-use Result::*;
+"#,
+            r#"
 fn foo() -> i64 {
     let n = 1;
     let k = match fun_name(n) {
@@ -2977,7 +3066,8 @@ fn $0fun_name(n: i32) -> Result<i32, i64> {
     return Err(1);
     let k = 2;
     Ok(k)
-}"##,
+}
+"#,
         );
     }
 
@@ -2986,7 +3076,7 @@ fn $0fun_name(n: i32) -> Result<i32, i64> {
         cov_mark::check!(external_control_flow_break_and_continue);
         check_assist_not_applicable(
             extract_function,
-            r##"
+            r#"
 fn foo() {
     loop {
         let n = 1;
@@ -2997,7 +3087,8 @@ fn foo() {
         let k = k + 1;$0
         let r = n + k;
     }
-}"##,
+}
+"#,
         );
     }
 
@@ -3006,7 +3097,7 @@ fn foo() {
         cov_mark::check!(external_control_flow_return_and_bc);
         check_assist_not_applicable(
             extract_function,
-            r##"
+            r#"
 fn foo() {
     loop {
         let n = 1;
@@ -3017,7 +3108,8 @@ fn foo() {
         let k = k + 1;$0
         let r = n + k;
     }
-}"##,
+}
+"#,
         );
     }
 
@@ -3025,7 +3117,7 @@ fn foo() {
     fn break_loop_with_if() {
         check_assist(
             extract_function,
-            r##"
+            r#"
 fn foo() {
     loop {
         let mut n = 1;
@@ -3034,8 +3126,9 @@ fn foo() {
         n += m;$0
         let h = 1 + n;
     }
-}"##,
-            r##"
+}
+"#,
+            r#"
 fn foo() {
     loop {
         let mut n = 1;
@@ -3051,7 +3144,8 @@ fn $0fun_name(n: &mut i32) -> bool {
     return true;
     *n += m;
     false
-}"##,
+}
+"#,
         );
     }
 
@@ -3059,7 +3153,7 @@ fn $0fun_name(n: &mut i32) -> bool {
     fn break_loop_nested() {
         check_assist(
             extract_function,
-            r##"
+            r#"
 fn foo() {
     loop {
         let mut n = 1;
@@ -3069,8 +3163,9 @@ fn foo() {
         }$0
         let h = 1;
     }
-}"##,
-            r##"
+}
+"#,
+            r#"
 fn foo() {
     loop {
         let mut n = 1;
@@ -3087,7 +3182,8 @@ fn $0fun_name(n: i32) -> bool {
         return true;
     }
     false
-}"##,
+}
+"#,
         );
     }
 
@@ -3095,7 +3191,7 @@ fn $0fun_name(n: i32) -> bool {
     fn return_from_nested_loop() {
         check_assist(
             extract_function,
-            r##"
+            r#"
 fn foo() {
     loop {
         let n = 1;
@@ -3107,8 +3203,9 @@ fn foo() {
         let m = k + 1;$0
         let h = 1 + m;
     }
-}"##,
-            r##"
+}
+"#,
+            r#"
 fn foo() {
     loop {
         let n = 1;
@@ -3127,7 +3224,8 @@ fn $0fun_name() -> Option<i32> {
     }
     let m = k + 1;
     Some(m)
-}"##,
+}
+"#,
         );
     }
 
@@ -3135,7 +3233,7 @@ fn $0fun_name() -> Option<i32> {
     fn break_from_nested_loop() {
         check_assist(
             extract_function,
-            r##"
+            r#"
 fn foo() {
     loop {
         let n = 1;
@@ -3146,8 +3244,9 @@ fn foo() {
         let m = k + 1;$0
         let h = 1 + m;
     }
-}"##,
-            r##"
+}
+"#,
+            r#"
 fn foo() {
     loop {
         let n = 1;
@@ -3163,7 +3262,8 @@ fn $0fun_name() -> i32 {
     }
     let m = k + 1;
     m
-}"##,
+}
+"#,
         );
     }
 
@@ -3171,7 +3271,7 @@ fn $0fun_name() -> i32 {
     fn break_from_nested_and_outer_loops() {
         check_assist(
             extract_function,
-            r##"
+            r#"
 fn foo() {
     loop {
         let n = 1;
@@ -3185,8 +3285,9 @@ fn foo() {
         let m = k + 1;$0
         let h = 1 + m;
     }
-}"##,
-            r##"
+}
+"#,
+            r#"
 fn foo() {
     loop {
         let n = 1;
@@ -3208,7 +3309,8 @@ fn $0fun_name() -> Option<i32> {
     }
     let m = k + 1;
     Some(m)
-}"##,
+}
+"#,
         );
     }
 
@@ -3216,7 +3318,7 @@ fn $0fun_name() -> Option<i32> {
     fn return_from_nested_fn() {
         check_assist(
             extract_function,
-            r##"
+            r#"
 fn foo() {
     loop {
         let n = 1;
@@ -3227,8 +3329,9 @@ fn foo() {
         let m = k + 1;$0
         let h = 1 + m;
     }
-}"##,
-            r##"
+}
+"#,
+            r#"
 fn foo() {
     loop {
         let n = 1;
@@ -3244,7 +3347,8 @@ fn $0fun_name() -> i32 {
     }
     let m = k + 1;
     m
-}"##,
+}
+"#,
         );
     }
 
@@ -3252,7 +3356,7 @@ fn $0fun_name() -> i32 {
     fn break_with_value() {
         check_assist(
             extract_function,
-            r##"
+            r#"
 fn foo() -> i32 {
     loop {
         let n = 1;
@@ -3263,8 +3367,9 @@ fn foo() -> i32 {
         let m = k + 1;$0
         let h = 1;
     }
-}"##,
-            r##"
+}
+"#,
+            r#"
 fn foo() -> i32 {
     loop {
         let n = 1;
@@ -3282,7 +3387,8 @@ fn $0fun_name() -> Option<i32> {
     }
     let m = k + 1;
     None
-}"##,
+}
+"#,
         );
     }
 
@@ -3290,7 +3396,7 @@ fn $0fun_name() -> Option<i32> {
     fn break_with_value_and_return() {
         check_assist(
             extract_function,
-            r##"
+            r#"
 fn foo() -> i64 {
     loop {
         let n = 1;
@@ -3302,8 +3408,9 @@ fn foo() -> i64 {
         let m = k + 1;$0
         let h = 1 + m;
     }
-}"##,
-            r##"
+}
+"#,
+            r#"
 fn foo() -> i64 {
     loop {
         let n = 1;
@@ -3322,7 +3429,8 @@ fn $0fun_name() -> Result<i32, i64> {
     }
     let m = k + 1;
     Ok(m)
-}"##,
+}
+"#,
         );
     }
 
@@ -3330,9 +3438,8 @@ fn $0fun_name() -> Result<i32, i64> {
     fn try_option() {
         check_assist(
             extract_function,
-            r##"
-enum Option<T> { None, Some(T), }
-use Option::*;
+            r#"
+//- minicore: option
 fn bar() -> Option<i32> { None }
 fn foo() -> Option<()> {
     let n = bar()?;
@@ -3340,10 +3447,9 @@ fn foo() -> Option<()> {
     let m = k + 1;$0
     let h = 1 + m;
     Some(())
-}"##,
-            r##"
-enum Option<T> { None, Some(T), }
-use Option::*;
+}
+"#,
+            r#"
 fn bar() -> Option<i32> { None }
 fn foo() -> Option<()> {
     let n = bar()?;
@@ -3356,7 +3462,8 @@ fn $0fun_name() -> Option<i32> {
     let k = foo()?;
     let m = k + 1;
     Some(m)
-}"##,
+}
+"#,
         );
     }
 
@@ -3364,19 +3471,17 @@ fn $0fun_name() -> Option<i32> {
     fn try_option_unit() {
         check_assist(
             extract_function,
-            r##"
-enum Option<T> { None, Some(T), }
-use Option::*;
+            r#"
+//- minicore: option
 fn foo() -> Option<()> {
     let n = 1;
     $0let k = foo()?;
     let m = k + 1;$0
     let h = 1 + n;
     Some(())
-}"##,
-            r##"
-enum Option<T> { None, Some(T), }
-use Option::*;
+}
+"#,
+            r#"
 fn foo() -> Option<()> {
     let n = 1;
     fun_name()?;
@@ -3388,7 +3493,8 @@ fn $0fun_name() -> Option<()> {
     let k = foo()?;
     let m = k + 1;
     Some(())
-}"##,
+}
+"#,
         );
     }
 
@@ -3396,19 +3502,17 @@ fn $0fun_name() -> Option<()> {
     fn try_result() {
         check_assist(
             extract_function,
-            r##"
-enum Result<T, E> { Ok(T), Err(E), }
-use Result::*;
+            r#"
+//- minicore: result
 fn foo() -> Result<(), i64> {
     let n = 1;
     $0let k = foo()?;
     let m = k + 1;$0
     let h = 1 + m;
     Ok(())
-}"##,
-            r##"
-enum Result<T, E> { Ok(T), Err(E), }
-use Result::*;
+}
+"#,
+            r#"
 fn foo() -> Result<(), i64> {
     let n = 1;
     let m = fun_name()?;
@@ -3420,7 +3524,8 @@ fn $0fun_name() -> Result<i32, i64> {
     let k = foo()?;
     let m = k + 1;
     Ok(m)
-}"##,
+}
+"#,
         );
     }
 
@@ -3428,9 +3533,8 @@ fn $0fun_name() -> Result<i32, i64> {
     fn try_option_with_return() {
         check_assist(
             extract_function,
-            r##"
-enum Option<T> { None, Some(T) }
-use Option::*;
+            r#"
+//- minicore: option
 fn foo() -> Option<()> {
     let n = 1;
     $0let k = foo()?;
@@ -3440,10 +3544,9 @@ fn foo() -> Option<()> {
     let m = k + 1;$0
     let h = 1 + m;
     Some(())
-}"##,
-            r##"
-enum Option<T> { None, Some(T) }
-use Option::*;
+}
+"#,
+            r#"
 fn foo() -> Option<()> {
     let n = 1;
     let m = fun_name()?;
@@ -3458,7 +3561,8 @@ fn $0fun_name() -> Option<i32> {
     }
     let m = k + 1;
     Some(m)
-}"##,
+}
+"#,
         );
     }
 
@@ -3466,9 +3570,8 @@ fn $0fun_name() -> Option<i32> {
     fn try_result_with_return() {
         check_assist(
             extract_function,
-            r##"
-enum Result<T, E> { Ok(T), Err(E), }
-use Result::*;
+            r#"
+//- minicore: result
 fn foo() -> Result<(), i64> {
     let n = 1;
     $0let k = foo()?;
@@ -3478,10 +3581,9 @@ fn foo() -> Result<(), i64> {
     let m = k + 1;$0
     let h = 1 + m;
     Ok(())
-}"##,
-            r##"
-enum Result<T, E> { Ok(T), Err(E), }
-use Result::*;
+}
+"#,
+            r#"
 fn foo() -> Result<(), i64> {
     let n = 1;
     let m = fun_name()?;
@@ -3496,7 +3598,8 @@ fn $0fun_name() -> Result<i32, i64> {
     }
     let m = k + 1;
     Ok(m)
-}"##,
+}
+"#,
         );
     }
 
@@ -3505,9 +3608,8 @@ fn $0fun_name() -> Result<i32, i64> {
         cov_mark::check!(external_control_flow_try_and_bc);
         check_assist_not_applicable(
             extract_function,
-            r##"
-enum Option<T> { None, Some(T) }
-use Option::*;
+            r#"
+//- minicore: option
 fn foo() -> Option<()> {
     loop {
         let n = Some(1);
@@ -3518,7 +3620,8 @@ fn foo() -> Option<()> {
         let r = n + k;
     }
     Some(())
-}"##,
+}
+"#,
         );
     }
 
@@ -3527,9 +3630,8 @@ fn foo() -> Option<()> {
         cov_mark::check!(external_control_flow_try_and_return_non_err);
         check_assist_not_applicable(
             extract_function,
-            r##"
-enum Result<T, E> { Ok(T), Err(E), }
-use Result::*;
+            r#"
+//- minicore: result
 fn foo() -> Result<(), i64> {
     let n = 1;
     $0let k = foo()?;
@@ -3539,7 +3641,8 @@ fn foo() -> Result<(), i64> {
     let m = k + 1;$0
     let h = 1 + m;
     Ok(())
-}"##,
+}
+"#,
         );
     }
 
@@ -3547,7 +3650,7 @@ fn foo() -> Result<(), i64> {
     fn param_usage_in_macro() {
         check_assist(
             extract_function,
-            r"
+            r#"
 macro_rules! m {
     ($val:expr) => { $val };
 }
@@ -3556,8 +3659,9 @@ fn foo() {
     let n = 1;
     $0let k = n * m!(n);$0
     let m = k + 1;
-}",
-            r"
+}
+"#,
+            r#"
 macro_rules! m {
     ($val:expr) => { $val };
 }
@@ -3571,7 +3675,66 @@ fn foo() {
 fn $0fun_name(n: i32) -> i32 {
     let k = n * m!(n);
     k
-}",
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn extract_with_await() {
+        check_assist(
+            extract_function,
+            r#"
+fn main() {
+    $0some_function().await;$0
+}
+
+async fn some_function() {
+
+}
+"#,
+            r#"
+fn main() {
+    fun_name().await;
+}
+
+async fn $0fun_name() {
+    some_function().await;
+}
+
+async fn some_function() {
+
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn extract_with_await_in_args() {
+        check_assist(
+            extract_function,
+            r#"
+fn main() {
+    $0function_call("a", some_function().await);$0
+}
+
+async fn some_function() {
+
+}
+"#,
+            r#"
+fn main() {
+    fun_name().await;
+}
+
+async fn $0fun_name() {
+    function_call("a", some_function().await);
+}
+
+async fn some_function() {
+
+}
+"#,
         );
     }
 }

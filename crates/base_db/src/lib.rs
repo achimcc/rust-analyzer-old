@@ -1,5 +1,4 @@
 //! base_db defines basic database traits. The concrete DB is defined by ide.
-mod cancellation;
 mod input;
 mod change;
 pub mod fixture;
@@ -10,14 +9,13 @@ use rustc_hash::FxHashSet;
 use syntax::{ast, Parse, SourceFile, TextRange, TextSize};
 
 pub use crate::{
-    cancellation::Canceled,
     change::Change,
     input::{
         CrateData, CrateDisplayName, CrateGraph, CrateId, CrateName, Dependency, Edition, Env,
         ProcMacro, ProcMacroExpander, ProcMacroId, ProcMacroKind, SourceRoot, SourceRootId,
     },
 };
-pub use salsa;
+pub use salsa::{self, Cancelled};
 pub use vfs::{file_set::FileSet, AnchoredPath, AnchoredPathBuf, FileId, VfsPath};
 
 #[macro_export]
@@ -38,52 +36,13 @@ pub trait Upcast<T: ?Sized> {
     fn upcast(&self) -> &T;
 }
 
-pub trait CheckCanceled {
-    /// Aborts current query if there are pending changes.
-    ///
-    /// rust-analyzer needs to be able to answer semantic questions about the
-    /// code while the code is being modified. A common problem is that a
-    /// long-running query is being calculated when a new change arrives.
-    ///
-    /// We can't just apply the change immediately: this will cause the pending
-    /// query to see inconsistent state (it will observe an absence of
-    /// repeatable read). So what we do is we **cancel** all pending queries
-    /// before applying the change.
-    ///
-    /// We implement cancellation by panicking with a special value and catching
-    /// it on the API boundary. Salsa explicitly supports this use-case.
-    fn check_canceled(&self);
-
-    fn catch_canceled<F, T>(&self, f: F) -> Result<T, Canceled>
-    where
-        Self: Sized + panic::RefUnwindSafe,
-        F: FnOnce(&Self) -> T + panic::UnwindSafe,
-    {
-        // Uncomment to debug missing cancellations.
-        // let _span = profile::heartbeat_span();
-        panic::catch_unwind(|| f(self)).map_err(|err| match err.downcast::<Canceled>() {
-            Ok(canceled) => *canceled,
-            Err(payload) => panic::resume_unwind(payload),
-        })
-    }
-}
-
-impl<T: salsa::Database> CheckCanceled for T {
-    fn check_canceled(&self) {
-        // profile::heartbeat();
-        if self.salsa_runtime().is_current_revision_canceled() {
-            Canceled::throw()
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct FilePosition {
     pub file_id: FileId,
     pub offset: TextSize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct FileRange {
     pub file_id: FileId,
     pub range: TextRange,
@@ -101,7 +60,7 @@ pub trait FileLoader {
 /// Database which stores all significant input facts: source code and project
 /// model. Everything else in rust-analyzer is derived from these queries.
 #[salsa::query_group(SourceDatabaseStorage)]
-pub trait SourceDatabase: CheckCanceled + FileLoader + std::fmt::Debug {
+pub trait SourceDatabase: FileLoader + std::fmt::Debug {
     // Parses the file into the syntax tree.
     #[salsa::invoke(parse_query)]
     fn parse(&self, file_id: FileId) -> Parse<ast::SourceFile>;
@@ -161,6 +120,7 @@ impl<T: SourceDatabaseExt> FileLoader for FileLoaderDelegate<&'_ T> {
     }
 
     fn relevant_crates(&self, file_id: FileId) -> Arc<FxHashSet<CrateId>> {
+        let _p = profile::span("relevant_crates");
         let source_root = self.0.file_source_root(file_id);
         self.0.source_root_crates(source_root)
     }

@@ -8,8 +8,7 @@ use std::{
 
 use always_assert::always;
 use crossbeam_channel::{select, Receiver};
-use ide::PrimeCachesProgress;
-use ide::{Canceled, FileId};
+use ide::{FileId, PrimeCachesProgress};
 use ide_db::base_db::VfsPath;
 use lsp_server::{Connection, Notification, Request, Response};
 use lsp_types::notification::Notification as _;
@@ -23,7 +22,7 @@ use crate::{
     from_proto,
     global_state::{file_id_to_url, url_to_file_id, GlobalState},
     handlers, lsp_ext,
-    lsp_utils::{apply_document_changes, is_canceled, notification_is, Progress},
+    lsp_utils::{apply_document_changes, is_cancelled, notification_is, Progress},
     reload::{BuildDataProgress, ProjectWorkspaceProgress},
     Result,
 };
@@ -104,6 +103,7 @@ impl fmt::Debug for Event {
 impl GlobalState {
     fn run(mut self, inbox: Receiver<lsp_server::Message>) -> Result<()> {
         if self.config.linked_projects().is_empty()
+            && self.config.detached_files().is_empty()
             && self.config.notifications().cargo_toml_not_found
         {
             self.show_message(
@@ -295,6 +295,8 @@ impl GlobalState {
                             state = Progress::End;
                             message = None;
                             fraction = 1.0;
+
+                            self.prime_caches_queue.op_completed(());
                         }
                     };
 
@@ -512,6 +514,8 @@ impl GlobalState {
             .on::<lsp_ext::AnalyzerStatus>(handlers::handle_analyzer_status)
             .on::<lsp_ext::SyntaxTree>(handlers::handle_syntax_tree)
             .on::<lsp_ext::ViewHir>(handlers::handle_view_hir)
+            .on::<lsp_ext::ViewCrateGraph>(handlers::handle_view_crate_graph)
+            .on::<lsp_ext::ViewItemTree>(handlers::handle_view_item_tree)
             .on::<lsp_ext::ExpandMacro>(handlers::handle_expand_macro)
             .on::<lsp_ext::ParentModule>(handlers::handle_parent_module)
             .on::<lsp_ext::Runnables>(handlers::handle_runnables)
@@ -523,10 +527,11 @@ impl GlobalState {
             .on::<lsp_ext::ExternalDocs>(handlers::handle_open_docs)
             .on::<lsp_ext::OpenCargoToml>(handlers::handle_open_cargo_toml)
             .on::<lsp_ext::MoveItem>(handlers::handle_move_item)
+            .on::<lsp_ext::WorkspaceSymbol>(handlers::handle_workspace_symbol)
             .on::<lsp_types::request::OnTypeFormatting>(handlers::handle_on_type_formatting)
             .on::<lsp_types::request::DocumentSymbolRequest>(handlers::handle_document_symbol)
-            .on::<lsp_types::request::WorkspaceSymbol>(handlers::handle_workspace_symbol)
             .on::<lsp_types::request::GotoDefinition>(handlers::handle_goto_definition)
+            .on::<lsp_types::request::GotoDeclaration>(handlers::handle_goto_declaration)
             .on::<lsp_types::request::GotoImplementation>(handlers::handle_goto_implementation)
             .on::<lsp_types::request::GotoTypeDefinition>(handlers::handle_goto_type_definition)
             .on::<lsp_types::request::Completion>(handlers::handle_completion)
@@ -539,6 +544,7 @@ impl GlobalState {
             .on::<lsp_types::request::Rename>(handlers::handle_rename)
             .on::<lsp_types::request::References>(handlers::handle_references)
             .on::<lsp_types::request::Formatting>(handlers::handle_formatting)
+            .on::<lsp_types::request::RangeFormatting>(handlers::handle_range_formatting)
             .on::<lsp_types::request::DocumentHighlightRequest>(handlers::handle_document_highlight)
             .on::<lsp_types::request::CallHierarchyPrepare>(handlers::handle_call_hierarchy_prepare)
             .on::<lsp_types::request::CallHierarchyIncomingCalls>(
@@ -696,7 +702,7 @@ impl GlobalState {
                     },
                 );
 
-                return Ok(());
+                Ok(())
             })?
             .on::<lsp_types::notification::DidChangeWatchedFiles>(|this, params| {
                 for change in params.changes {
@@ -711,18 +717,23 @@ impl GlobalState {
     }
     fn update_file_notifications_on_threadpool(&mut self) {
         self.maybe_update_diagnostics();
+
+        // Ensure that only one cache priming task can run at a time
+        self.prime_caches_queue.request_op(());
+        if self.prime_caches_queue.should_start_op().is_none() {
+            return;
+        }
+
         self.task_pool.handle.spawn_with_sender({
             let snap = self.snapshot();
             move |sender| {
-                snap.analysis
-                    .prime_caches(|progress| {
-                        sender.send(Task::PrimeCaches(progress)).unwrap();
-                    })
-                    .unwrap_or_else(|_: Canceled| {
-                        // Pretend that we're done, so that the progress bar is removed. Otherwise
-                        // the editor may complain about it already existing.
-                        sender.send(Task::PrimeCaches(PrimeCachesProgress::Finished)).unwrap()
-                    });
+                let cb = |progress| {
+                    sender.send(Task::PrimeCaches(progress)).unwrap();
+                };
+                match snap.analysis.prime_caches(cb) {
+                    Ok(()) => (),
+                    Err(_canceled) => (),
+                }
             }
         });
     }
@@ -730,7 +741,7 @@ impl GlobalState {
         let subscriptions = self
             .mem_docs
             .keys()
-            .map(|path| self.vfs.read().0.file_id(&path).unwrap())
+            .map(|path| self.vfs.read().0.file_id(path).unwrap())
             .collect::<Vec<_>>();
 
         log::trace!("updating notifications for {:?}", subscriptions);
@@ -742,7 +753,7 @@ impl GlobalState {
                     .filter_map(|file_id| {
                         handlers::publish_diagnostics(&snapshot, file_id)
                             .map_err(|err| {
-                                if !is_canceled(&*err) {
+                                if !is_cancelled(&*err) {
                                     log::error!("failed to compute diagnostics: {:?}", err);
                                 }
                                 ()

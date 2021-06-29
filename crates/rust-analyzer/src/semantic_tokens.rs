@@ -46,7 +46,7 @@ define_semantic_token_types![
     (BRACE, "brace"),
     (BRACKET, "bracket"),
     (BUILTIN_TYPE, "builtinType"),
-    (CHAR_LITERAL, "characterLiteral"),
+    (CHAR, "character"),
     (COLON, "colon"),
     (COMMA, "comma"),
     (COMPARISON, "comparison"),
@@ -91,6 +91,9 @@ define_semantic_token_modifiers![
     (INJECTED, "injected"),
     (MUTABLE, "mutable"),
     (CONSUMING, "consuming"),
+    (ASYNC, "async"),
+    (LIBRARY, "library"),
+    (PUBLIC, "public"),
     (UNSAFE, "unsafe"),
     (ATTRIBUTE_MODIFIER, "attribute"),
     (TRAIT_MODIFIER, "trait"),
@@ -110,7 +113,7 @@ impl ops::BitOrAssign<SemanticTokenModifier> for ModifierSet {
 
 /// Tokens are encoded relative to each other.
 ///
-/// This is a direct port of https://github.com/microsoft/vscode-languageserver-node/blob/f425af9de46a0187adb78ec8a46b9b2ce80c5412/server/src/sematicTokens.proposed.ts#L45
+/// This is a direct port of <https://github.com/microsoft/vscode-languageserver-node/blob/f425af9de46a0187adb78ec8a46b9b2ce80c5412/server/src/sematicTokens.proposed.ts#L45>
 pub(crate) struct SemanticTokensBuilder {
     id: String,
     prev_line: u32,
@@ -183,8 +186,8 @@ pub(crate) fn diff_tokens(old: &[SemanticToken], new: &[SemanticToken]) -> Vec<S
     }
 }
 
-pub(crate) fn type_index(type_: SemanticTokenType) -> u32 {
-    SUPPORTED_TYPES.iter().position(|it| *it == type_).unwrap() as u32
+pub(crate) fn type_index(ty: SemanticTokenType) -> u32 {
+    SUPPORTED_TYPES.iter().position(|it| *it == ty).unwrap() as u32
 }
 
 #[cfg(test)]

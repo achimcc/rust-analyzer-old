@@ -1,6 +1,39 @@
 //! A simplified AST that only contains items.
+//!
+//! This is the primary IR used throughout `hir_def`. It is the input to the name resolution
+//! algorithm, as well as to the queries defined in `adt.rs`, `data.rs`, and most things in
+//! `attr.rs`.
+//!
+//! `ItemTree`s are built per `HirFileId`, from the syntax tree of the parsed file. This means that
+//! they are crate-independent: they don't know which `#[cfg]`s are active or which module they
+//! belong to, since those concepts don't exist at this level (a single `ItemTree` might be part of
+//! multiple crates, or might be included into the same crate twice via `#[path]`).
+//!
+//! One important purpose of this layer is to provide an "invalidation barrier" for incremental
+//! computations: when typing inside an item body, the `ItemTree` of the modified file is typically
+//! unaffected, so we don't have to recompute name resolution results or item data (see `data.rs`).
+//!
+//! The `ItemTree` for the currently open file can be displayed by using the VS Code command
+//! "Rust Analyzer: Debug ItemTree".
+//!
+//! Compared to rustc's architecture, `ItemTree` has properties from both rustc's AST and HIR: many
+//! syntax-level Rust features are already desugared to simpler forms in the `ItemTree`, but name
+//! resolution has not yet been performed. `ItemTree`s are per-file, while rustc's AST and HIR are
+//! per-crate, because we are interested in incrementally computing it.
+//!
+//! The representation of items in the `ItemTree` should generally mirror the surface syntax: it is
+//! usually a bad idea to desugar a syntax-level construct to something that is structurally
+//! different here. Name resolution needs to be able to process attributes and expand macros
+//! (including attribute macros), and having a 1-to-1 mapping between syntax and the `ItemTree`
+//! avoids introducing subtle bugs.
+//!
+//! In general, any item in the `ItemTree` stores its `AstId`, which allows mapping it back to its
+//! surface syntax.
 
 mod lower;
+mod pretty;
+#[cfg(test)]
+mod tests;
 
 use std::{
     any::type_name,
@@ -18,7 +51,7 @@ use hir_expand::{
     ast_id_map::FileAstId,
     hygiene::Hygiene,
     name::{name, AsName, Name},
-    HirFileId, InFile,
+    FragmentKind, HirFileId, InFile,
 };
 use la_arena::{Arena, Idx, RawIdx};
 use profile::Count;
@@ -88,7 +121,7 @@ impl ItemTree {
         let mut item_tree = match_ast! {
             match syntax {
                 ast::SourceFile(file) => {
-                    top_attrs = Some(RawAttrs::new(&file, &hygiene));
+                    top_attrs = Some(RawAttrs::new(db, &file, &hygiene));
                     ctx.lower_module_items(&file)
                 },
                 ast::MacroItems(items) => {
@@ -132,6 +165,7 @@ impl ItemTree {
             let ItemTreeData {
                 imports,
                 extern_crates,
+                extern_blocks,
                 functions,
                 params,
                 structs,
@@ -154,6 +188,7 @@ impl ItemTree {
 
             imports.shrink_to_fit();
             extern_crates.shrink_to_fit();
+            extern_blocks.shrink_to_fit();
             functions.shrink_to_fit();
             params.shrink_to_fit();
             structs.shrink_to_fit();
@@ -203,6 +238,10 @@ impl ItemTree {
         }
     }
 
+    pub fn pretty_print(&self) -> String {
+        pretty::print_item_tree(self)
+    }
+
     fn data(&self) -> &ItemTreeData {
         self.data.as_ref().expect("attempted to access data of empty ItemTree")
     }
@@ -239,6 +278,7 @@ static VIS_PUB_CRATE: RawVisibility = RawVisibility::Module(ModPath::from_kind(P
 struct ItemTreeData {
     imports: Arena<Import>,
     extern_crates: Arena<ExternCrate>,
+    extern_blocks: Arena<ExternBlock>,
     functions: Arena<Function>,
     params: Arena<Param>,
     structs: Arena<Struct>,
@@ -432,6 +472,7 @@ macro_rules! mod_items {
 mod_items! {
     Import in imports -> ast::Use,
     ExternCrate in extern_crates -> ast::ExternCrate,
+    ExternBlock in extern_blocks -> ast::ExternBlock,
     Function in functions -> ast::Fn,
     Struct in structs -> ast::Struct,
     Union in unions -> ast::Union,
@@ -482,21 +523,38 @@ impl<N: ItemTreeNode> Index<FileItemTreeId<N>> for ItemTree {
     }
 }
 
-/// A desugared `use` import.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Import {
-    pub path: Interned<ModPath>,
-    pub alias: Option<ImportAlias>,
     pub visibility: RawVisibilityId,
-    pub is_glob: bool,
-    /// AST ID of the `use` or `extern crate` item this import was derived from. Note that many
-    /// `Import`s can map to the same `use` item.
     pub ast_id: FileAstId<ast::Use>,
-    /// Index of this `Import` when the containing `Use` is visited via `ModPath::expand_use_item`.
-    ///
-    /// This can be used to get the `UseTree` this `Import` corresponds to and allows emitting
-    /// precise diagnostics.
-    pub index: usize,
+    pub use_tree: UseTree,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct UseTree {
+    pub index: Idx<ast::UseTree>,
+    kind: UseTreeKind,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum UseTreeKind {
+    /// ```
+    /// use path::to::Item;
+    /// use path::to::Item as Renamed;
+    /// use path::to::Trait as _;
+    /// ```
+    Single { path: Interned<ModPath>, alias: Option<ImportAlias> },
+
+    /// ```
+    /// use *;  // (invalid, but can occur in nested tree)
+    /// use path::*;
+    /// ```
+    Glob { path: Option<Interned<ModPath>> },
+
+    /// ```
+    /// use prefix::{self, Item, ...};
+    /// ```
+    Prefixed { prefix: Option<Interned<ModPath>>, list: Box<[UseTree]> },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -508,6 +566,13 @@ pub struct ExternCrate {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ExternBlock {
+    pub abi: Option<Interned<str>>,
+    pub ast_id: FileAstId<ast::ExternBlock>,
+    pub children: Box<[ModItem]>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Function {
     pub name: Name,
     pub visibility: RawVisibilityId,
@@ -515,6 +580,7 @@ pub struct Function {
     pub abi: Option<Interned<str>>,
     pub params: IdRange<Param>,
     pub ret_type: Interned<TypeRef>,
+    pub async_ret_type: Option<Interned<TypeRef>>,
     pub ast_id: FileAstId<ast::Fn>,
     pub(crate) flags: FnFlags,
 }
@@ -549,17 +615,6 @@ pub struct Struct {
     pub generic_params: Interned<GenericParams>,
     pub fields: Fields,
     pub ast_id: FileAstId<ast::Struct>,
-    pub kind: StructDefKind,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum StructDefKind {
-    /// `struct S { ... }` - type namespace only.
-    Record,
-    /// `struct S(...);`
-    Tuple,
-    /// `struct S;`
-    Unit,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -607,7 +662,6 @@ pub struct Trait {
     pub generic_params: Interned<GenericParams>,
     pub is_auto: bool,
     pub is_unsafe: bool,
-    pub bounds: Box<[TypeBound]>,
     pub items: Box<[AssocItem]>,
     pub ast_id: FileAstId<ast::Trait>,
 }
@@ -627,7 +681,7 @@ pub struct TypeAlias {
     pub name: Name,
     pub visibility: RawVisibilityId,
     /// Bounds on the type alias itself. Only valid in trait declarations, eg. `type Assoc: Copy;`.
-    pub bounds: Box<[TypeBound]>,
+    pub bounds: Box<[Interned<TypeBound>]>,
     pub generic_params: Interned<GenericParams>,
     pub type_ref: Option<Interned<TypeRef>>,
     pub is_extern: bool,
@@ -656,6 +710,7 @@ pub struct MacroCall {
     /// Path to the called macro.
     pub path: Interned<ModPath>,
     pub ast_id: FileAstId<ast::MacroCall>,
+    pub fragment: FragmentKind,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -671,6 +726,97 @@ pub struct MacroDef {
     pub name: Name,
     pub visibility: RawVisibilityId,
     pub ast_id: FileAstId<ast::MacroDef>,
+}
+
+impl Import {
+    /// Maps a `UseTree` contained in this import back to its AST node.
+    pub fn use_tree_to_ast(
+        &self,
+        db: &dyn DefDatabase,
+        file_id: HirFileId,
+        index: Idx<ast::UseTree>,
+    ) -> ast::UseTree {
+        // Re-lower the AST item and get the source map.
+        // Note: The AST unwraps are fine, since if they fail we should have never obtained `index`.
+        let ast = InFile::new(file_id, self.ast_id).to_node(db.upcast());
+        let ast_use_tree = ast.use_tree().expect("missing `use_tree`");
+        let hygiene = Hygiene::new(db.upcast(), file_id);
+        let (_, source_map) =
+            lower::lower_use_tree(db, &hygiene, ast_use_tree).expect("failed to lower use tree");
+        source_map[index].clone()
+    }
+}
+
+impl UseTree {
+    /// Expands the `UseTree` into individually imported `ModPath`s.
+    pub fn expand(
+        &self,
+        mut cb: impl FnMut(Idx<ast::UseTree>, ModPath, /* is_glob */ bool, Option<ImportAlias>),
+    ) {
+        self.expand_impl(None, &mut cb)
+    }
+
+    fn expand_impl(
+        &self,
+        prefix: Option<ModPath>,
+        cb: &mut dyn FnMut(
+            Idx<ast::UseTree>,
+            ModPath,
+            /* is_glob */ bool,
+            Option<ImportAlias>,
+        ),
+    ) {
+        fn concat_mod_paths(prefix: Option<ModPath>, path: &ModPath) -> Option<ModPath> {
+            match (prefix, &path.kind) {
+                (None, _) => Some(path.clone()),
+                (Some(mut prefix), PathKind::Plain) => {
+                    for segment in path.segments() {
+                        prefix.push_segment(segment.clone());
+                    }
+                    Some(prefix)
+                }
+                (Some(prefix), PathKind::Super(0)) => {
+                    // `some::path::self` == `some::path`
+                    if path.segments().is_empty() {
+                        Some(prefix)
+                    } else {
+                        None
+                    }
+                }
+                (Some(_), _) => None,
+            }
+        }
+
+        match &self.kind {
+            UseTreeKind::Single { path, alias } => {
+                if let Some(path) = concat_mod_paths(prefix, path) {
+                    cb(self.index, path, false, alias.clone());
+                }
+            }
+            UseTreeKind::Glob { path: Some(path) } => {
+                if let Some(path) = concat_mod_paths(prefix, path) {
+                    cb(self.index, path, true, None);
+                }
+            }
+            UseTreeKind::Glob { path: None } => {
+                if let Some(prefix) = prefix {
+                    cb(self.index, prefix, true, None);
+                }
+            }
+            UseTreeKind::Prefixed { prefix: additional_prefix, list } => {
+                let prefix = match additional_prefix {
+                    Some(path) => match concat_mod_paths(prefix, path) {
+                        Some(path) => Some(path),
+                        None => return,
+                    },
+                    None => prefix,
+                };
+                for tree in &**list {
+                    tree.expand_impl(prefix.clone(), cb);
+                }
+            }
+        }
+    }
 }
 
 macro_rules! impl_froms {
@@ -690,6 +836,7 @@ impl ModItem {
         match self {
             ModItem::Import(_)
             | ModItem::ExternCrate(_)
+            | ModItem::ExternBlock(_)
             | ModItem::Struct(_)
             | ModItem::Union(_)
             | ModItem::Enum(_)
@@ -714,6 +861,7 @@ impl ModItem {
         match self {
             ModItem::Import(it) => tree[it.index].ast_id().upcast(),
             ModItem::ExternCrate(it) => tree[it.index].ast_id().upcast(),
+            ModItem::ExternBlock(it) => tree[it.index].ast_id().upcast(),
             ModItem::Function(it) => tree[it.index].ast_id().upcast(),
             ModItem::Struct(it) => tree[it.index].ast_id().upcast(),
             ModItem::Union(it) => tree[it.index].ast_id().upcast(),
@@ -772,6 +920,10 @@ pub struct IdRange<T> {
 impl<T> IdRange<T> {
     fn new(range: Range<Idx<T>>) -> Self {
         Self { range: range.start.into_raw().into()..range.end.into_raw().into(), _p: PhantomData }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.range.is_empty()
     }
 }
 

@@ -116,6 +116,7 @@ fn get_crate_data(
         load_out_dirs_from_check: true,
         wrap_rustc: true,
         with_proc_macro: false,
+        prefill_caches: (),
     };
     let (sender, receiver) = unbounded();
     let mut vfs = vfs::Vfs::default();

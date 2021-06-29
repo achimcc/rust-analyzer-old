@@ -1,5 +1,6 @@
-//! FIXME: write short doc here
+//! See [`CargoWorkspace`].
 
+use std::iter;
 use std::path::PathBuf;
 use std::{convert::TryInto, ops, process::Command, sync::Arc};
 
@@ -12,10 +13,10 @@ use rustc_hash::FxHashMap;
 use serde::Deserialize;
 use serde_json::from_value;
 
-use crate::build_data::BuildDataConfig;
-use crate::utf8_stdout;
+use crate::CfgOverrides;
+use crate::{build_data::BuildDataConfig, utf8_stdout};
 
-/// `CargoWorkspace` represents the logical structure of, well, a Cargo
+/// [`CargoWorkspace`] represents the logical structure of, well, a Cargo
 /// workspace. It pretty closely mirrors `cargo metadata` output.
 ///
 /// Note that internally, rust analyzer uses a different structure:
@@ -77,6 +78,21 @@ pub struct CargoConfig {
 
     /// rustc private crate source
     pub rustc_source: Option<RustcSource>,
+
+    /// crates to disable `#[cfg(test)]` on
+    pub unset_test_crates: Vec<String>,
+}
+
+impl CargoConfig {
+    pub fn cfg_overrides(&self) -> CfgOverrides {
+        self.unset_test_crates
+            .iter()
+            .cloned()
+            .zip(iter::repeat_with(|| {
+                cfg::CfgDiff::new(Vec::new(), vec![cfg::CfgAtom::Flag("test".into())]).unwrap()
+            }))
+            .collect()
+    }
 }
 
 pub type Package = Idx<PackageData>;
@@ -119,6 +135,38 @@ pub struct RustAnalyzerPackageMetaData {
 pub struct PackageDependency {
     pub pkg: Package,
     pub name: String,
+    pub kind: DepKind,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord)]
+pub enum DepKind {
+    /// Available to the library, binary, and dev targets in the package (but not the build script).
+    Normal,
+    /// Available only to test and bench targets (and the library target, when built with `cfg(test)`).
+    Dev,
+    /// Available only to the build script target.
+    Build,
+}
+
+impl DepKind {
+    fn iter(list: &[cargo_metadata::DepKindInfo]) -> impl Iterator<Item = Self> + '_ {
+        let mut dep_kinds = Vec::new();
+        if list.is_empty() {
+            dep_kinds.push(Self::Normal);
+        }
+        for info in list {
+            let kind = match info.kind {
+                cargo_metadata::DependencyKind::Normal => Self::Normal,
+                cargo_metadata::DependencyKind::Development => Self::Dev,
+                cargo_metadata::DependencyKind::Build => Self::Build,
+                cargo_metadata::DependencyKind::Unknown => continue,
+            };
+            dep_kinds.push(kind);
+        }
+        dep_kinds.sort_unstable();
+        dep_kinds.dedup();
+        dep_kinds.into_iter()
+    }
 }
 
 /// Information associated with a package's target
@@ -144,6 +192,7 @@ pub enum TargetKind {
     Example,
     Test,
     Bench,
+    BuildScript,
     Other,
 }
 
@@ -155,6 +204,7 @@ impl TargetKind {
                 "test" => TargetKind::Test,
                 "bench" => TargetKind::Bench,
                 "example" => TargetKind::Example,
+                "custom-build" => TargetKind::BuildScript,
                 "proc-macro" => TargetKind::Lib,
                 _ if kind.contains("lib") => TargetKind::Lib,
                 _ => continue,
@@ -201,31 +251,12 @@ impl CargoWorkspace {
         if let Some(parent) = cargo_toml.parent() {
             meta.current_dir(parent.to_path_buf());
         }
-        let target = if let Some(target) = config.target.as_ref() {
+        let target = if let Some(target) = &config.target {
             Some(target.clone())
+        } else if let stdout @ Some(_) = cargo_config_build_target(cargo_toml) {
+            stdout
         } else {
-            // cargo metadata defaults to giving information for _all_ targets.
-            // In the absence of a preference from the user, we use the host platform.
-            let mut rustc = Command::new(toolchain::rustc());
-            rustc.current_dir(cargo_toml.parent().unwrap()).arg("-vV");
-            log::debug!("Discovering host platform by {:?}", rustc);
-            match utf8_stdout(rustc) {
-                Ok(stdout) => {
-                    let field = "host: ";
-                    let target = stdout.lines().find_map(|l| l.strip_prefix(field));
-                    if let Some(target) = target {
-                        Some(target.to_string())
-                    } else {
-                        // If we fail to resolve the host platform, it's not the end of the world.
-                        log::info!("rustc -vV did not report host platform, got:\n{}", stdout);
-                        None
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Failed to discover host platform: {}", e);
-                    None
-                }
-            }
+            rustc_discover_host_triple(cargo_toml)
         };
         if let Some(target) = target {
             meta.other_options(vec![String::from("--filter-platform"), target]);
@@ -264,7 +295,7 @@ impl CargoWorkspace {
                 id, edition, name, manifest_path, version, metadata, ..
             } = meta_pkg;
             let meta = from_value::<PackageMetadata>(metadata.clone()).unwrap_or_default();
-            let is_member = ws_members.contains(&id);
+            let is_member = ws_members.contains(id);
             let edition = edition
                 .parse::<Edition>()
                 .with_context(|| format!("Failed to parse edition {}", edition))?;
@@ -309,7 +340,11 @@ impl CargoWorkspace {
                 }
             };
             node.deps.sort_by(|a, b| a.pkg.cmp(&b.pkg));
-            for dep_node in node.deps {
+            for (dep_node, kind) in node
+                .deps
+                .iter()
+                .flat_map(|dep| DepKind::iter(&dep.dep_kinds).map(move |kind| (dep, kind)))
+            {
                 let pkg = match pkg_by_id.get(&dep_node.pkg) {
                     Some(&pkg) => pkg,
                     None => {
@@ -320,7 +355,7 @@ impl CargoWorkspace {
                         continue;
                     }
                 };
-                let dep = PackageDependency { name: dep_node.name, pkg };
+                let dep = PackageDependency { name: dep_node.name.clone(), pkg, kind };
                 packages[source].dependencies.push(dep);
             }
             packages[source].active_features.extend(node.features);
@@ -328,11 +363,8 @@ impl CargoWorkspace {
 
         let workspace_root =
             AbsPathBuf::assert(PathBuf::from(meta.workspace_root.into_os_string()));
-        let build_data_config = BuildDataConfig::new(
-            cargo_toml.to_path_buf(),
-            config.clone(),
-            Arc::new(meta.packages.clone()),
-        );
+        let build_data_config =
+            BuildDataConfig::new(cargo_toml.to_path_buf(), config.clone(), Arc::new(meta.packages));
 
         Ok(CargoWorkspace { packages, targets, workspace_root, build_data_config })
     }
@@ -366,5 +398,45 @@ impl CargoWorkspace {
 
     fn is_unique(&self, name: &str) -> bool {
         self.packages.iter().filter(|(_, v)| v.name == name).count() == 1
+    }
+}
+
+fn rustc_discover_host_triple(cargo_toml: &AbsPath) -> Option<String> {
+    let mut rustc = Command::new(toolchain::rustc());
+    rustc.current_dir(cargo_toml.parent().unwrap()).arg("-vV");
+    log::debug!("Discovering host platform by {:?}", rustc);
+    match utf8_stdout(rustc) {
+        Ok(stdout) => {
+            let field = "host: ";
+            let target = stdout.lines().find_map(|l| l.strip_prefix(field));
+            if let Some(target) = target {
+                Some(target.to_string())
+            } else {
+                // If we fail to resolve the host platform, it's not the end of the world.
+                log::info!("rustc -vV did not report host platform, got:\n{}", stdout);
+                None
+            }
+        }
+        Err(e) => {
+            log::warn!("Failed to discover host platform: {}", e);
+            None
+        }
+    }
+}
+
+fn cargo_config_build_target(cargo_toml: &AbsPath) -> Option<String> {
+    let mut cargo_config = Command::new(toolchain::cargo());
+    cargo_config
+        .current_dir(cargo_toml.parent().unwrap())
+        .args(&["-Z", "unstable-options", "config", "get", "build.target"])
+        .env("RUSTC_BOOTSTRAP", "1");
+    // if successful we receive `build.target = "target-triple"`
+    log::debug!("Discovering cargo config target by {:?}", cargo_config);
+    match utf8_stdout(cargo_config) {
+        Ok(stdout) => stdout
+            .strip_prefix("build.target = \"")
+            .and_then(|stdout| stdout.strip_suffix('"'))
+            .map(ToOwned::to_owned),
+        Err(_) => None,
     }
 }

@@ -264,7 +264,7 @@ fn prelude_is_macro_use() {
     cov_mark::check!(prelude_is_macro_use);
     check(
         r#"
-//- /main.rs crate:main deps:foo
+//- /main.rs crate:main deps:std
 structs!(Foo);
 structs_priv!(Bar);
 structs_outside!(Out);
@@ -276,20 +276,19 @@ mod bar;
 structs!(Baz);
 crate::structs!(MacroNotResolved3);
 
-//- /lib.rs crate:foo
-#[prelude_import]
-use self::prelude::*;
-
-mod prelude {
-    #[macro_export]
-    macro_rules! structs {
-        ($i:ident) => { struct $i; }
-    }
-
-    mod priv_mod {
+//- /lib.rs crate:std
+pub mod prelude {
+    pub mod rust_2018 {
         #[macro_export]
-        macro_rules! structs_priv {
+        macro_rules! structs {
             ($i:ident) => { struct $i; }
+        }
+
+        mod priv_mod {
+            #[macro_export]
+            macro_rules! structs_priv {
+                ($i:ident) => { struct $i; }
+            }
         }
     }
 }
@@ -617,12 +616,11 @@ fn macro_dollar_crate_is_correct_in_indirect_deps() {
 foo!();
 
 //- /std.rs crate:std deps:core
-#[prelude_import]
-use self::prelude::*;
-
 pub use core::foo;
 
-mod prelude {}
+pub mod prelude {
+    pub mod rust_2018 {}
+}
 
 #[macro_use]
 mod std_macros;
@@ -681,6 +679,130 @@ pub trait Clone {}
         expect![[r#"
             crate
             Clone: t m
+        "#]],
+    );
+}
+
+#[test]
+fn builtin_derive_with_unresolved_attributes_fall_back() {
+    // Tests that we still resolve derives after ignoring an unresolved attribute.
+    cov_mark::check!(unresolved_attribute_fallback);
+    let map = compute_crate_def_map(
+        r#"
+        //- /main.rs crate:main deps:core
+        use core::Clone;
+
+        #[derive(Clone)]
+        #[unresolved]
+        struct Foo;
+
+        //- /core.rs crate:core
+        #[rustc_builtin_macro]
+        pub macro Clone {}
+        "#,
+    );
+    assert_eq!(map.modules[map.root].scope.impls().len(), 1);
+}
+
+#[test]
+fn unresolved_attributes_fall_back_track_per_file_moditems() {
+    // Tests that we track per-file ModItems when ignoring an unresolved attribute.
+    // Just tracking the `ModItem` leads to `Foo` getting ignored.
+
+    check(
+        r#"
+        //- /main.rs crate:main
+
+        mod submod;
+
+        #[unresolved]
+        struct Foo;
+
+        //- /submod.rs
+        #[unresolved]
+        struct Bar;
+        "#,
+        expect![[r#"
+            crate
+            Foo: t v
+            submod: t
+
+            crate::submod
+            Bar: t v
+        "#]],
+    );
+}
+
+#[test]
+fn unresolved_attrs_extern_block_hang() {
+    // Regression test for https://github.com/rust-analyzer/rust-analyzer/issues/8905
+    check(
+        r#"
+#[unresolved]
+extern "C" {
+    #[unresolved]
+    fn f();
+}
+    "#,
+        expect![[r#"
+        crate
+        f: v
+    "#]],
+    );
+}
+
+#[test]
+fn macros_in_extern_block() {
+    check(
+        r#"
+macro_rules! m {
+    () => { static S: u8; };
+}
+
+extern {
+    m!();
+}
+    "#,
+        expect![[r#"
+            crate
+            S: v
+        "#]],
+    );
+}
+
+#[test]
+fn resolves_derive_helper() {
+    cov_mark::check!(resolved_derive_helper);
+    check(
+        r#"
+//- /main.rs crate:main deps:proc
+#[derive(proc::Derive)]
+#[helper]
+#[unresolved]
+struct S;
+
+//- /proc.rs crate:proc
+#[proc_macro_derive(Derive, attributes(helper))]
+fn derive() {}
+        "#,
+        expect![[r#"
+            crate
+            S: t v
+        "#]],
+    );
+}
+
+#[test]
+fn unresolved_attr_with_cfg_attr_hang() {
+    // Another regression test for https://github.com/rust-analyzer/rust-analyzer/issues/8905
+    check(
+        r#"
+#[cfg_attr(not(off), unresolved, unresolved)]
+struct S;
+        "#,
+        expect![[r#"
+            crate
+            S: t v
         "#]],
     );
 }
@@ -842,7 +964,6 @@ fn collects_derive_helpers() {
 fn resolve_macro_def() {
     check(
         r#"
-//- /lib.rs
 pub macro structs($($i:ident),*) {
     $(struct $i { field: u32 } )*
 }

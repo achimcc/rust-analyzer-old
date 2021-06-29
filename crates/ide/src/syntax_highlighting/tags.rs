@@ -37,6 +37,8 @@ pub enum HlTag {
     None,
 }
 
+// Don't forget to adjust the feature description in crates/ide/src/syntax_highlighting.rs.
+// And make sure to use the lsp strings used when converting to the protocol in crates\rust-analyzer\src\semantic_tokens.rs, not the names of the variants here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum HlMod {
@@ -65,8 +67,14 @@ pub enum HlMod {
     Static,
     /// Used for items in traits and trait impls.
     Trait,
+    /// Used with keywords like `async` and `await`.
+    Async,
+    /// Used for items from other crates.
+    Library,
+    /// Used for public items.
+    Public,
     // Keep this last!
-    /// Used for unsafe functions, mutable statics, union accesses and unsafe operations.
+    /// Used for unsafe functions, unsafe traits, mutable statics, union accesses and unsafe operations.
     Unsafe,
 }
 
@@ -186,6 +194,9 @@ impl HlMod {
         HlMod::Mutable,
         HlMod::Static,
         HlMod::Trait,
+        HlMod::Async,
+        HlMod::Library,
+        HlMod::Public,
         HlMod::Unsafe,
     ];
 
@@ -203,6 +214,9 @@ impl HlMod {
             HlMod::Mutable => "mutable",
             HlMod::Static => "static",
             HlMod::Trait => "trait",
+            HlMod::Async => "async",
+            HlMod::Library => "library",
+            HlMod::Public => "public",
             HlMod::Unsafe => "unsafe",
         }
     }

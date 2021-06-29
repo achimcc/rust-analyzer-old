@@ -1,30 +1,31 @@
 //! Various extension methods to ast Nodes, which are hard to code-generate.
 //! Extensions for various expressions live in a sibling `expr_extensions` module.
 
-use std::{fmt, iter::successors};
+use std::{borrow::Cow, fmt, iter::successors};
 
 use itertools::Itertools;
 use parser::SyntaxKind;
+use rowan::{GreenNodeData, GreenTokenData, WalkEvent};
 
 use crate::{
-    ast::{self, support, AstNode, AstToken, AttrsOwner, NameOwner, SyntaxNode},
-    SmolStr, SyntaxElement, SyntaxToken, TokenText, T,
+    ast::{self, support, AstChildren, AstNode, AstToken, AttrsOwner, NameOwner, SyntaxNode},
+    NodeOrToken, SmolStr, SyntaxElement, SyntaxToken, TokenText, T,
 };
 
 impl ast::Lifetime {
-    pub fn text(&self) -> TokenText {
+    pub fn text(&self) -> TokenText<'_> {
         text_of_first_token(self.syntax())
     }
 }
 
 impl ast::Name {
-    pub fn text(&self) -> TokenText {
+    pub fn text(&self) -> TokenText<'_> {
         text_of_first_token(self.syntax())
     }
 }
 
 impl ast::NameRef {
-    pub fn text(&self) -> TokenText {
+    pub fn text(&self) -> TokenText<'_> {
         text_of_first_token(self.syntax())
     }
 
@@ -33,11 +34,71 @@ impl ast::NameRef {
     }
 }
 
-fn text_of_first_token(node: &SyntaxNode) -> TokenText {
-    let first_token =
-        node.green().children().next().and_then(|it| it.into_token()).unwrap().to_owned();
+fn text_of_first_token(node: &SyntaxNode) -> TokenText<'_> {
+    fn first_token(green_ref: &GreenNodeData) -> &GreenTokenData {
+        green_ref.children().next().and_then(NodeOrToken::into_token).unwrap()
+    }
 
-    TokenText(first_token)
+    match node.green() {
+        Cow::Borrowed(green_ref) => TokenText::borrowed(first_token(green_ref).text()),
+        Cow::Owned(green) => TokenText::owned(first_token(&green).to_owned()),
+    }
+}
+
+impl ast::BlockExpr {
+    pub fn items(&self) -> AstChildren<ast::Item> {
+        support::children(self.syntax())
+    }
+}
+
+impl ast::Expr {
+    /// Preorder walk all the expression's child expressions.
+    pub fn walk(&self, cb: &mut dyn FnMut(ast::Expr)) {
+        let mut preorder = self.syntax().preorder();
+        while let Some(event) = preorder.next() {
+            let node = match event {
+                WalkEvent::Enter(node) => node,
+                WalkEvent::Leave(_) => continue,
+            };
+            match ast::Stmt::cast(node.clone()) {
+                // recursively walk the initializer, skipping potential const pat expressions
+                // let statements aren't usually nested too deeply so this is fine to recurse on
+                Some(ast::Stmt::LetStmt(l)) => {
+                    if let Some(expr) = l.initializer() {
+                        expr.walk(cb);
+                    }
+                    preorder.skip_subtree();
+                }
+                // Don't skip subtree since we want to process the expression child next
+                Some(ast::Stmt::ExprStmt(_)) => (),
+                // skip inner items which might have their own expressions
+                Some(ast::Stmt::Item(_)) => preorder.skip_subtree(),
+                None => {
+                    // skip const args, those expressions are a different context
+                    if ast::GenericArg::can_cast(node.kind()) {
+                        preorder.skip_subtree();
+                    } else if let Some(expr) = ast::Expr::cast(node) {
+                        let is_different_context = match &expr {
+                            ast::Expr::EffectExpr(effect) => {
+                                matches!(
+                                    effect.effect(),
+                                    ast::Effect::Async(_)
+                                        | ast::Effect::Try(_)
+                                        | ast::Effect::Const(_)
+                                )
+                            }
+                            ast::Expr::ClosureExpr(__) => true,
+                            _ => false,
+                        };
+                        cb(expr);
+                        if is_different_context {
+                            preorder.skip_subtree();
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -139,19 +200,20 @@ impl AttrKind {
 
 impl ast::Attr {
     pub fn as_simple_atom(&self) -> Option<SmolStr> {
-        if self.eq_token().is_some() || self.token_tree().is_some() {
+        let meta = self.meta()?;
+        if meta.eq_token().is_some() || meta.token_tree().is_some() {
             return None;
         }
         self.simple_name()
     }
 
     pub fn as_simple_call(&self) -> Option<(SmolStr, ast::TokenTree)> {
-        let tt = self.token_tree()?;
+        let tt = self.meta()?.token_tree()?;
         Some((self.simple_name()?, tt))
     }
 
     pub fn simple_name(&self) -> Option<SmolStr> {
-        let path = self.path()?;
+        let path = self.meta()?.path()?;
         match (path.segment(), path.qualifier()) {
             (Some(segment), None) => Some(segment.syntax().first_token()?.text().into()),
             _ => None,
@@ -168,6 +230,18 @@ impl ast::Attr {
             (Some(T![#]), Some(T![!])) => AttrKind::Inner,
             _ => AttrKind::Outer,
         }
+    }
+
+    pub fn path(&self) -> Option<ast::Path> {
+        self.meta()?.path()
+    }
+
+    pub fn expr(&self) -> Option<ast::Expr> {
+        self.meta()?.expr()
+    }
+
+    pub fn token_tree(&self) -> Option<ast::TokenTree> {
+        self.meta()?.token_tree()
     }
 }
 
@@ -238,6 +312,13 @@ impl ast::Path {
         }
     }
 
+    pub fn as_single_name_ref(&self) -> Option<ast::NameRef> {
+        match self.qualifier() {
+            Some(_) => None,
+            None => self.segment()?.name_ref(),
+        }
+    }
+
     pub fn first_qualifier_or_self(&self) -> ast::Path {
         successors(Some(self.clone()), ast::Path::qualifier).last().unwrap()
     }
@@ -247,12 +328,24 @@ impl ast::Path {
     }
 
     pub fn segments(&self) -> impl Iterator<Item = ast::PathSegment> + Clone {
-        // cant make use of SyntaxNode::siblings, because the returned Iterator is not clone
         successors(self.first_segment(), |p| {
             p.parent_path().parent_path().and_then(|p| p.segment())
         })
     }
+
+    pub fn qualifiers(&self) -> impl Iterator<Item = ast::Path> + Clone {
+        successors(self.qualifier(), |p| p.qualifier())
+    }
 }
+
+impl ast::Use {
+    pub fn is_simple_glob(&self) -> bool {
+        self.use_tree()
+            .map(|use_tree| use_tree.use_tree_list().is_none() && use_tree.star_token().is_some())
+            .unwrap_or(false)
+    }
+}
+
 impl ast::UseTree {
     pub fn is_simple_path(&self) -> bool {
         self.use_tree_list().is_none() && self.star_token().is_none()
@@ -296,6 +389,15 @@ impl ast::Impl {
         let first = types.next();
         let second = types.next();
         (first, second)
+    }
+
+    pub fn for_trait_name_ref(name_ref: &ast::NameRef) -> Option<ast::Impl> {
+        let this = name_ref.syntax().ancestors().find_map(ast::Impl::cast)?;
+        if this.trait_()?.syntax().text_range().start() == name_ref.syntax().text_range().start() {
+            Some(this)
+        } else {
+            None
+        }
     }
 }
 
@@ -412,7 +514,7 @@ impl fmt::Display for NameOrNameRef {
 }
 
 impl NameOrNameRef {
-    pub fn text(&self) -> TokenText {
+    pub fn text(&self) -> TokenText<'_> {
         match self {
             NameOrNameRef::Name(name) => name.text(),
             NameOrNameRef::NameRef(name_ref) => name_ref.text(),
@@ -603,6 +705,29 @@ impl ast::Visibility {
             None => VisibilityKind::Pub,
         }
     }
+
+    pub fn is_eq_to(&self, other: &Self) -> bool {
+        match (self.kind(), other.kind()) {
+            (VisibilityKind::In(this), VisibilityKind::In(other)) => {
+                stdx::iter_eq_by(this.segments(), other.segments(), |lhs, rhs| {
+                    lhs.kind().zip(rhs.kind()).map_or(false, |it| match it {
+                        (PathSegmentKind::CrateKw, PathSegmentKind::CrateKw)
+                        | (PathSegmentKind::SelfKw, PathSegmentKind::SelfKw)
+                        | (PathSegmentKind::SuperKw, PathSegmentKind::SuperKw) => true,
+                        (PathSegmentKind::Name(lhs), PathSegmentKind::Name(rhs)) => {
+                            lhs.text() == rhs.text()
+                        }
+                        _ => false,
+                    })
+                })
+            }
+            (VisibilityKind::PubSelf, VisibilityKind::PubSelf)
+            | (VisibilityKind::PubSuper, VisibilityKind::PubSuper)
+            | (VisibilityKind::PubCrate, VisibilityKind::PubCrate)
+            | (VisibilityKind::Pub, VisibilityKind::Pub) => true,
+            _ => false,
+        }
+    }
 }
 
 impl ast::LifetimeParam {
@@ -612,6 +737,14 @@ impl ast::LifetimeParam {
             .filter_map(|it| it.into_token())
             .skip_while(|x| x.kind() != T![:])
             .filter(|it| it.kind() == T![lifetime_ident])
+    }
+}
+
+impl ast::Module {
+    /// Returns the parent ast::Module, this is different than the semantic parent in that this only
+    /// considers parent declarations in the AST
+    pub fn parent(&self) -> Option<ast::Module> {
+        self.syntax().ancestors().nth(2).and_then(ast::Module::cast)
     }
 }
 

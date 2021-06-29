@@ -28,7 +28,7 @@ pub(crate) fn reorder_fields(acc: &mut Assists, ctx: &AssistContext) -> Option<(
         .or_else(|| ctx.find_node_at_offset::<ast::RecordPat>().map(Either::Right))?;
 
     let path = record.as_ref().either(|it| it.path(), |it| it.path())?;
-    let ranks = compute_fields_ranks(&path, &ctx)?;
+    let ranks = compute_fields_ranks(&path, ctx)?;
     let get_rank_of_field =
         |of: Option<_>| *ranks.get(&of.unwrap_or_default()).unwrap_or(&usize::MAX);
 
@@ -70,10 +70,10 @@ pub(crate) fn reorder_fields(acc: &mut Assists, ctx: &AssistContext) -> Option<(
         target,
         |builder| match fields {
             Either::Left((sorted, field_list)) => {
-                replace(builder.make_ast_mut(field_list).fields(), sorted)
+                replace(builder.make_mut(field_list).fields(), sorted)
             }
             Either::Right((sorted, field_list)) => {
-                replace(builder.make_ast_mut(field_list).fields(), sorted)
+                replace(builder.make_mut(field_list).fields(), sorted)
             }
         },
     )

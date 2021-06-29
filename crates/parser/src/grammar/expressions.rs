@@ -1,5 +1,3 @@
-//! FIXME: write short doc here
-
 mod atom;
 
 pub(crate) use self::atom::{block_expr, match_arm_list};
@@ -210,7 +208,7 @@ struct Restrictions {
 
 /// Binding powers of operators for a Pratt parser.
 ///
-/// See https://www.oilshell.org/blog/2016/11/03.html
+/// See <https://www.oilshell.org/blog/2016/11/03.html>
 #[rustfmt::skip]
 fn current_op(p: &Parser) -> (u8, SyntaxKind) {
     const NOT_AN_OP: (u8, SyntaxKind) = (0, T![@]);

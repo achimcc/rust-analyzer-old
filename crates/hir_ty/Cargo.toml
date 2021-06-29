@@ -10,7 +10,7 @@ edition = "2018"
 doctest = false
 
 [dependencies]
-cov-mark = { version = "1.1", features = ["thread-local"] }
+cov-mark = "2.0.0-pre.1"
 itertools = "0.10.0"
 arrayvec = "0.7"
 smallvec = "1.2.0"
@@ -18,10 +18,11 @@ ena = "0.14.0"
 log = "0.4.8"
 rustc-hash = "1.1.0"
 scoped-tls = "1"
-chalk-solve = { version = "0.64", default-features = false }
-chalk-ir = "0.64"
-chalk-recursive = "0.64"
+chalk-solve = { version = "0.68", default-features = false }
+chalk-ir = "0.68"
+chalk-recursive = { version = "0.68", default-features = false }
 la-arena = { version = "0.2.0", path = "../../lib/arena" }
+once_cell = { version = "1.5.0" }
 
 stdx = { path = "../stdx", version = "0.0.0" }
 hir_def = { path = "../hir_def", version = "0.0.0" }

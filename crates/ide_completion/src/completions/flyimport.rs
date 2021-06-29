@@ -1,10 +1,10 @@
 //! Feature: completion with imports-on-the-fly
 //!
 //! When completing names in the current scope, proposes additional imports from other modules or crates,
-//! if they can be qualified in the scope and their name contains all symbols from the completion input.
+//! if they can be qualified in the scope, and their name contains all symbols from the completion input.
 //!
 //! To be considered applicable, the name must contain all input symbols in the given order, not necessarily adjacent.
-//! If any input symbol is not lowercased, the name must contain all symbols in exact case; otherwise the contaning is checked case-insensitively.
+//! If any input symbol is not lowercased, the name must contain all symbols in exact case; otherwise the containing is checked case-insensitively.
 //!
 //! ```
 //! fn main() {
@@ -23,8 +23,8 @@
 //! ```
 //!
 //! Also completes associated items, that require trait imports.
-//! If any unresolved and/or partially-qualified path predeces the input, it will be taken into account.
-//! Currently, only the imports with their import path ending with the whole qialifier will be proposed
+//! If any unresolved and/or partially-qualified path precedes the input, it will be taken into account.
+//! Currently, only the imports with their import path ending with the whole qualifier will be proposed
 //! (no fuzzy matching for qualifier).
 //!
 //! ```
@@ -61,14 +61,14 @@
 //! }
 //! ```
 //!
-//! NOTE: currently, if an assoc item comes from a trait that's not currently imported and it also has an unresolved and/or partially-qualified path,
+//! NOTE: currently, if an assoc item comes from a trait that's not currently imported, and it also has an unresolved and/or partially-qualified path,
 //! no imports will be proposed.
 //!
 //! .Fuzzy search details
 //!
 //! To avoid an excessive amount of the results returned, completion input is checked for inclusion in the names only
 //! (i.e. in `HashMap` in the `std::collections::HashMap` path).
-//! For the same reasons, avoids searching for any path imports for inputs with their length less that 2 symbols
+//! For the same reasons, avoids searching for any path imports for inputs with their length less than 2 symbols
 //! (but shows all associated items for any input length).
 //!
 //! .Import configuration
@@ -79,18 +79,17 @@
 //! .LSP and performance implications
 //!
 //! The feature is enabled only if the LSP client supports LSP protocol version 3.16+ and reports the `additionalTextEdits`
-//! (case sensitive) resolve client capability in its client capabilities.
+//! (case-sensitive) resolve client capability in its client capabilities.
 //! This way the server is able to defer the costly computations, doing them for a selected completion item only.
 //! For clients with no such support, all edits have to be calculated on the completion request, including the fuzzy search completion ones,
 //! which might be slow ergo the feature is automatically disabled.
 //!
 //! .Feature toggle
 //!
-//! The feature can be forcefully turned off in the settings with the `rust-analyzer.completion.enableAutoimportCompletions` flag.
-//! Note that having this flag set to `true` does not guarantee that the feature is enabled: your client needs to have the corredponding
+//! The feature can be forcefully turned off in the settings with the `rust-analyzer.completion.autoimport.enable` flag.
+//! Note that having this flag set to `true` does not guarantee that the feature is enabled: your client needs to have the corresponding
 //! capability enabled.
 
-use hir::ModPath;
 use ide_db::helpers::{
     import_assets::{ImportAssets, ImportCandidate},
     insert_use::ImportScope,
@@ -110,12 +109,10 @@ pub(crate) fn import_on_the_fly(acc: &mut Completions, ctx: &CompletionContext) 
     if !ctx.config.enable_imports_on_the_fly {
         return None;
     }
-    if ctx.use_item_syntax.is_some()
-        || ctx.attribute_under_caret.is_some()
-        || ctx.mod_declaration_under_caret.is_some()
-        || ctx.record_lit_syntax.is_some()
-        || ctx.has_trait_parent
-        || ctx.has_impl_parent
+    if ctx.in_use_tree()
+        || ctx.is_path_disallowed()
+        || ctx.expects_item()
+        || ctx.expects_assoc_item()
     {
         return None;
     }
@@ -163,20 +160,20 @@ pub(crate) fn position_for_import<'a>(
 ) -> Option<&'a SyntaxNode> {
     Some(match import_candidate {
         Some(ImportCandidate::Path(_)) => ctx.name_ref_syntax.as_ref()?.syntax(),
-        Some(ImportCandidate::TraitAssocItem(_)) => ctx.path_qual.as_ref()?.syntax(),
-        Some(ImportCandidate::TraitMethod(_)) => ctx.dot_receiver.as_ref()?.syntax(),
+        Some(ImportCandidate::TraitAssocItem(_)) => ctx.path_qual()?.syntax(),
+        Some(ImportCandidate::TraitMethod(_)) => ctx.dot_receiver()?.syntax(),
         None => ctx
             .name_ref_syntax
             .as_ref()
             .map(|name_ref| name_ref.syntax())
-            .or_else(|| ctx.path_qual.as_ref().map(|path| path.syntax()))
-            .or_else(|| ctx.dot_receiver.as_ref().map(|expr| expr.syntax()))?,
+            .or_else(|| ctx.path_qual().map(|path| path.syntax()))
+            .or_else(|| ctx.dot_receiver().map(|expr| expr.syntax()))?,
     })
 }
 
 fn import_assets(ctx: &CompletionContext, fuzzy_name: String) -> Option<ImportAssets> {
     let current_module = ctx.scope.module()?;
-    if let Some(dot_receiver) = &ctx.dot_receiver {
+    if let Some(dot_receiver) = ctx.dot_receiver() {
         ImportAssets::for_fuzzy_method_call(
             current_module,
             ctx.sema.type_of_expr(dot_receiver)?,
@@ -192,7 +189,7 @@ fn import_assets(ctx: &CompletionContext, fuzzy_name: String) -> Option<ImportAs
         };
         let assets_for_path = ImportAssets::for_fuzzy_path(
             current_module,
-            ctx.path_qual.clone(),
+            ctx.path_qual().cloned(),
             fuzzy_name,
             &ctx.sema,
             approximate_node,
@@ -210,7 +207,7 @@ fn import_assets(ctx: &CompletionContext, fuzzy_name: String) -> Option<ImportAs
 }
 
 fn compute_fuzzy_completion_order_key(
-    proposed_mod_path: &ModPath,
+    proposed_mod_path: &hir::ModPath,
     user_input_lowercased: &str,
 ) -> usize {
     cov_mark::hit!(certain_fuzzy_order_test);
@@ -230,11 +227,11 @@ mod tests {
 
     use crate::{
         item::CompletionKind,
-        test_utils::{check_edit, check_edit_with_config, completion_list, TEST_CONFIG},
+        tests::{check_edit, check_edit_with_config, filtered_completion_list, TEST_CONFIG},
     };
 
     fn check(ra_fixture: &str, expect: Expect) {
-        let actual = completion_list(ra_fixture, CompletionKind::Magic);
+        let actual = filtered_completion_list(ra_fixture, CompletionKind::Magic);
         expect.assert_eq(&actual);
     }
 

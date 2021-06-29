@@ -192,11 +192,6 @@ pub struct Search {
 #[derive(Debug)]
 pub struct ProcMacro;
 
-#[derive(Debug)]
-pub struct CreateJson{
-    pub path: PathBuf,
-}
-
 impl RustAnalyzer {
     pub const HELP: &'static str = Self::HELP_;
 

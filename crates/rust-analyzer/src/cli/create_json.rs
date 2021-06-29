@@ -2,7 +2,7 @@
 //! errors.
 
 use crossbeam_channel::{unbounded, Receiver};
-use ide::{AnalysisHost, Change, DiagnosticsConfig, FileId};
+use ide::Change;
 use ide_db::base_db::CrateGraph;
 use project_model::{
     BuildDataCollector, CargoConfig, ProcMacroClient, ProjectManifest, ProjectWorkspace,
@@ -116,7 +116,7 @@ fn get_crate_data(
         load_out_dirs_from_check: true,
         wrap_rustc: true,
         with_proc_macro: false,
-        prefill_caches: (),
+        prefill_caches: false,
     };
     let (sender, receiver) = unbounded();
     let mut vfs = vfs::Vfs::default();

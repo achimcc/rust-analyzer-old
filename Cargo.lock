@@ -152,6 +152,7 @@ dependencies = [
  "expect-test",
  "mbe",
  "rustc-hash",
+ "serde",
  "syntax",
  "tt",
 ]
